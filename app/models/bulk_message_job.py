@@ -16,6 +16,10 @@ class BulkMessageJob(Base, TimestampMixin):
     recipient_chat_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|running|done|failed
+    message_type: Mapped[str] = mapped_column(String(20), default="text")  # text|image|file|poll
+    media_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    poll_options: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     credits_used: Mapped[int] = mapped_column(Integer, default=0)

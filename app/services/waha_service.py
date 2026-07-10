@@ -133,6 +133,32 @@ class WAHAService:
         }
         return await self._post("/api/sendImage", payload)
 
+    async def send_file(self, chat_id: str, url: str, filename: str = "", caption: str = "") -> SendResult:
+        if not chat_id.endswith(("@c.us", "@g.us")):
+            chat_id = f"{chat_id}@c.us"
+        payload = {
+            "session": self.session,
+            "chatId": chat_id,
+            "file": {"url": url, "filename": filename or url.rsplit("/", 1)[-1]},
+            "caption": caption,
+        }
+        return await self._post("/api/sendFile", payload)
+
+    async def send_poll(self, chat_id: str, question: str, options: list[str],
+                        multiple_answers: bool = False) -> SendResult:
+        if not chat_id.endswith(("@c.us", "@g.us")):
+            chat_id = f"{chat_id}@c.us"
+        payload = {
+            "session": self.session,
+            "chatId": chat_id,
+            "poll": {
+                "name": question,
+                "options": options,
+                "multipleAnswers": multiple_answers,
+            },
+        }
+        return await self._post("/api/sendPoll", payload)
+
     async def send_seen(self, chat_id: str) -> None:
         try:
             await self._post("/api/sendSeen", {"session": self.session, "chatId": chat_id})

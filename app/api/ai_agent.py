@@ -81,3 +81,20 @@ async def translate_message(req: TranslateRequest):
     except Exception as exc:
         raise HTTPException(500, f"Translation error: {exc}")
     return {"translated": translated}
+
+
+class PolishRequest(BaseModel):
+    text: str
+    tone: str = "professional"
+
+
+@router.post("/polish")
+async def polish_reply(req: PolishRequest):
+    """Polish a draft reply: fix grammar, keep it WhatsApp-natural (Periskope 'Polish replies')."""
+    if not req.text.strip():
+        raise HTTPException(400, "Text is empty")
+    try:
+        polished = await GeminiService().polish_reply(req.text, req.tone)
+    except Exception as exc:
+        raise HTTPException(500, f"AI error: {exc}")
+    return {"polished": polished}

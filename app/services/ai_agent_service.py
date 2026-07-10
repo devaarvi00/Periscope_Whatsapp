@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -58,13 +59,36 @@ class AIAgentService:
             return None
 
     def _get_relevant_knowledge(self, query: str) -> list[dict[str, Any]]:
+        """Rank active knowledge items by keyword overlap with the query."""
         items = (
             self.db.query(KnowledgeItem)
             .filter(KnowledgeItem.status == "active")
-            .limit(10)
             .all()
         )
-        return [{"title": k.title, "content": k.content} for k in items]
+        if not items:
+            return []
+
+        stopwords = {
+            "the", "a", "an", "is", "are", "was", "were", "do", "does", "did",
+            "can", "could", "will", "would", "how", "what", "when", "where",
+            "who", "why", "i", "you", "my", "your", "to", "of", "in", "on",
+            "for", "and", "or", "it", "this", "that", "please", "hi", "hello",
+        }
+        words = {w for w in re.findall(r"[\w']+", query.lower()) if len(w) > 2 and w not in stopwords}
+
+        scored = []
+        for k in items:
+            haystack = f"{k.title} {k.content}".lower()
+            score = sum(1 for w in words if w in haystack)
+            scored.append((score, k))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        # Prefer matching items; fall back to the most recent few so the AI
+        # always has some context to work with.
+        matched = [k for score, k in scored if score > 0][:5]
+        if not matched:
+            matched = [k for _, k in scored][:3]
+        return [{"title": k.title, "content": k.content} for k in matched]
 
     def human_takeover(self, chat: Chat) -> None:
         """Agent takes over from AI — snooze the AI."""

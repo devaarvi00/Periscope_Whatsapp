@@ -130,6 +130,21 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         if body:
             await automation.run_rules("message_keyword", rule_context)
 
+        # AI auto-flag: mark important inbound messages per the configured criteria
+        if not from_me and body and settings.ai_auto_flag_enabled:
+            try:
+                from app.services.gemini_service import GeminiService
+                if await GeminiService().flag_message(body, settings.ai_auto_flag_criteria):
+                    msg_row = db.query(Message).filter(Message.message_wid == msg_wid).first()
+                    if msg_row:
+                        msg_row.is_flagged = True
+                    chat.is_flagged = True
+                    db.commit()
+                    from app.core.ws_manager import ws_manager as _ws
+                    await _ws.emit_chat_updated(chat.id, {"is_flagged": True})
+            except Exception as exc:
+                logger.warning("AI auto-flag failed: %s", exc)
+
         # AI agent handling
         if not from_me and chat.ai_active and chat.ai_state != "SNOOZED":
             from app.services.ai_agent_service import AIAgentService

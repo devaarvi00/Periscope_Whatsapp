@@ -85,12 +85,19 @@ class BulkJobCreate(BaseModel):
     phone_id: int
     recipient_chat_ids: list[str]
     scheduled_at: str | None = None
+    message_type: str = "text"  # text|image|file|poll
+    media_url: str | None = None
+    poll_options: list[str] | None = None
 
 
 class BulkJobOut(BaseModel):
     id: int
     name: str
     status: str
+    message_type: str = "text"
+    media_url: str | None = None
+    poll_options: list | None = None
+    error_message: str | None = None
     sent_count: int
     failed_count: int
     credits_used: int

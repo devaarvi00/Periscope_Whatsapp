@@ -39,6 +39,14 @@ class GeminiService:
         )
         return await self._text(prompt, temperature=0.7)
 
+    async def polish_reply(self, text: str, tone: str = "professional") -> str:
+        prompt = (
+            f"Polish this WhatsApp reply draft. Fix grammar and spelling, keep it short and "
+            f"natural for WhatsApp (no markdown), and use a {tone} tone. "
+            f"Keep the same language and meaning. Return only the polished message.\n\n{text}"
+        )
+        return await self._text(prompt, temperature=0.3)
+
     async def translate(self, text: str, target_language: str) -> str:
         prompt = f"Translate this WhatsApp message to {target_language}. Return only the translation.\n\n{text}"
         return await self._text(prompt, temperature=0.1)
