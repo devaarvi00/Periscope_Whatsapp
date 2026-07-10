@@ -19,6 +19,9 @@ from app.api.bulk_messaging import router as bulk_router
 from app.api.contacts import router as contacts_router
 from app.api.inbox import router as inbox_router
 from app.api.knowledge_base import router as kb_router
+from app.api.developer import router as developer_router
+from app.api.exports import router as exports_router
+from app.api.public_api import router as public_api_router
 from app.api.labels import router as labels_router
 from app.api.logs import router as logs_router
 from app.api.notes import router as notes_router
@@ -108,9 +111,11 @@ from app.api.auth import get_current_agent  # noqa: E402
 
 _auth = [Depends(get_current_agent)]
 
-# Public routes: auth (login/register) and webhooks (WAHA posts here without a JWT)
+# Public routes: auth (login/register), WAHA webhooks, and the API-key-guarded
+# developer API (it authenticates via X-API-Key instead of a JWT)
 app.include_router(auth_router, prefix=PREFIX)
 app.include_router(webhooks_router, prefix=PREFIX)
+app.include_router(public_api_router, prefix=PREFIX)
 
 # All other routes require a valid JWT
 app.include_router(inbox_router, prefix=PREFIX, dependencies=_auth)
@@ -127,6 +132,8 @@ app.include_router(ai_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(kb_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(search_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(logs_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(exports_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(developer_router, prefix=PREFIX, dependencies=_auth)
 
 
 @app.websocket("/ws")

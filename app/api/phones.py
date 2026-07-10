@@ -10,12 +10,19 @@ from app.models.message import Message
 from app.schemas.inbox import PhoneCreate, PhoneOut
 from app.services.waha_service import WAHAService
 
+from app.api.auth import get_current_agent as _current_agent
+
 router = APIRouter(prefix="/phones", tags=["phones"])
 
 
 @router.get("", response_model=list[PhoneOut])
-def list_phones(db: Session = Depends(get_db)):
-    return db.query(Phone).filter(Phone.is_active == True).all()
+def list_phones(db: Session = Depends(get_db), agent=Depends(_current_agent)):
+    from app.core.permissions import allowed_phone_ids
+    q = db.query(Phone).filter(Phone.is_active == True)
+    allowed = allowed_phone_ids(db, agent)
+    if allowed is not None:
+        q = q.filter(Phone.id.in_(allowed or [0]))
+    return q.all()
 
 
 @router.post("", response_model=PhoneOut, status_code=201)

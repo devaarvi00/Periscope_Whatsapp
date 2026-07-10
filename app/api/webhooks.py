@@ -111,6 +111,19 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             has_media=msg_type not in ("text", "chat", ""),
         )
 
+        # Notify outbound webhook subscribers
+        from app.services.webhook_dispatcher import dispatch_event
+        if chat_is_new:
+            await dispatch_event("chat.created", {
+                "chat_id": chat.id, "chat_wid": chat_wid,
+                "name": chat.name, "is_group": chat.is_group,
+            })
+        await dispatch_event("message.sent" if from_me else "message.received", {
+            "chat_id": chat.id, "chat_wid": chat_wid, "body": body,
+            "sender_name": sender_name, "sender_number": sender_number,
+            "type": msg_type, "timestamp": ts.isoformat(),
+        })
+
         # Run automation rules
         from app.services.automation_service import AutomationService
         automation = AutomationService(db)

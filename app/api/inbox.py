@@ -33,10 +33,13 @@ def list_chats(
     label_id: int | None = None,
     search: str | None = None,
     assigned_to: int | None = None,
+    is_group: bool | None = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
 ):
+    from app.core.permissions import allowed_phone_ids
     svc = InboxService(db)
     chats = svc.list_chats(
         phone_id=phone_id,
@@ -45,8 +48,10 @@ def list_chats(
         label_id=label_id,
         search=search,
         assigned_to=assigned_to,
+        is_group=is_group,
         limit=limit,
         offset=offset,
+        phone_ids=allowed_phone_ids(db, agent),
     )
     result = []
     for c in chats:

@@ -27,10 +27,16 @@ class InboxService:
         assigned_to: int | None = None,
         limit: int = 50,
         offset: int = 0,
+        phone_ids: list[int] | None = None,
+        is_group: bool | None = None,
     ) -> list[Chat]:
         q = self.db.query(Chat).filter(Chat.is_archived == is_archived)
         if phone_id:
             q = q.filter(Chat.phone_id == phone_id)
+        if phone_ids is not None:
+            q = q.filter(Chat.phone_id.in_(phone_ids or [0]))
+        if is_group is not None:
+            q = q.filter(Chat.is_group == is_group)
         if is_flagged is not None:
             q = q.filter(Chat.is_flagged == is_flagged)
         if assigned_to is not None:

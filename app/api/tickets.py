@@ -55,6 +55,8 @@ def create_ticket(
         agent_id=agent.id, description=f"Ticket '{ticket.title}' created",
     )
     background.add_task(fire_trigger, "ticket_created", _trigger_context(ticket))
+    from app.services.webhook_dispatcher import dispatch_event
+    background.add_task(dispatch_event, "ticket.created", _trigger_context(ticket))
     return ticket
 
 
@@ -85,6 +87,8 @@ def update_ticket(
         metadata=changes,
     )
     background.add_task(fire_trigger, "ticket_updated", _trigger_context(ticket))
+    from app.services.webhook_dispatcher import dispatch_event
+    background.add_task(dispatch_event, "ticket.updated", _trigger_context(ticket))
     return ticket
 
 
