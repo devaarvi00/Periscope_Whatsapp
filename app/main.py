@@ -20,6 +20,7 @@ from app.api.contacts import router as contacts_router
 from app.api.inbox import router as inbox_router
 from app.api.knowledge_base import router as kb_router
 from app.api.labels import router as labels_router
+from app.api.logs import router as logs_router
 from app.api.notes import router as notes_router
 from app.api.phones import router as phones_router
 from app.api.quick_replies import router as qr_router
@@ -64,13 +65,19 @@ async def lifespan(_: FastAPI):
     await _configure_waha_webhook()
 
     from app.workers.scheduler import build_scheduler
-    from app.workers.tasks import check_sla_breaches, run_scheduled_bulk_jobs, sync_phone_statuses
+    from app.workers.tasks import (
+        check_no_reply_timeouts,
+        check_sla_breaches,
+        run_scheduled_bulk_jobs,
+        sync_phone_statuses,
+    )
     from apscheduler.triggers.interval import IntervalTrigger
 
     scheduler = build_scheduler()
     scheduler.add_job(sync_phone_statuses, IntervalTrigger(minutes=5), id="sync-phone-statuses")
     scheduler.add_job(check_sla_breaches, IntervalTrigger(minutes=10), id="check-sla")
     scheduler.add_job(run_scheduled_bulk_jobs, IntervalTrigger(minutes=1), id="bulk-jobs")
+    scheduler.add_job(check_no_reply_timeouts, IntervalTrigger(minutes=5), id="no-reply-timeouts")
     scheduler.start()
 
     yield
@@ -119,6 +126,7 @@ app.include_router(automation_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(ai_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(kb_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(search_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(logs_router, prefix=PREFIX, dependencies=_auth)
 
 
 @app.websocket("/ws")

@@ -146,7 +146,7 @@ class WAHAService:
             "config": {
                 "webhooks": [{
                     "url": webhook_url,
-                    "events": ["message", "message.any", "session.status"],
+                    "events": ["message", "message.any", "message.reaction", "session.status"],
                     "customHeaders": [{"name": "X-Webhook-Secret", "value": secret}],
                 }]
             }

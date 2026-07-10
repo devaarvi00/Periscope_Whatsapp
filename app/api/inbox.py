@@ -5,7 +5,9 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.api.auth import get_current_agent
 from app.db.session import get_db
+from app.models.agent import Agent
 from app.models.chat import ChatLabel
 from app.models.phone import Phone
 from app.schemas.inbox import (
@@ -14,6 +16,8 @@ from app.schemas.inbox import (
     MessageOut,
     SendMessageRequest,
 )
+from app.services.activity_service import log_activity
+from app.services.automation_service import fire_trigger
 from app.services.inbox_service import InboxService
 from app.services.waha_service import WAHAService
 
@@ -86,12 +90,33 @@ def get_chat(chat_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/chats/{chat_id}")
-def update_chat(chat_id: int, req: ChatUpdateRequest, db: Session = Depends(get_db)):
+def update_chat(
+    chat_id: int,
+    req: ChatUpdateRequest,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     svc = InboxService(db)
     updates = req.model_dump(exclude_none=True)
+    prev = svc.get_chat(chat_id)
+    prev_assigned = prev.assigned_to if prev else None
     chat = svc.update_chat(chat_id, **updates)
     if not chat:
         raise HTTPException(404, "Chat not found")
+    if "assigned_to" in updates and updates["assigned_to"] != prev_assigned:
+        log_activity(
+            db, "chat_assigned", entity_type="chat", entity_id=chat.id,
+            agent_id=agent.id,
+            description=f"Chat '{chat.name}' assigned to agent #{updates['assigned_to']}",
+        )
+        background.add_task(fire_trigger, "chat_assigned", {
+            "chat_id": chat.id,
+            "chat_wid": chat.chat_wid,
+            "chat_name": chat.name,
+            "assigned_to": updates["assigned_to"],
+            "is_group": chat.is_group,
+        })
     return {"ok": True}
 
 
@@ -125,7 +150,11 @@ def get_messages(
 
 
 @router.post("/send")
-async def send_message(req: SendMessageRequest, db: Session = Depends(get_db)):
+async def send_message(
+    req: SendMessageRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     svc = InboxService(db)
     chat = svc.get_chat(req.chat_id)
     if not chat:
@@ -148,8 +177,9 @@ async def send_message(req: SendMessageRequest, db: Session = Depends(get_db)):
             "phone_id": phone.id,
             "message_wid": result.message_id or f"sent_{datetime.utcnow().timestamp()}",
             "from_me": True,
-            "sender_name": "Agent",
+            "sender_name": agent.name or "Agent",
             "sender_number": phone.phone_number,
+            "sent_by_agent_id": agent.id,
             "body": req.body,
             "message_type": "text",
             "timestamp": datetime.utcnow(),
@@ -239,8 +269,18 @@ async def sync_chat_messages(chat_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/chats/{chat_id}/labels/{label_id}")
-def add_label(chat_id: int, label_id: int, db: Session = Depends(get_db)):
+def add_label(
+    chat_id: int,
+    label_id: int,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     InboxService(db).add_label_to_chat(chat_id, label_id)
+    background.add_task(fire_trigger, "label_added", {
+        "chat_id": chat_id,
+        "label_id": label_id,
+        "source": "manual",
+    })
     return {"ok": True}
 
 

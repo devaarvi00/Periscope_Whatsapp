@@ -49,6 +49,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
 
         inbox = InboxService(db)
         chat = inbox.get_chat_by_wid(chat_wid)
+        chat_is_new = chat is None
         if not chat:
             is_group = chat_wid.endswith("@g.us")
             chat_name = (
@@ -113,13 +114,21 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         # Run automation rules
         from app.services.automation_service import AutomationService
         automation = AutomationService(db)
-        await automation.run_rules("message_received", {
+        rule_context = {
             "chat_id": chat.id,
             "chat_wid": chat_wid,
+            "chat_name": chat.name,
             "message": body,
             "from_me": from_me,
             "is_group": chat.is_group,
-        })
+            "sender_name": sender_name,
+            "sender_number": sender_number,
+        }
+        if chat_is_new:
+            await automation.run_rules("chat_created", rule_context)
+        await automation.run_rules("message_received", rule_context)
+        if body:
+            await automation.run_rules("message_keyword", rule_context)
 
         # AI agent handling
         if not from_me and chat.ai_active and chat.ai_state != "SNOOZED":
@@ -145,6 +154,72 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
 
     except Exception as exc:
         logger.exception("Webhook processing error: %s", exc)
+    finally:
+        db.close()
+
+
+async def _process_reaction_event(payload: dict[str, Any]) -> None:
+    """Create a ticket when a message is reacted to with a ticket emoji (Periskope-style)."""
+    db = SessionLocal()
+    try:
+        session = payload.get("session", settings.waha_session_name)
+        data = payload.get("payload") or {}
+        reaction = data.get("reaction") or {}
+        emoji = str(reaction.get("text") or "").strip()
+        if not emoji or emoji not in settings.ticket_emoji_reactions:
+            return
+
+        msg_id = reaction.get("messageId") or data.get("messageId")
+        if isinstance(msg_id, dict):
+            msg_wid = msg_id.get("_serialized") or msg_id.get("id", "")
+        else:
+            msg_wid = str(msg_id or "")
+        if not msg_wid:
+            return
+
+        message = db.query(Message).filter(Message.message_wid == msg_wid).first()
+        if not message:
+            return
+
+        from app.models.ticket import Ticket
+        existing = db.query(Ticket).filter(Ticket.message_id == message.id).first()
+        if existing:
+            return
+
+        chat = db.query(Chat).filter(Chat.id == message.chat_id).first()
+        title = (message.body or "").strip()[:120] or f"Ticket from {chat.name if chat else 'chat'}"
+        ticket = Ticket(
+            chat_id=message.chat_id,
+            message_id=message.id,
+            title=f"{emoji} {title}",
+            description=message.body or "",
+        )
+        db.add(ticket)
+        db.commit()
+        db.refresh(ticket)
+        logger.info("Emoji reaction %s created ticket %s (session %s)", emoji, ticket.id, session)
+
+        from app.services.activity_service import log_activity
+        log_activity(
+            db, "ticket_created_via_emoji", entity_type="ticket", entity_id=ticket.id,
+            description=f"Ticket created from {emoji} reaction on message {msg_wid}",
+        )
+
+        from app.core.ws_manager import ws_manager
+        await ws_manager.emit_ticket_event("ticket_created", ticket.id, {"chat_id": message.chat_id})
+
+        from app.services.automation_service import AutomationService
+        await AutomationService(db).run_rules("ticket_created", {
+            "chat_id": message.chat_id,
+            "ticket_id": ticket.id,
+            "title": ticket.title,
+            "priority": "medium",
+            "status": "open",
+            "message": message.body or "",
+            "source": "emoji_reaction",
+        })
+    except Exception as exc:
+        logger.exception("Reaction webhook error: %s", exc)
     finally:
         db.close()
 
@@ -203,6 +278,8 @@ async def waha_webhook(
 
     if event in ("message", "message.any", "message_create"):
         background.add_task(_process_message_event, body)
+    elif event == "message.reaction":
+        background.add_task(_process_reaction_event, body)
     elif event == "session.status":
         background.add_task(_process_session_status, body)
 

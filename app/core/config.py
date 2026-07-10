@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     bulk_message_credits_per_month: int = 3000
     max_automation_rules_per_license: int = 2
 
+    # Tickets: reacting to a message with one of these emojis creates a ticket
+    ticket_emoji_reactions: list[str] = ["🎫", "📌", "🚩", "⚠️"]
+    # AI auto-flag: flag important inbound messages matching this custom prompt
+    ai_auto_flag_enabled: bool = False
+    ai_auto_flag_criteria: str = (
+        "urgent requests, complaints, refund or cancellation requests, "
+        "angry or frustrated customers, payment issues"
+    )
+
     log_level: str = "INFO"
     allowed_origins: list[str] = ["*"]
 
