@@ -171,7 +171,12 @@ async def send_message(
 
     waha = WAHAService(session_name=phone.session_name)
     try:
-        result = await waha.send_text(chat.chat_wid, req.body)
+        if req.message_type == "image" and req.media_url:
+            result = await waha.send_image(chat.chat_wid, req.media_url, caption=req.body)
+        elif req.message_type == "file" and req.media_url:
+            result = await waha.send_file(chat.chat_wid, req.media_url, caption=req.body)
+        else:
+            result = await waha.send_text(chat.chat_wid, req.body)
     except Exception as exc:
         raise HTTPException(500, f"Send failed: {exc}")
 
@@ -186,7 +191,9 @@ async def send_message(
             "sender_number": phone.phone_number,
             "sent_by_agent_id": agent.id,
             "body": req.body,
-            "message_type": "text",
+            "message_type": req.message_type if req.media_url else "text",
+            "has_media": bool(req.media_url),
+            "media_url": req.media_url,
             "timestamp": datetime.utcnow(),
         })
     except IntegrityError:

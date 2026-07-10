@@ -128,6 +128,65 @@ async def check_no_reply_timeouts() -> None:
         db.close()
 
 
+async def run_scheduled_messages() -> None:
+    """Send due per-chat scheduled messages; reschedule daily/weekly repeats."""
+    from datetime import timedelta
+
+    from app.db.session import SessionLocal
+    from app.models.chat import Chat
+    from app.models.phone import Phone
+    from app.models.scheduled_message import ScheduledMessage
+    from app.services.inbox_service import InboxService
+    from app.services.waha_service import WAHAService
+
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        due = (
+            db.query(ScheduledMessage)
+            .filter(ScheduledMessage.status == "pending", ScheduledMessage.send_at <= now)
+            .limit(50)
+            .all()
+        )
+        for item in due:
+            chat = db.query(Chat).filter(Chat.id == item.chat_id).first()
+            phone = db.query(Phone).filter(Phone.id == chat.phone_id).first() if chat else None
+            if not chat or not phone:
+                item.status = "failed"
+                item.last_error = "Chat or phone missing"
+                db.commit()
+                continue
+            try:
+                waha = WAHAService(session_name=phone.session_name)
+                result = await waha.send_text(chat.chat_wid, item.body)
+                InboxService(db).upsert_message({
+                    "chat_id": chat.id,
+                    "phone_id": phone.id,
+                    "message_wid": result.message_id or f"sched_{item.id}_{now.timestamp()}",
+                    "from_me": True,
+                    "sender_name": "Scheduled",
+                    "sender_number": phone.phone_number,
+                    "body": item.body,
+                    "message_type": "text",
+                    "timestamp": now,
+                })
+                item.sent_count = (item.sent_count or 0) + 1
+                if item.repeat == "daily":
+                    item.send_at = item.send_at + timedelta(days=1)
+                elif item.repeat == "weekly":
+                    item.send_at = item.send_at + timedelta(weeks=1)
+                else:
+                    item.status = "sent"
+                item.last_error = None
+            except Exception as exc:
+                item.status = "failed"
+                item.last_error = str(exc)[:500]
+                logger.warning("Scheduled message %s failed: %s", item.id, exc)
+            db.commit()
+    finally:
+        db.close()
+
+
 async def run_scheduled_bulk_jobs() -> None:
     """Execute bulk message jobs that are due."""
     from app.db.session import SessionLocal

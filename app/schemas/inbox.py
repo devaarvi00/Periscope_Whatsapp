@@ -47,6 +47,8 @@ class SendMessageRequest(BaseModel):
     chat_id: int
     body: str
     phone_id: int | None = None
+    message_type: str = "text"  # text|image|file
+    media_url: str | None = None
 
 
 class ChatUpdateRequest(BaseModel):

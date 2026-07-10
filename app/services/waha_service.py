@@ -112,6 +112,31 @@ class WAHAService:
             logger.warning("WAHA get_messages error: %s", exc)
         return []
 
+    # ── Groups ────────────────────────────────────────────────────────────────
+
+    async def get_group_participants(self, group_id: str) -> list[dict[str, Any]]:
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/groups/{group_id}/participants"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                data = resp.json()
+                return data if isinstance(data, list) else data.get("participants", [])
+        except Exception as exc:
+            logger.warning("WAHA get_group_participants error: %s", exc)
+        return []
+
+    async def get_group_info(self, group_id: str) -> dict[str, Any]:
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/groups/{group_id}"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                return resp.json()
+        except Exception as exc:
+            logger.warning("WAHA get_group_info error: %s", exc)
+        return {}
+
     # ── Sending ────────────────────────────────────────────────────────────────
 
     async def send_text(self, chat_id: str, text: str) -> SendResult:
