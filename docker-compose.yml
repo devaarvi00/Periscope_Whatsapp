@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+
+  # ── MySQL ──────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: periskope_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: whatsapp_periscope
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - periskope
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── WAHA (WhatsApp HTTP API) ───────────────────────────────────────
+  waha:
+    image: devlikeapro/waha:latest
+    container_name: periskope_waha
+    restart: unless-stopped
+    environment:
+      WHATSAPP_DEFAULT_ENGINE: WEBJS
+      WHATSAPP_API_KEY: ${WAHA_API_KEY}
+    volumes:
+      - waha_data:/app/.wwebjs_auth
+    networks:
+      - periskope
+    ports:
+      - "3000:3000"   # Remove in production if behind nginx
+
+  # ── Periskope App ──────────────────────────────────────────────────
+  app:
+    build: .
+    container_name: periskope_app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override DB URL to use Docker service name
+      DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD}@mysql:3306/whatsapp_periscope
+      WAHA_BASE_URL: http://waha:3000
+      # Webhook URL must be the public domain so WAHA container can reach nginx
+      PUBLIC_WEBHOOK_BASE_URL: ${PUBLIC_WEBHOOK_BASE_URL}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      waha:
+        condition: service_started
+    networks:
+      - periskope
+    expose:
+      - "8000"
+
+  # ── Nginx (reverse proxy + SSL termination) ─────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: periskope_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro   # Put your SSL certs here
+    depends_on:
+      - app
+    networks:
+      - periskope
+
+volumes:
+  mysql_data:
+  waha_data:
+
+networks:
+  periskope:
+    driver: bridge

@@ -1,0 +1,13 @@
+<!DOCTYPE html><html><head></head><body>
+<script>
+localStorage.setItem('token','eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJhZG1pbkBnbWFpbC5jb20iLCJyb2xlIjoiYWRtaW4iLCJleHAiOjE3ODI1MzQ2MzB9.vJlKNAEgNeBXPq5EIiMir9hVBEaDDkyA77OLSN4euUk');
+// After app loads, click the Chats nav
+window.addEventListener('load', function() {
+  setTimeout(function() {
+    var chatsLink = document.querySelector('[data-view="inbox"]');
+    if (chatsLink) chatsLink.click();
+  }, 2000);
+});
+location.href='/';
+</script>
+</body></html>

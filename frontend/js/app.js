@@ -1,0 +1,2243 @@
+/* ── Periskope SPA ─────────────────────────────────────────────── */
+
+// ── Global State ──────────────────────────────────────────────── //
+const State = {
+  agent: null,
+  currentView: 'inbox',
+  inbox: {
+    chats: [], selectedChatId: null,
+    messages: [], filter: 'all', search: '',
+  },
+  tickets: { list: [], filter: 'all' },
+  contacts: { list: [], search: '' },
+  labels: [],
+  phones: [],
+  ws: null,
+};
+
+// ── Utils ──────────────────────────────────────────────────────── //
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function timeAgo(ts) {
+  if (!ts) return '';
+  const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  const diff = Date.now() - d.getTime();
+  if (diff < 60000) return 'now';
+  if (diff < 3600000) return Math.floor(diff/60000) + 'm';
+  if (diff < 86400000) return Math.floor(diff/3600000) + 'h';
+  return d.toLocaleDateString('en', {month:'short', day:'numeric'});
+}
+
+function fmt(ts) {
+  if (!ts) return '';
+  const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  return d.toLocaleTimeString('en', {hour:'2-digit', minute:'2-digit'});
+}
+
+function initials(name) {
+  if (!name) return '?';
+  return name.split(' ').slice(0, 2).map(w => w[0]).join('').toUpperCase();
+}
+
+function avatarColor(name) {
+  const colors = ['#0D8C7C','#2563EB','#7C3AED','#DB2777','#D97706','#059669'];
+  let h = 0;
+  for (let i = 0; i < (name||'').length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xfffffff;
+  return colors[h % colors.length];
+}
+
+function toast(msg, type = 'default') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast' + (type !== 'default' ? ' ' + type : '');
+  el.style.display = 'block';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.style.display = 'none', 3200);
+}
+
+function showModal(title, bodyHTML, onClose) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').innerHTML = bodyHTML;
+  document.getElementById('modal-overlay').style.display = 'flex';
+  document.getElementById('modal-close').onclick = () => closeModal(onClose);
+  document.getElementById('modal-overlay').onclick = e => {
+    if (e.target === document.getElementById('modal-overlay')) closeModal(onClose);
+  };
+}
+
+function closeModal(cb) {
+  document.getElementById('modal-overlay').style.display = 'none';
+  if (cb) cb();
+}
+
+function pillClass(val) {
+  const map = {
+    open:'pill-open', in_progress:'pill-in_progress', resolved:'pill-resolved', closed:'pill-closed',
+    low:'pill-low', medium:'pill-medium', high:'pill-high', urgent:'pill-urgent',
+    active:'pill-active', inactive:'pill-inactive', ACTIVE:'pill-active', INACTIVE:'pill-inactive',
+    THINKING:'pill-in_progress', SNOOZED:'pill-closed',
+  };
+  return 'pill ' + (map[val] || '');
+}
+
+function labelChip(label) {
+  return `<span class="label-chip" style="background:${esc(label.color)}22;color:${esc(label.color)};border:1px solid ${esc(label.color)}55">${esc(label.name)}</span>`;
+}
+
+// ── Auth ───────────────────────────────────────────────────────── //
+async function checkAuth() {
+  if (!Api.getToken()) { showLogin(); return; }
+  try {
+    State.agent = await Api.auth.me();
+    showApp();
+  } catch(_) { showLogin(); }
+}
+
+function showLogin() {
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('app-shell').style.display = 'none';
+}
+
+function showApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app-shell').style.display = 'flex';
+  renderAgent();
+  const hashView = location.hash.replace('#','');
+  navigateTo(hashView || 'dashboard');
+  loadLabels();
+  loadPhones();
+  connectWS();
+}
+
+function renderAgent() {
+  const a = State.agent;
+  if (!a) return;
+  document.getElementById('agent-name').textContent = a.name;
+  document.getElementById('agent-role').textContent = a.role;
+  const av = document.getElementById('agent-avatar');
+  av.textContent = initials(a.name);
+  av.style.background = avatarColor(a.name);
+  // Topbar
+  const ta = document.getElementById('topbar-avatar');
+  const tn = document.getElementById('topbar-name');
+  if (ta) { ta.textContent = initials(a.name); ta.style.background = avatarColor(a.name); }
+  if (tn) tn.textContent = a.name.split(' ')[0];
+}
+
+// Password show/hide toggle
+document.getElementById('toggle-password')?.addEventListener('click', () => {
+  const inp = document.getElementById('login-password');
+  const ico = document.getElementById('eye-icon');
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  ico.innerHTML = show
+    ? '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>'
+    : '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>';
+});
+
+document.getElementById('login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn     = document.getElementById('login-btn');
+  const errEl   = document.getElementById('login-error');
+  const errMsg  = document.getElementById('login-error-msg');
+  const arrow   = document.getElementById('login-btn-arrow');
+  const spinner = document.getElementById('login-btn-spinner');
+
+  btn.disabled = true;
+  arrow.style.display   = 'none';
+  spinner.style.display = 'inline';
+  errEl.style.display   = 'none';
+
+  try {
+    const email = document.getElementById('login-email').value.trim();
+    const password = document.getElementById('login-password').value;
+    console.log('[login] attempting', email);
+    const res = await Api.auth.login(email, password);
+    console.log('[login] response', res);
+    Api.setToken(res.access_token);
+    State.agent = { id: res.agent_id, name: res.name, email: res.email, role: res.role };
+    console.log('[login] calling showApp');
+    showApp();
+    console.log('[login] showApp done');
+  } catch(err) {
+    console.error('[login] error', err);
+    errMsg.textContent    = err.message || 'Invalid email or password';
+    errEl.style.display   = 'flex';
+    btn.disabled          = false;
+    arrow.style.display   = 'inline';
+    spinner.style.display = 'none';
+  }
+});
+
+document.getElementById('logout-btn').addEventListener('click', () => {
+  if (State.ws) State.ws.close();
+  Api.clearToken(); State.agent = null; showLogin();
+});
+
+// ── Navigation ─────────────────────────────────────────────────── //
+const VIEW_LABELS = {
+  dashboard: 'Dashboard', inbox: 'Chats', tickets: 'Tickets',
+  contacts: 'Contacts', 'chat-list': 'Chat List',
+  analytics: 'Analytics', 'ai-agent': 'AI',
+  automation: 'Automation Rules', 'knowledge-base': 'Media',
+  bulk: 'Bulk Messages', settings: 'Settings',
+  communities: 'Communities', logs: 'Logs',
+};
+
+function navigateTo(view) {
+  _stopDashWahaPoller();
+  State.currentView = view;
+  document.querySelectorAll('.nav-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.view === view);
+  });
+  const bc = document.getElementById('app-breadcrumb');
+  if (bc) bc.innerHTML = `<strong>${VIEW_LABELS[view] || view}</strong>`;
+  const main = document.getElementById('main-content');
+  main.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  ({
+    dashboard:        renderDashboard,
+    inbox:            renderInbox,
+    tickets:          renderTickets,
+    contacts:         renderContacts,
+    'chat-list':      renderContacts,
+    analytics:        renderAnalytics,
+    'ai-agent':       renderAIAgent,
+    automation:       renderAutomation,
+    'knowledge-base': renderKnowledgeBase,
+    bulk:             renderBulk,
+    settings:         renderSettings,
+    communities:      renderCommunities,
+    logs:             renderLogs,
+  }[view] || (() => { main.innerHTML = `<div class="loading-center">View not found</div>`; }))();
+}
+
+document.querySelectorAll('.nav-item').forEach(el => {
+  el.addEventListener('click', e => { e.preventDefault(); navigateTo(el.dataset.view); });
+});
+
+// ── WebSocket ──────────────────────────────────────────────────── //
+const WS = {
+  socket: null,
+  retryDelay: 1000,    // ms — doubles on each failure, capped at 30s
+  maxDelay: 30000,
+  pongTimeout: null,
+  alive: false,
+};
+
+function wsSetStatus(status, label) {
+  const el = document.getElementById('ws-status');
+  const lb = document.getElementById('ws-label');
+  if (!el) return;
+  el.className = 'ws-status ' + status;
+  if (lb) lb.textContent = label;
+  el.title = label;
+}
+
+function connectWS() {
+  if (!State.agent || !Api.getToken()) return;
+
+  // Close any existing socket cleanly
+  if (WS.socket) {
+    WS.socket.onclose = null;
+    WS.socket.close();
+    WS.socket = null;
+  }
+
+  wsSetStatus('reconnecting', 'Connecting…');
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${proto}://${location.host}/ws?token=${encodeURIComponent(Api.getToken())}`;
+  const ws = new WebSocket(url);
+  WS.socket = ws;
+  WS.alive = false;
+
+  ws.onopen = () => {
+    WS.retryDelay = 1000;   // reset backoff on success
+    WS.alive = true;
+    wsSetStatus('connected', 'Live');
+    State.ws = ws;
+  };
+
+  ws.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+
+      // ── Heartbeat ──────────────────────────────────── //
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+      if (msg.type === 'pong' || msg.type === 'connected') {
+        return;
+      }
+
+      // ── Application events ─────────────────────────── //
+      handleWSEvent(msg);
+    } catch(_) {}
+  };
+
+  ws.onerror = () => {
+    wsSetStatus('disconnected', 'Error');
+  };
+
+  ws.onclose = () => {
+    WS.socket = null;
+    State.ws = null;
+    WS.alive = false;
+    wsSetStatus('reconnecting', 'Reconnecting…');
+
+    // Exponential backoff
+    const delay = Math.min(WS.retryDelay, WS.maxDelay);
+    WS.retryDelay = Math.min(WS.retryDelay * 2, WS.maxDelay);
+    setTimeout(connectWS, delay);
+  };
+}
+
+function handleWSEvent(data) {
+  const { event, data: d } = data;
+
+  if (event === 'new_message') {
+    // Append to open thread if it matches
+    if (State.currentView === 'inbox' && State.inbox.selectedChatId == d.chat_id) {
+      appendMessage(d);
+    }
+    // Always refresh the chat list for unread counts
+    if (State.currentView === 'inbox') refreshChatList();
+
+    // Show a subtle toast when user is on a different view
+    if (State.currentView !== 'inbox' && !d.from_me) {
+      const preview = (d.body || '').substring(0, 60);
+      toast(`💬 New message: ${preview}`, 'default');
+    }
+    return;
+  }
+
+  if (event === 'chat_updated') {
+    if (State.currentView === 'inbox') refreshChatList();
+    return;
+  }
+
+  if (event === 'ticket_created' || event === 'ticket_updated') {
+    if (State.currentView === 'tickets') {
+      loadTickets();
+    }
+    return;
+  }
+
+  if (event === 'data_cleared') {
+    // WhatsApp session logged out — wipe stale data from UI immediately
+    State.inbox.chats = [];
+    State.inbox.selectedChatId = null;
+    State.inbox.messages = [];
+
+    if (State.currentView === 'inbox') {
+      // Clear the chat list and close any open thread
+      const chatList = document.getElementById('chat-list');
+      if (chatList) chatList.innerHTML = `<div class="empty-state" style="padding:2rem;text-align:center">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5" style="margin:0 auto .75rem;display:block"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <p style="font-size:13px;color:var(--text-3)">WhatsApp disconnected.<br>Reconnect to see chats.</p>
+      </div>`;
+      const threadPanel = document.getElementById('thread-panel');
+      if (threadPanel) threadPanel.innerHTML = `<div class="empty-thread"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1.2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Select a conversation</p><span>Choose a chat from the list to start messaging</span></div>`;
+    }
+
+    if (State.currentView === 'dashboard') {
+      // Reset stats to zero
+      const dsTotal = document.getElementById('ds-total');
+      const dsUnread = document.getElementById('ds-unread');
+      if (dsTotal) dsTotal.textContent = '0';
+      if (dsUnread) dsUnread.textContent = '0';
+    }
+
+    toast('WhatsApp session disconnected — chat data cleared', 'warning');
+    _chatAutoSynced = false;
+    return;
+  }
+}
+
+// ── Labels & Phones (global load) ─────────────────────────────── //
+async function loadLabels() {
+  try { State.labels = await Api.labels.list(); } catch(_) {}
+}
+async function loadPhones() {
+  try { State.phones = await Api.phones.list(); } catch(_) {}
+}
+
+// ── INBOX VIEW ─────────────────────────────────────────────────── //
+async function renderInbox() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="inbox-layout h-full" id="inbox-layout">
+      <div class="chat-list-panel" id="chat-list-panel">
+        <div class="chat-list-header">
+          <div class="search-bar" style="flex:1">
+            <input type="search" id="chat-search" placeholder="Search chats...">
+          </div>
+          <button class="btn btn-primary btn-sm" id="sync-btn" title="Sync">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:13px;height:13px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          </button>
+        </div>
+        <div class="chat-list-filters" id="chat-filters">
+          <span class="filter-chip active" data-f="all">All chats</span>
+          <span class="filter-chip" data-f="inbox">Inbox</span>
+          <span class="filter-chip" data-f="mine">Assigned to me</span>
+          <span class="filter-chip" data-f="unread">Unread</span>
+          <span class="filter-chip" data-f="flagged">Flagged</span>
+          <span class="filter-chip" data-f="awaiting">Awaiting reply</span>
+        </div>
+        <div class="chat-list" id="chat-list">
+          <div class="loading-center"><div class="spinner"></div></div>
+        </div>
+      </div>
+      <div class="thread-panel" id="thread-panel">
+        <div class="empty-state" style="flex:1">
+          <div class="empty-state-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </div>
+          <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
+          <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
+        </div>
+      </div>
+      <div class="contact-detail-panel" id="detail-panel" style="display:none">
+        <div class="detail-panel-header">
+          <span>Details</span>
+          <button class="detail-panel-close" id="close-detail-btn" title="Close panel">×</button>
+        </div>
+        <div class="detail-panel-body" id="detail-panel-body"></div>
+      </div>
+    </div>`;
+
+  await loadChats();
+
+  document.getElementById('chat-search').addEventListener('input', e => {
+    State.inbox.search = e.target.value;
+    debounceLoadChats();
+  });
+
+  document.querySelectorAll('.filter-chip').forEach(c => {
+    c.addEventListener('click', () => {
+      document.querySelectorAll('.filter-chip').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+      State.inbox.filter = c.dataset.f;
+      loadChats();
+    });
+  });
+
+  document.getElementById('sync-btn').addEventListener('click', async () => {
+    if (!State.phones[0]) return toast('No phones configured', 'error');
+    try {
+      await Api.inbox.sync(State.phones[0].id);
+      toast('Sync started', 'success');
+      setTimeout(loadChats, 2000);
+    } catch(e) { toast(e.message, 'error'); }
+  });
+
+  document.getElementById('close-detail-btn').addEventListener('click', () => {
+    document.getElementById('detail-panel').style.display = 'none';
+    document.getElementById('inbox-layout').classList.remove('detail-open');
+  });
+}
+
+let _chatDebounce = null;
+let _chatAutoSynced = false;
+let _dashWahaTimer = null;
+let _dashWahaUpdating = false;
+let _dashWahaPrevStatus = '';
+function debounceLoadChats() {
+  clearTimeout(_chatDebounce);
+  _chatDebounce = setTimeout(loadChats, 300);
+}
+
+async function loadChats() {
+  const q = {};
+  const f = State.inbox.filter;
+  if (f === 'flagged') q.is_flagged = true;
+  if (f === 'archived') q.is_archived = true;
+  if (f === 'inbox') q.is_archived = false;
+  if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
+  if (f === 'unread') {}
+  if (f === 'awaiting') {}
+  if (State.inbox.search) q.search = State.inbox.search;
+
+  try {
+    let chats = await Api.inbox.chats(q);
+    // Auto-sync from WAHA once per session when inbox is empty
+    if (chats.length === 0 && !_chatAutoSynced && State.phones.length) {
+      _chatAutoSynced = true;
+      const phoneId = State.phones[0].id;
+      try {
+        await Api.inbox.sync(phoneId);
+        chats = await Api.inbox.chats(q);
+      } catch(_) {}
+    }
+    if (f === 'unread') chats = chats.filter(c => c.unread_count > 0);
+    if (f === 'inbox') chats = chats.filter(c => !c.is_archived && c.status !== 'closed');
+    // "awaiting reply" = chats where last message is from the customer (not from us)
+    if (f === 'awaiting') chats = chats.filter(c => c.last_message_from_me === false || (c.unread_count === 0 && !c.last_from_me));
+    State.inbox.chats = chats;
+    renderChatList(chats);
+    const total = chats.reduce((s, c) => s + (c.unread_count || 0), 0);
+    const badge = document.getElementById('unread-badge');
+    if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+  } catch(_) {}
+}
+
+function refreshChatList() { loadChats(); }
+
+function renderChatList(chats) {
+  const el = document.getElementById('chat-list');
+  if (!el) return;
+  if (!chats.length) {
+    el.innerHTML = `<div class="loading-center text-muted">No conversations</div>`; return;
+  }
+  el.innerHTML = chats.map(c => {
+    const active = c.id == State.inbox.selectedChatId ? ' active' : '';
+    const color = avatarColor(c.name || c.chat_wid);
+    const isGroup = c.is_group;
+    const unread = c.unread_count || 0;
+
+    // Phone tag: find phone name from State.phones using c.phone_id
+    let phoneTagHtml = '';
+    if (isGroup) {
+      phoneTagHtml = `<span class="chat-phone-tag">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+        Group
+      </span>`;
+    } else if (c.phone_id && State.phones.length) {
+      const phone = State.phones.find(p => p.id === c.phone_id);
+      if (phone) {
+        phoneTagHtml = `<span class="chat-phone-tag">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
+          ${esc(phone.name || phone.phone_number)}
+        </span>`;
+      }
+    }
+
+    // Label chips
+    let labelsHtml = '';
+    if (c.labels && c.labels.length) {
+      labelsHtml = `<div class="chat-item-labels">${c.labels.slice(0,4).map(lbl => {
+        const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
+        const color2 = labelObj ? labelObj.color : '#9ca3af';
+        const name = labelObj ? labelObj.name : (lbl || '');
+        return `<span class="chat-label-mini" style="background:${color2}22;color:${color2};border:1px solid ${color2}44">${esc(name)}</span>`;
+      }).join('')}</div>`;
+    }
+
+    return `<div class="chat-item${active}" data-cid="${c.id}">
+      <div class="chat-avatar${isGroup?' group':''}" style="background:${color}">${initials(c.name||c.chat_wid)}</div>
+      <div class="chat-meta">
+        <div class="chat-meta-top">
+          <span class="chat-name">${esc(c.name||c.chat_wid)}</span>
+          <span class="chat-time">${timeAgo(c.last_message_at)}</span>
+        </div>
+        <div class="chat-meta-bottom">
+          <span class="chat-preview">${esc((c.last_message||'').substring(0,55))}</span>
+          <div class="chat-badges-right">
+            ${c.is_flagged ? `<svg viewBox="0 0 24 24" fill="#f59e0b" style="width:11px;height:11px;flex-shrink:0"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15" stroke="#f59e0b" stroke-width="2"/></svg>` : ''}
+            ${c.ai_active ? `<span class="ai-badge">AI</span>` : ''}
+            ${unread ? `<span class="unread-dot">${unread > 99 ? '99+' : unread}</span>` : ''}
+          </div>
+        </div>
+        ${phoneTagHtml ? `<div style="display:flex;align-items:center;gap:.25rem;margin-top:2px">${phoneTagHtml}</div>` : ''}
+        ${labelsHtml}
+      </div>
+    </div>`;
+  }).join('');
+
+  el.querySelectorAll('.chat-item').forEach(el => {
+    el.addEventListener('click', () => openChat(+el.dataset.cid));
+  });
+}
+
+async function openChat(chatId) {
+  State.inbox.selectedChatId = chatId;
+  document.querySelectorAll('.chat-item').forEach(el => {
+    el.classList.toggle('active', +el.dataset.cid === chatId);
+  });
+  const chat = State.inbox.chats.find(c => c.id === chatId);
+  if (!chat) return;
+  const wasDetailOpen = document.getElementById('detail-panel')?.style.display !== 'none';
+  renderThread(chat);
+  if (wasDetailOpen) renderContactDetail(chat);
+  Api.inbox.markRead(chatId).catch(()=>{});
+  await loadMessages(chatId);
+}
+
+// ── Contact Detail Panel ────────────────────────────────────────── //
+async function renderContactDetail(chat) {
+  const panel = document.getElementById('detail-panel');
+  const body = document.getElementById('detail-panel-body');
+  const layout = document.getElementById('inbox-layout');
+  if (!panel || !body || !layout) return;
+
+  panel.style.display = 'flex';
+  layout.classList.add('detail-open');
+
+  const color = avatarColor(chat.name || chat.chat_wid);
+  const chatLabels = chat.labels || [];
+
+  // Build label chips
+  const labelsMarkup = chatLabels.map(lbl => {
+    const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
+    const lColor = labelObj ? labelObj.color : '#9ca3af';
+    const lName = labelObj ? labelObj.name : String(lbl);
+    return `<span class="detail-label-chip" style="background:${lColor}22;color:${lColor};border:1px solid ${lColor}44" data-label="${esc(lbl)}">
+      ${esc(lName)}<span class="chip-remove" data-remove-label="${esc(lbl)}">×</span>
+    </span>`;
+  }).join('');
+
+  // Build agent options
+  let agentOpts = `<option value="">— Unassigned —</option>`;
+  try {
+    const agents = await Api.auth.agents();
+    agentOpts += agents.map(a =>
+      `<option value="${a.id}" ${chat.assigned_to == a.id ? 'selected' : ''}>${esc(a.name)}</option>`
+    ).join('');
+  } catch(_) {}
+
+  // Available labels for "add" list
+  const availableLabels = State.labels.filter(l => !chatLabels.includes(l.id) && !chatLabels.includes(l.name));
+  const addLabelOpts = availableLabels.map(l =>
+    `<option value="${l.id}">${esc(l.name)}</option>`
+  ).join('');
+
+  body.innerHTML = `
+    <div class="detail-contact-top">
+      <div class="detail-avatar" style="background:${color}">${initials(chat.name||chat.chat_wid)}</div>
+      <div class="detail-contact-name">${esc(chat.name||chat.chat_wid)}</div>
+      <div class="detail-contact-wid">${esc(chat.chat_wid||'')}</div>
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-label">Assigned To</div>
+      <select class="detail-assign-select" id="detail-assign-select">
+        ${agentOpts}
+      </select>
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-label">Labels</div>
+      <div class="detail-labels-row" id="detail-labels-row">
+        ${labelsMarkup || '<span style="font-size:12px;color:var(--text-3);font-style:italic">No labels yet</span>'}
+      </div>
+      ${availableLabels.length ? `
+      <div style="display:flex;gap:.4rem;align-items:center;margin-top:.4rem">
+        <select id="detail-add-label-select" style="font-size:11.5px;padding:2px 5px;border:1px solid var(--border);border-radius:4px;flex:1;height:26px;background:#fff">
+          <option value="">+ Add label…</option>
+          ${addLabelOpts}
+        </select>
+      </div>` : `<div style="font-size:11.5px;color:var(--text-3);margin-top:.35rem">
+        <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent);text-decoration:none">Create labels</a> in Settings
+      </div>`}
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-label">Phone</div>
+      <div style="font-size:12.5px;color:var(--text-2)">
+        ${chat.is_group ? 'Group chat' : (chat.chat_wid || '—')}
+      </div>
+      ${(() => {
+        if (chat.phone_id && State.phones.length) {
+          const phone = State.phones.find(p => p.id === chat.phone_id);
+          if (phone) return `<div style="font-size:11.5px;color:var(--text-3);margin-top:2px">via ${esc(phone.name||phone.phone_number)}</div>`;
+        }
+        return '';
+      })()}
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-label">Status</div>
+      <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+        <span class="${pillClass(chat.status||'open')}" style="font-size:11px">${chat.status||'open'}</span>
+        ${chat.ai_active ? '<span class="ai-badge" style="font-size:10px">AI Active</span>' : ''}
+        ${chat.is_flagged ? '<span style="font-size:10px;font-weight:600;background:#fffbeb;color:#d97706;border:1px solid #fde68a;border-radius:10px;padding:1px 7px">Flagged</span>' : ''}
+      </div>
+      <button class="detail-close-chat-btn" id="detail-close-chat-btn" style="margin-top:.6rem">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+        Mark as Resolved
+      </button>
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-label">Conversation</div>
+      <div style="font-size:12px;color:var(--text-2);display:flex;flex-direction:column;gap:.3rem">
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--text-3)">Created</span>
+          <span>${chat.created_at ? new Date(chat.created_at).toLocaleDateString('en', {month:'short',day:'numeric',year:'numeric'}) : '—'}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--text-3)">Last message</span>
+          <span>${chat.last_message_at ? timeAgo(chat.last_message_at) + ' ago' : '—'}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--text-3)">Unread</span>
+          <span>${chat.unread_count || 0} messages</span>
+        </div>
+      </div>
+    </div>`;
+
+  // Assign agent handler
+  document.getElementById('detail-assign-select').addEventListener('change', async e => {
+    const val = e.target.value ? parseInt(e.target.value) : null;
+    try {
+      await Api.inbox.updateChat(chat.id, { assigned_to: val });
+      chat.assigned_to = val;
+      toast(val ? 'Chat assigned' : 'Unassigned', 'success');
+      renderChatList(State.inbox.chats);
+    } catch(err) { toast(err.message, 'error'); }
+  });
+
+  // Add label handler
+  const addLabelSel = document.getElementById('detail-add-label-select');
+  if (addLabelSel) {
+    addLabelSel.addEventListener('change', async e => {
+      const labelId = e.target.value;
+      if (!labelId) return;
+      const labelObj = State.labels.find(l => l.id == labelId);
+      if (!labelObj) return;
+      const newLabels = [...chatLabels, labelObj.name];
+      try {
+        await Api.inbox.updateChat(chat.id, { labels: newLabels });
+        chat.labels = newLabels;
+        toast('Label added', 'success');
+        renderContactDetail(chat);
+        renderChatList(State.inbox.chats);
+      } catch(err) { toast(err.message, 'error'); }
+    });
+  }
+
+  // Remove label handlers
+  body.querySelectorAll('[data-remove-label]').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      const lbl = btn.dataset.removeLabel;
+      const newLabels = chatLabels.filter(l => l !== lbl && String(l) !== lbl);
+      try {
+        await Api.inbox.updateChat(chat.id, { labels: newLabels });
+        chat.labels = newLabels;
+        toast('Label removed', 'success');
+        renderContactDetail(chat);
+        renderChatList(State.inbox.chats);
+      } catch(err) { toast(err.message, 'error'); }
+    });
+  });
+
+  // Close/resolve chat
+  document.getElementById('detail-close-chat-btn').addEventListener('click', async () => {
+    try {
+      await Api.inbox.updateChat(chat.id, { status: 'resolved' });
+      chat.status = 'resolved';
+      toast('Chat marked as resolved', 'success');
+      renderContactDetail(chat);
+      renderChatList(State.inbox.chats);
+    } catch(err) { toast(err.message, 'error'); }
+  });
+}
+
+function renderThread(chat) {
+  const panel = document.getElementById('thread-panel');
+  if (!panel) return;
+  const isAI = chat.ai_active;
+  const isDetailOpen = document.getElementById('detail-panel')?.style.display !== 'none';
+  panel.innerHTML = `
+    <div class="thread-header">
+      <div class="thread-contact-info">
+        <div class="chat-avatar" style="background:${avatarColor(chat.name||chat.chat_wid)};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(chat.name||chat.chat_wid)}</div>
+        <div class="thread-contact-text">
+          <div class="thread-name">${esc(chat.name||chat.chat_wid)}</div>
+          <div class="thread-meta">${chat.is_group ? '👥 Group' : esc((chat.chat_wid||'').replace('@s.whatsapp.net','').replace('@g.us',''))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
+        </div>
+      </div>
+      <div class="thread-actions">
+        <button id="btn-ai-toggle" class="${isAI ? 'active-ai' : ''}" title="${isAI ? 'Deactivate AI' : 'Activate AI'}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+          ${isAI ? 'AI On' : 'AI Off'}
+        </button>
+        <button id="btn-suggest" title="AI suggest reply">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Suggest
+        </button>
+        <button id="btn-close-chat" class="btn-close-chat" title="Resolve chat">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+          Resolve
+        </button>
+        <div class="thread-more-wrap">
+          <button id="btn-more" title="More actions" class="btn-icon-only">
+            <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" style="width:14px;height:14px"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+          </button>
+          <div class="thread-more-menu" id="thread-more-menu">
+            <button id="btn-summarize">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="21" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="11" y2="18"/></svg>
+              Summary
+            </button>
+            <button id="btn-ticket">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
+              Create Ticket
+            </button>
+            <button id="btn-note">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              Add Note
+            </button>
+            <button id="btn-flag">
+              <svg viewBox="0 0 24 24" fill="${chat.is_flagged ? 'var(--warning)':'none'}" stroke="var(--warning)" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
+              ${chat.is_flagged ? 'Unflag' : 'Flag'}
+            </button>
+          </div>
+        </div>
+        <button id="btn-details-toggle" class="btn-icon-only${isDetailOpen ? ' btn-details-active' : ''}" title="Toggle contact details">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="messages-area" id="messages-area">
+      <div class="loading-center"><div class="spinner"></div></div>
+    </div>
+    <div class="reply-area">
+      <div class="reply-toolbar" id="reply-toolbar">
+        <button class="btn btn-ghost btn-sm" id="btn-qr">/ Quick Reply</button>
+        <select id="phone-select" class="btn btn-secondary btn-sm" style="border:1px solid var(--border);padding:3px 6px">
+          ${State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="reply-bar">
+        <textarea id="reply-text" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button class="btn btn-primary" id="send-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:15px;height:15px"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+    </div>`;
+
+  // AI toggle
+  document.getElementById('btn-ai-toggle').addEventListener('click', async () => {
+    try {
+      if (chat.ai_active) {
+        await Api.ai.deactivate(chat.id);
+        chat.ai_active = false;
+        toast('AI deactivated', 'success');
+      } else {
+        await Api.ai.activate(chat.id);
+        chat.ai_active = true;
+        toast('AI activated', 'success');
+      }
+      renderThread(chat);
+      loadMessages(chat.id);
+    } catch(e) { toast(e.message, 'error'); }
+  });
+
+  // Suggest reply
+  document.getElementById('btn-suggest').addEventListener('click', async () => {
+    try {
+      const res = await Api.ai.suggestReply(chat.id);
+      document.getElementById('reply-text').value = res.suggestion || res.reply || JSON.stringify(res);
+      toast('Reply suggestion ready', 'success');
+    } catch(e) { toast(e.message, 'error'); }
+  });
+
+  // Summarize
+  document.getElementById('btn-summarize').addEventListener('click', async () => {
+    try {
+      const res = await Api.ai.summarize(chat.id);
+      showModal('Chat Summary', `<p style="font-size:13px;line-height:1.6;color:var(--text-2)">${esc(res.summary || JSON.stringify(res))}</p>`);
+    } catch(e) { toast(e.message, 'error'); }
+  });
+
+  // Create ticket
+  document.getElementById('btn-ticket').addEventListener('click', () => {
+    showModal('Create Ticket', `
+      <div class="form-group"><label>Title</label><input type="text" id="tk-title" placeholder="Issue title..."></div>
+      <div class="form-group"><label>Description</label><textarea id="tk-desc" placeholder="Describe the issue..."></textarea></div>
+      <div class="form-group"><label>Priority</label>
+        <select id="tk-priority"><option value="medium">Medium</option><option value="low">Low</option><option value="high">High</option><option value="urgent">Urgent</option></select>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="tk-save-btn">Create Ticket</button>
+      </div>`);
+    document.getElementById('tk-save-btn').addEventListener('click', async () => {
+      const title = document.getElementById('tk-title').value.trim();
+      if (!title) return toast('Title required', 'error');
+      try {
+        await Api.tickets.create({
+          chat_id: chat.id, title,
+          description: document.getElementById('tk-desc').value,
+          priority: document.getElementById('tk-priority').value,
+        });
+        closeModal(); toast('Ticket created', 'success');
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  });
+
+  // Add note
+  document.getElementById('btn-note').addEventListener('click', () => {
+    showModal('Add Private Note', `
+      <div class="form-group"><label>Note (not sent to customer)</label><textarea id="note-content" style="min-height:100px" placeholder="Write a note..."></textarea></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="note-save-btn">Save Note</button>
+      </div>`);
+    document.getElementById('note-save-btn').addEventListener('click', async () => {
+      const content = document.getElementById('note-content').value.trim();
+      if (!content) return;
+      try {
+        await Api.notes.create({ chat_id: chat.id, content });
+        closeModal(); toast('Note saved', 'success');
+        loadMessages(chat.id);
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  });
+
+  // Flag toggle
+  document.getElementById('btn-flag').addEventListener('click', async () => {
+    try {
+      await Api.inbox.updateChat(chat.id, { is_flagged: !chat.is_flagged });
+      chat.is_flagged = !chat.is_flagged;
+      renderThread(chat);
+      loadChats();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+
+  // Resolve/close chat
+  document.getElementById('btn-close-chat').addEventListener('click', async () => {
+    try {
+      await Api.inbox.updateChat(chat.id, { status: 'resolved' });
+      chat.status = 'resolved';
+      toast('Chat resolved', 'success');
+      loadChats();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+
+  // More actions dropdown toggle
+  const moreBtn = document.getElementById('btn-more');
+  const moreMenu = document.getElementById('thread-more-menu');
+  moreBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    moreMenu.classList.toggle('open');
+  });
+  document.addEventListener('click', function closeMoreMenu(e) {
+    if (!moreMenu.contains(e.target) && e.target !== moreBtn) {
+      moreMenu.classList.remove('open');
+      document.removeEventListener('click', closeMoreMenu);
+    }
+  });
+
+  // Details panel toggle
+  document.getElementById('btn-details-toggle').addEventListener('click', () => {
+    const detailPanel = document.getElementById('detail-panel');
+    const layout = document.getElementById('inbox-layout');
+    const btn = document.getElementById('btn-details-toggle');
+    if (detailPanel.style.display === 'none' || !detailPanel.style.display) {
+      renderContactDetail(chat);
+      btn.classList.add('btn-details-active');
+    } else {
+      detailPanel.style.display = 'none';
+      layout.classList.remove('detail-open');
+      btn.classList.remove('btn-details-active');
+    }
+  });
+
+  // Quick reply picker
+  document.getElementById('btn-qr').addEventListener('click', async () => {
+    try {
+      const qrs = await Api.quickReplies.list();
+      if (!qrs.length) return toast('No quick replies configured', 'error');
+      showModal('Quick Replies', `
+        <div style="max-height:300px;overflow-y:auto;">
+          ${qrs.map(q => `<div class="contact-card" style="cursor:pointer" data-qr="${esc(q.message)}">
+            <div style="flex:1">
+              <div style="font-weight:600;font-size:13px">/${esc(q.command)}</div>
+              <div style="font-size:12px;color:var(--text-3)">${esc(q.message.substring(0,80))}</div>
+            </div>
+          </div>`).join('')}
+        </div>`);
+      document.querySelectorAll('[data-qr]').forEach(el => {
+        el.addEventListener('click', () => {
+          document.getElementById('reply-text').value = el.dataset.qr;
+          closeModal();
+        });
+      });
+    } catch(e) { toast(e.message, 'error'); }
+  });
+
+  // Send message
+  const sendMsg = async () => {
+    const text = document.getElementById('reply-text').value.trim();
+    if (!text) return;
+    const phoneId = document.getElementById('phone-select')?.value;
+    if (!phoneId) return toast('Select a phone', 'error');
+    const btn = document.getElementById('send-btn');
+    btn.disabled = true;
+    try {
+      await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
+      document.getElementById('reply-text').value = '';
+      await loadMessages(chat.id);
+    } catch(e) { toast(e.message, 'error'); }
+    btn.disabled = false;
+  };
+
+  document.getElementById('send-btn').addEventListener('click', sendMsg);
+  document.getElementById('reply-text').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+  });
+}
+
+async function loadMessages(chatId, _alreadySynced) {
+  const area = document.getElementById('messages-area');
+  if (!area) return;
+  const chat = State.inbox.chats?.find(c => c.id == chatId);
+  const isGroup = chat?.is_group || false;
+  try {
+    let messages = await Api.inbox.messages(chatId, { limit: 50 });
+    // Auto-fetch from WAHA if DB has no messages for this chat yet
+    if (messages.length === 0 && !_alreadySynced) {
+      try { await Api.inbox.syncMessages(chatId); } catch(_) {}
+      messages = await Api.inbox.messages(chatId, { limit: 50 });
+    }
+    State.inbox.messages = messages;
+    area.innerHTML = messages.map(m => renderMessage(m, isGroup)).join('') ||
+      `<div class="empty-state" style="flex:none;padding:2rem"><p>No messages yet</p></div>`;
+    area.scrollTop = area.scrollHeight;
+  } catch(e) {
+    area.innerHTML = `<div class="loading-center text-muted">Could not load messages</div>`;
+  }
+}
+
+function renderMessage(m, isGroup) {
+  if (m.body?.startsWith('[NOTE]') || m.message_type === 'note') {
+    const content = m.body?.replace('[NOTE] ', '') || m.body;
+    return `<div class="note-msg">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+      <span><strong>Note:</strong> ${esc(content)}</span>
+    </div>`;
+  }
+  const cls = m.from_me ? 'me' : 'them';
+  const senderDisplay = !m.from_me && (isGroup || m.sender_name)
+    ? (m.sender_name || m.sender_number || '').trim()
+    : '';
+
+  let bubbleContent = '';
+  const mtype = (m.message_type || 'text').toLowerCase();
+
+  if (mtype === 'image' || mtype === 'photo') {
+    bubbleContent = `<div class="msg-media-img">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      <span>Photo</span>
+    </div>${m.body ? `<div style="font-size:12px;margin-top:.3rem">${esc(m.body)}</div>` : ''}`;
+  } else if (mtype === 'video') {
+    bubbleContent = `<div class="msg-media-img">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+      <span>Video</span>
+    </div>${m.body ? `<div style="font-size:12px;margin-top:.3rem">${esc(m.body)}</div>` : ''}`;
+  } else if (mtype === 'audio' || mtype === 'voice' || mtype === 'ptt') {
+    bubbleContent = `<div class="msg-media-audio">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
+      <div class="msg-audio-bars">${Array(5).fill(0).map(()=>`<span style="height:${8+Math.random()*12|0}px"></span>`).join('')}</div>
+      <span style="font-size:11px;color:inherit;opacity:.7">${mtype === 'ptt' ? 'Voice' : 'Audio'}</span>
+    </div>`;
+  } else if (mtype === 'document' || mtype === 'pdf') {
+    bubbleContent = `<div class="msg-media-doc">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      <span>${esc(m.body || 'Document')}</span>
+    </div>`;
+  } else if (mtype === 'sticker') {
+    bubbleContent = `<span style="font-size:28px">🖼️</span>`;
+  } else if (mtype === 'location') {
+    bubbleContent = `<div class="msg-media-doc">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+      <span>${esc(m.body || 'Location')}</span>
+    </div>`;
+  } else if (mtype === 'contact' || mtype === 'vcard') {
+    bubbleContent = `<div class="msg-media-doc">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      <span>${esc(m.body || 'Contact')}</span>
+    </div>`;
+  } else {
+    bubbleContent = m.body ? esc(m.body).replace(/\n/g, '<br>') : (m.has_media ? `<em style="opacity:.7">Media message</em>` : '');
+  }
+
+  return `<div class="msg ${cls}">
+    ${senderDisplay ? `<div class="msg-sender">${esc(senderDisplay)}</div>` : ''}
+    <div class="msg-bubble">${bubbleContent}</div>
+    <div class="msg-info">${fmt(m.timestamp)} ${m.from_me ? (m.is_read ? '<span style="color:#53bdeb">✓✓</span>' : '✓') : ''}</div>
+  </div>`;
+}
+
+function appendMessage(m) {
+  const area = document.getElementById('messages-area');
+  if (!area) return;
+  const chat = State.inbox.chats?.find(c => c.id == State.inbox.selectedChatId);
+  area.insertAdjacentHTML('beforeend', renderMessage(m, chat?.is_group || false));
+  area.scrollTop = area.scrollHeight;
+}
+
+// ── TICKETS VIEW ────────────────────────────────────────────────── //
+async function renderTickets() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full">
+      <div class="section-header">
+        <h2>Tickets</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem;align-items:center">
+          <select id="ticket-filter" style="font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:4px">
+            <option value="">All statuses</option>
+            <option value="open">Open</option>
+            <option value="in_progress">In Progress</option>
+            <option value="resolved">Resolved</option>
+            <option value="closed">Closed</option>
+          </select>
+          <button class="btn btn-primary btn-sm" id="new-ticket-btn">+ New Ticket</button>
+        </div>
+      </div>
+      <div class="scroll-area">
+        <div class="content-card">
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr><th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Assigned</th><th>Due</th><th>SLA</th><th></th></tr>
+              </thead>
+              <tbody id="tickets-tbody"><tr><td colspan="8" style="text-align:center;padding:2rem"><div class="spinner"></div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  await loadTickets();
+
+  document.getElementById('ticket-filter').addEventListener('change', e => {
+    loadTickets(e.target.value);
+  });
+
+  document.getElementById('new-ticket-btn').addEventListener('click', () => showCreateTicketModal());
+}
+
+async function loadTickets(status = '') {
+  try {
+    const q = {};
+    if (status) q.status = status;
+    const list = await Api.tickets.list(q);
+    State.tickets.list = list;
+    const tbody = document.getElementById('tickets-tbody');
+    if (!tbody) return;
+    if (!list.length) {
+      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:2rem;color:var(--text-3)">No tickets found</td></tr>`; return;
+    }
+    tbody.innerHTML = list.map(t => `
+      <tr>
+        <td style="color:var(--text-3);font-size:12px">#${t.id}</td>
+        <td><a href="#" class="ticket-link text-accent" data-tid="${t.id}" style="font-weight:600">${esc(t.title)}</a></td>
+        <td><span class="${pillClass(t.status)}">${t.status?.replace('_',' ')}</span></td>
+        <td><span class="${pillClass(t.priority)}">${t.priority}</span></td>
+        <td style="font-size:12px;color:var(--text-3)">${t.assigned_to ? 'Agent #'+t.assigned_to : '—'}</td>
+        <td style="font-size:12px;color:var(--text-3)">${t.due_date ? new Date(t.due_date).toLocaleDateString() : '—'}</td>
+        <td>${t.sla_breached ? '<span class="pill" style="background:#FEF2F2;color:#DC2626">Breached</span>' : '<span class="pill" style="background:var(--success-bg);color:var(--success)">OK</span>'}</td>
+        <td>
+          <button class="btn btn-ghost btn-sm ticket-edit" data-tid="${t.id}">Edit</button>
+          <button class="btn btn-danger btn-sm ticket-del" data-tid="${t.id}">Del</button>
+        </td>
+      </tr>`).join('');
+
+    tbody.querySelectorAll('.ticket-edit').forEach(btn => {
+      btn.addEventListener('click', () => showEditTicketModal(list.find(t => t.id == btn.dataset.tid)));
+    });
+    tbody.querySelectorAll('.ticket-del').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Delete ticket?')) return;
+        try { await Api.tickets.del(btn.dataset.tid); toast('Deleted', 'success'); loadTickets(); }
+        catch(e) { toast(e.message, 'error'); }
+      });
+    });
+  } catch(e) { toast('Failed to load tickets', 'error'); }
+}
+
+function showCreateTicketModal() {
+  showModal('New Ticket', `
+    <div class="form-group"><label>Title *</label><input type="text" id="ntk-title"></div>
+    <div class="form-group"><label>Description</label><textarea id="ntk-desc"></textarea></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+      <div class="form-group"><label>Priority</label>
+        <select id="ntk-priority"><option>low</option><option selected>medium</option><option>high</option><option>urgent</option></select>
+      </div>
+      <div class="form-group"><label>Due Date</label><input type="date" id="ntk-due"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="ntk-save">Create</button>
+    </div>`);
+  document.getElementById('ntk-save').addEventListener('click', async () => {
+    const title = document.getElementById('ntk-title').value.trim();
+    if (!title) return toast('Title required', 'error');
+    try {
+      await Api.tickets.create({ title, description: document.getElementById('ntk-desc').value, priority: document.getElementById('ntk-priority').value, due_date: document.getElementById('ntk-due').value || null });
+      closeModal(); toast('Ticket created', 'success'); loadTickets();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+function showEditTicketModal(ticket) {
+  showModal('Edit Ticket #' + ticket.id, `
+    <div class="form-group"><label>Title</label><input type="text" id="etk-title" value="${esc(ticket.title)}"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+      <div class="form-group"><label>Status</label>
+        <select id="etk-status">
+          <option ${ticket.status==='open'?'selected':''}>open</option>
+          <option ${ticket.status==='in_progress'?'selected':''} value="in_progress">in_progress</option>
+          <option ${ticket.status==='resolved'?'selected':''}>resolved</option>
+          <option ${ticket.status==='closed'?'selected':''}>closed</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Priority</label>
+        <select id="etk-priority">
+          <option ${ticket.priority==='low'?'selected':''}>low</option>
+          <option ${ticket.priority==='medium'?'selected':''}>medium</option>
+          <option ${ticket.priority==='high'?'selected':''}>high</option>
+          <option ${ticket.priority==='urgent'?'selected':''}>urgent</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="etk-save">Save</button>
+    </div>`);
+  document.getElementById('etk-save').addEventListener('click', async () => {
+    try {
+      await Api.tickets.update(ticket.id, { title: document.getElementById('etk-title').value, status: document.getElementById('etk-status').value, priority: document.getElementById('etk-priority').value });
+      closeModal(); toast('Updated', 'success'); loadTickets();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── CONTACTS VIEW ───────────────────────────────────────────────── //
+async function renderContacts() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full">
+      <div class="section-header">
+        <h2>Contacts</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem;align-items:center">
+          <div class="search-bar"><input type="search" id="contact-search" placeholder="Search…" style="width:200px"></div>
+          <button class="btn btn-primary btn-sm" id="new-contact-btn">+ New Contact</button>
+        </div>
+      </div>
+      <div class="list-container" id="contacts-list">
+        <div class="loading-center"><div class="spinner"></div></div>
+      </div>
+    </div>`;
+
+  await loadContacts();
+  document.getElementById('contact-search').addEventListener('input', e => {
+    State.contacts.search = e.target.value;
+    debounce(loadContacts, 300)();
+  });
+  document.getElementById('new-contact-btn').addEventListener('click', () => showContactModal());
+}
+
+function debounce(fn, ms) {
+  let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+async function loadContacts() {
+  const q = {};
+  if (State.contacts.search) q.search = State.contacts.search;
+  try {
+    const list = await Api.contacts.list(q);
+    State.contacts.list = list;
+    const el = document.getElementById('contacts-list');
+    if (!el) return;
+    if (!list.length) { el.innerHTML = `<div class="loading-center text-muted">No contacts</div>`; return; }
+    el.innerHTML = list.map(c => `
+      <div class="contact-card" data-cid="${c.id}">
+        <div class="contact-avatar">${initials(c.name||c.phone_number)}</div>
+        <div class="contact-info">
+          <div class="contact-name">${esc(c.name||'—')}</div>
+          <div class="contact-phone">${esc(c.phone_number)}</div>
+          ${c.company ? `<div class="contact-company">${esc(c.company)}</div>` : ''}
+        </div>
+        <div style="display:flex;gap:.35rem;margin-left:auto">
+          <button class="btn btn-ghost btn-sm contact-edit" data-cid="${c.id}">Edit</button>
+          <button class="btn btn-danger btn-sm contact-del" data-cid="${c.id}">Del</button>
+        </div>
+      </div>`).join('');
+    el.querySelectorAll('.contact-edit').forEach(btn => {
+      btn.addEventListener('click', e => { e.stopPropagation(); showContactModal(list.find(c => c.id == btn.dataset.cid)); });
+    });
+    el.querySelectorAll('.contact-del').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        if (!confirm('Delete contact?')) return;
+        try { await Api.contacts.del(btn.dataset.cid); toast('Deleted', 'success'); loadContacts(); }
+        catch(err) { toast(err.message, 'error'); }
+      });
+    });
+  } catch(_) {}
+}
+
+function showContactModal(contact = null) {
+  const c = contact || {};
+  showModal(contact ? 'Edit Contact' : 'New Contact', `
+    <div class="form-group"><label>Name</label><input type="text" id="ct-name" value="${esc(c.name||'')}"></div>
+    <div class="form-group"><label>Phone Number *</label><input type="text" id="ct-phone" value="${esc(c.phone_number||'')}" ${contact?'readonly':''}></div>
+    <div class="form-group"><label>Email</label><input type="email" id="ct-email" value="${esc(c.email||'')}"></div>
+    <div class="form-group"><label>Company</label><input type="text" id="ct-company" value="${esc(c.company||'')}"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="ct-save">Save</button>
+    </div>`);
+  document.getElementById('ct-save').addEventListener('click', async () => {
+    const phone = document.getElementById('ct-phone').value.trim();
+    if (!phone) return toast('Phone required', 'error');
+    try {
+      const body = { phone_number: phone, name: document.getElementById('ct-name').value, email: document.getElementById('ct-email').value, company: document.getElementById('ct-company').value };
+      if (contact) await Api.contacts.update(contact.id, body);
+      else await Api.contacts.create(body);
+      closeModal(); toast(contact ? 'Updated' : 'Created', 'success'); loadContacts();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── ANALYTICS VIEW ──────────────────────────────────────────────── //
+async function renderAnalytics() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header"><h2>Analytics</h2></div>
+      <div id="analytics-body">
+        <div class="loading-center"><div class="spinner"></div></div>
+      </div>
+    </div>`;
+  try {
+    const [dash, msg, tkt, agents] = await Promise.all([
+      Api.analytics.dashboard(),
+      Api.analytics.messages(30),
+      Api.analytics.tickets(),
+      Api.analytics.agents(30),
+    ]);
+    const body = document.getElementById('analytics-body');
+    body.innerHTML = `
+      <div class="metrics-grid">
+        <div class="metric-card metric-accent">
+          <div class="metric-label">Total Chats</div>
+          <div class="metric-value">${dash.total_chats ?? 0}</div>
+          <div class="metric-sub">All conversations</div>
+        </div>
+        <div class="metric-card metric-blue">
+          <div class="metric-label">Messages (30d)</div>
+          <div class="metric-value">${(msg.outgoing_messages ?? 0) + (msg.incoming_messages ?? 0)}</div>
+          <div class="metric-sub">${msg.outgoing_messages ?? 0} sent · ${msg.incoming_messages ?? 0} received</div>
+        </div>
+        <div class="metric-card metric-orange">
+          <div class="metric-label">Open Tickets</div>
+          <div class="metric-value">${tkt.open ?? 0}</div>
+          <div class="metric-sub">${tkt.in_progress ?? 0} in progress</div>
+        </div>
+        <div class="metric-card metric-green">
+          <div class="metric-label">Resolved Tickets</div>
+          <div class="metric-value">${tkt.resolved ?? 0}</div>
+          <div class="metric-sub">${tkt.sla_breached ?? 0} SLA breached</div>
+        </div>
+        <div class="metric-card metric-accent">
+          <div class="metric-label">Unread Chats</div>
+          <div class="metric-value">${dash.unread_chats ?? 0}</div>
+        </div>
+        <div class="metric-card metric-orange">
+          <div class="metric-label">Flagged Chats</div>
+          <div class="metric-value">${dash.flagged_chats ?? 0}</div>
+        </div>
+      </div>
+      <div class="analytics-section">
+        <div class="content-card">
+          <div class="card-header">Agent Performance (30d)</div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>Agent</th><th>Messages Sent</th><th>Chats Assigned</th><th>Open Tickets</th></tr></thead>
+              <tbody>${(agents||[]).map(a => `
+                <tr>
+                  <td style="font-weight:600">${esc(a.agent_name||'Agent '+a.agent_id)}</td>
+                  <td>${a.messages_sent ?? 0}</td>
+                  <td>${a.chats_assigned ?? 0}</td>
+                  <td>${a.open_tickets ?? 0}</td>
+                </tr>`).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--text-3);padding:1.5rem">No data yet</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>`;
+  } catch(e) {
+    document.getElementById('analytics-body').innerHTML = `<div class="loading-center text-muted">Could not load analytics</div>`;
+  }
+}
+
+// ── AI AGENT VIEW ───────────────────────────────────────────────── //
+async function renderAIAgent() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header"><h2>AI Agent</h2></div>
+      <div class="scroll-area">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+          <div class="content-card">
+            <div class="card-header">Active AI Chats</div>
+            <div class="card-body" id="ai-chats-list"><div class="spinner"></div></div>
+          </div>
+          <div class="content-card">
+            <div class="card-header">
+              Knowledge Base
+              <div class="header-actions"><a href="#" id="goto-kb" style="font-size:12px;color:var(--accent)">Manage →</a></div>
+            </div>
+            <div class="card-body" id="ai-kb-preview"><div class="spinner"></div></div>
+          </div>
+        </div>
+        <div class="content-card">
+          <div class="card-header">Translate Message</div>
+          <div class="card-body">
+            <div style="display:flex;gap:.75rem;align-items:flex-end">
+              <div class="form-group" style="flex:1;margin:0"><label>Text</label><textarea id="tl-text" style="min-height:60px" placeholder="Enter text to translate..."></textarea></div>
+              <div class="form-group" style="margin:0"><label>Language</label>
+                <select id="tl-lang"><option value="hindi">Hindi</option><option value="spanish">Spanish</option><option value="french">French</option><option value="arabic">Arabic</option><option value="english">English</option></select>
+              </div>
+              <button class="btn btn-primary btn-sm" id="tl-btn" style="margin-bottom:1rem">Translate</button>
+            </div>
+            <div id="tl-result" style="display:none;background:var(--bg);padding:.75rem;border-radius:4px;font-size:13px;margin-top:.5rem"></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  document.getElementById('goto-kb').addEventListener('click', e => { e.preventDefault(); navigateTo('knowledge-base'); });
+
+  try {
+    const chats = await Api.inbox.chats({ ai_active: true });
+    const el = document.getElementById('ai-chats-list');
+    if (!chats.length) { el.innerHTML = `<p class="text-muted">No active AI chats</p>`; }
+    else {
+      el.innerHTML = chats.map(c => `
+        <div style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;border-bottom:1px solid var(--border-light)">
+          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(c.name||c.chat_wid)}</div>
+          <span class="${pillClass(c.ai_state||'ACTIVE')}">${c.ai_state||'ACTIVE'}</span></div>
+          <button class="btn btn-ghost btn-sm ai-takeover" data-cid="${c.id}">Takeover</button>
+        </div>`).join('');
+      el.querySelectorAll('.ai-takeover').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          try { await Api.ai.takeover(btn.dataset.cid); toast('Human takeover done', 'success'); renderAIAgent(); }
+          catch(e) { toast(e.message, 'error'); }
+        });
+      });
+    }
+  } catch(_) {}
+
+  try {
+    const items = await Api.kb.list({ limit: 5 });
+    const el = document.getElementById('ai-kb-preview');
+    if (!items.length) { el.innerHTML = `<p class="text-muted">No knowledge items yet</p>`; }
+    else { el.innerHTML = items.map(i => `<div style="font-size:13px;padding:.35rem 0;border-bottom:1px solid var(--border-light)">${esc(i.title)}</div>`).join(''); }
+  } catch(_) {}
+
+  document.getElementById('tl-btn').addEventListener('click', async () => {
+    const text = document.getElementById('tl-text').value.trim();
+    if (!text) return;
+    try {
+      const res = await Api.ai.translate(text, document.getElementById('tl-lang').value);
+      const div = document.getElementById('tl-result');
+      div.textContent = res.translated || res.translation || JSON.stringify(res);
+      div.style.display = 'block';
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── AUTOMATION VIEW ─────────────────────────────────────────────── //
+async function renderAutomation() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Automation Rules</h2>
+        <div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-rule-btn">+ New Rule</button></div>
+      </div>
+      <div class="scroll-area" id="rules-list"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>`;
+
+  await loadRules();
+  document.getElementById('new-rule-btn').addEventListener('click', () => showRuleModal());
+}
+
+async function loadRules() {
+  try {
+    const [rules, triggers] = await Promise.all([Api.automation.list(), Api.automation.triggers()]);
+    const el = document.getElementById('rules-list');
+    if (!el) return;
+    if (!rules.length) { el.innerHTML = `<div class="loading-center text-muted">No automation rules yet</div>`; return; }
+    el.innerHTML = rules.map(r => `
+      <div class="rule-card" style="margin-bottom:.65rem">
+        <div class="rule-info">
+          <div class="rule-name">${esc(r.name)}</div>
+          <div class="rule-trigger">Trigger: ${esc(r.trigger_type)} · Runs: ${r.runs_count || 0}</div>
+          <div class="rule-actions-list">Actions: ${(r.actions||[]).map(a => a.type||a).join(', ')}</div>
+        </div>
+        <div class="rule-controls">
+          <span class="${pillClass(r.is_active ? 'active' : 'inactive')}">${r.is_active ? 'Active' : 'Paused'}</span>
+          <button class="btn btn-ghost btn-sm rule-toggle" data-rid="${r.id}" data-active="${r.is_active}">${r.is_active ? 'Pause' : 'Resume'}</button>
+          <button class="btn btn-danger btn-sm rule-del" data-rid="${r.id}">Del</button>
+        </div>
+      </div>`).join('');
+
+    el.querySelectorAll('.rule-toggle').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try {
+          await Api.automation.update(btn.dataset.rid, { is_active: btn.dataset.active === 'true' ? false : true });
+          toast('Updated', 'success'); loadRules();
+        } catch(e) { toast(e.message, 'error'); }
+      });
+    });
+    el.querySelectorAll('.rule-del').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Delete rule?')) return;
+        try { await Api.automation.del(btn.dataset.rid); toast('Deleted', 'success'); loadRules(); }
+        catch(e) { toast(e.message, 'error'); }
+      });
+    });
+  } catch(_) {}
+}
+
+function showRuleModal() {
+  showModal('New Automation Rule', `
+    <div class="form-group"><label>Rule Name *</label><input type="text" id="rl-name" placeholder="e.g. Auto-assign support"></div>
+    <div class="form-group"><label>Trigger</label>
+      <select id="rl-trigger">
+        <option value="message_received">Message Received</option>
+        <option value="message_keyword">Message Keyword Match</option>
+        <option value="chat_created">Chat Created</option>
+        <option value="ticket_created">Ticket Created</option>
+        <option value="no_reply_timeout">No Reply Timeout</option>
+      </select>
+    </div>
+    <div class="form-group"><label>Criteria (JSON)</label><textarea id="rl-criteria" style="font-family:monospace;font-size:12px">{}</textarea></div>
+    <div class="form-group"><label>Actions (JSON array)</label><textarea id="rl-actions" style="font-family:monospace;font-size:12px">[{"type":"send_message","message":"Hello!"}]</textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="rl-save">Create Rule</button>
+    </div>`);
+  document.getElementById('rl-save').addEventListener('click', async () => {
+    const name = document.getElementById('rl-name').value.trim();
+    if (!name) return toast('Name required', 'error');
+    try {
+      const criteria = JSON.parse(document.getElementById('rl-criteria').value || '{}');
+      const actions = JSON.parse(document.getElementById('rl-actions').value || '[]');
+      await Api.automation.create({ name, trigger_type: document.getElementById('rl-trigger').value, criteria, actions });
+      closeModal(); toast('Rule created', 'success'); loadRules();
+    } catch(e) { toast(e.message || 'Invalid JSON', 'error'); }
+  });
+}
+
+// ── KNOWLEDGE BASE ──────────────────────────────────────────────── //
+async function renderKnowledgeBase() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Knowledge Base</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
+          <select id="kb-filter" style="font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:4px">
+            <option value="">All</option><option value="faq">FAQ</option><option value="document">Document</option>
+          </select>
+          <button class="btn btn-primary btn-sm" id="new-kb-btn">+ Add Item</button>
+        </div>
+      </div>
+      <div class="scroll-area" id="kb-list"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>`;
+  await loadKB();
+  document.getElementById('new-kb-btn').addEventListener('click', () => showKBModal());
+  document.getElementById('kb-filter').addEventListener('change', e => loadKB(e.target.value));
+}
+
+async function loadKB(type = '') {
+  const q = {};
+  if (type) q.item_type = type;
+  try {
+    const items = await Api.kb.list(q);
+    const el = document.getElementById('kb-list');
+    if (!el) return;
+    if (!items.length) { el.innerHTML = `<div class="loading-center text-muted">No knowledge items</div>`; return; }
+    el.innerHTML = items.map(i => `
+      <div class="kb-item">
+        <div class="kb-item-title">${esc(i.title)}</div>
+        <div class="kb-item-content">${esc((i.content||'').substring(0,200))}${i.content?.length > 200 ? '…' : ''}</div>
+        <div class="kb-item-footer">
+          <span class="pill ${i.status==='active'?'pill-resolved':'pill-in_progress'}">${i.status}</span>
+          <span class="text-muted">${i.item_type}</span>
+          ${i.is_self_learned ? '<span class="pill pill-open">AI Learned</span>' : ''}
+          <div style="margin-left:auto;display:flex;gap:.35rem">
+            ${i.status !== 'active' ? `<button class="btn btn-secondary btn-sm kb-approve" data-id="${i.id}">Approve</button>` : ''}
+            <button class="btn btn-ghost btn-sm kb-edit" data-id="${i.id}">Edit</button>
+            <button class="btn btn-danger btn-sm kb-del" data-id="${i.id}">Del</button>
+          </div>
+        </div>
+      </div>`).join('');
+    el.querySelectorAll('.kb-approve').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try { await Api.kb.approve(btn.dataset.id); toast('Approved', 'success'); loadKB(); }
+        catch(e) { toast(e.message, 'error'); }
+      });
+    });
+    el.querySelectorAll('.kb-del').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Delete?')) return;
+        try { await Api.kb.del(btn.dataset.id); toast('Deleted', 'success'); loadKB(); }
+        catch(e) { toast(e.message, 'error'); }
+      });
+    });
+    el.querySelectorAll('.kb-edit').forEach(btn => {
+      btn.addEventListener('click', () => showKBModal(items.find(i => i.id == btn.dataset.id)));
+    });
+  } catch(_) {}
+}
+
+function showKBModal(item = null) {
+  const i = item || {};
+  showModal(item ? 'Edit Knowledge Item' : 'New Knowledge Item', `
+    <div class="form-group"><label>Title *</label><input type="text" id="kb-title" value="${esc(i.title||'')}"></div>
+    <div class="form-group"><label>Type</label>
+      <select id="kb-type"><option ${i.item_type==='faq'?'selected':''} value="faq">FAQ</option><option ${i.item_type==='document'?'selected':''} value="document">Document</option></select>
+    </div>
+    <div class="form-group"><label>Content</label><textarea id="kb-content" style="min-height:120px">${esc(i.content||'')}</textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="kb-save">Save</button>
+    </div>`);
+  document.getElementById('kb-save').addEventListener('click', async () => {
+    const title = document.getElementById('kb-title').value.trim();
+    if (!title) return toast('Title required', 'error');
+    try {
+      const body = { title, item_type: document.getElementById('kb-type').value, content: document.getElementById('kb-content').value };
+      if (item) await Api.kb.update(item.id, body);
+      else await Api.kb.create(body);
+      closeModal(); toast(item ? 'Updated' : 'Created', 'success'); loadKB();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── BULK MESSAGING ──────────────────────────────────────────────── //
+async function renderBulk() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Bulk Messaging</h2>
+        <div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-bulk-btn">+ New Campaign</button></div>
+      </div>
+      <div class="scroll-area" id="bulk-list"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>`;
+  await loadBulkJobs();
+  document.getElementById('new-bulk-btn').addEventListener('click', () => showBulkModal());
+}
+
+async function loadBulkJobs() {
+  try {
+    const jobs = await Api.bulk.list();
+    const el = document.getElementById('bulk-list');
+    if (!el) return;
+    if (!jobs.length) { el.innerHTML = `<div class="loading-center text-muted">No bulk jobs yet</div>`; return; }
+    el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
+      <thead><tr><th>Name</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Credits</th><th>Scheduled</th><th></th></tr></thead>
+      <tbody>${jobs.map(j => `<tr>
+        <td style="font-weight:600">${esc(j.name)}</td>
+        <td><span class="${pillClass(j.status==='completed'?'resolved':j.status==='running'?'in_progress':'open')}">${j.status}</span></td>
+        <td>${(j.recipient_chat_ids||[]).length}</td>
+        <td>${j.sent_count||0}</td>
+        <td>${j.failed_count||0}</td>
+        <td>${j.credits_used||0}</td>
+        <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? new Date(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
+        <td>${j.status==='pending' ? `<button class="btn btn-primary btn-sm bulk-send" data-jid="${j.id}">Send Now</button>` : ''}</td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+    el.querySelectorAll('.bulk-send').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Send now?')) return;
+        try { await Api.bulk.send(btn.dataset.jid); toast('Sending...', 'success'); setTimeout(loadBulkJobs, 1500); }
+        catch(e) { toast(e.message, 'error'); }
+      });
+    });
+  } catch(_) {}
+}
+
+function showBulkModal() {
+  const phoneOpts = State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('');
+  showModal('New Bulk Campaign', `
+    <div class="form-group"><label>Campaign Name *</label><input type="text" id="bk-name"></div>
+    <div class="form-group"><label>Phone</label><select id="bk-phone">${phoneOpts}</select></div>
+    <div class="form-group"><label>Message *</label><textarea id="bk-msg" style="min-height:80px" placeholder="Your broadcast message..."></textarea></div>
+    <div class="form-group"><label>Recipient Chat IDs (comma separated)</label><input type="text" id="bk-ids" placeholder="1,2,3..."></div>
+    <div class="form-group"><label>Schedule At (leave empty for manual send)</label><input type="datetime-local" id="bk-schedule"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="bk-save">Create Campaign</button>
+    </div>`);
+  document.getElementById('bk-save').addEventListener('click', async () => {
+    const name = document.getElementById('bk-name').value.trim();
+    const msg = document.getElementById('bk-msg').value.trim();
+    if (!name || !msg) return toast('Name and message required', 'error');
+    const idsRaw = document.getElementById('bk-ids').value;
+    const ids = idsRaw ? idsRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : [];
+    try {
+      const body = {
+        name, message: msg,
+        phone_id: parseInt(document.getElementById('bk-phone').value),
+        recipient_chat_ids: ids,
+        scheduled_at: document.getElementById('bk-schedule').value || null,
+      };
+      await Api.bulk.create(body);
+      closeModal(); toast('Campaign created', 'success'); loadBulkJobs();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── SETTINGS VIEW ───────────────────────────────────────────────── //
+async function renderSettings() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header"><h2>Settings</h2></div>
+      <div class="tab-bar" id="settings-tabs">
+        <div class="tab active" data-tab="phones">Phone Numbers</div>
+        <div class="tab" data-tab="labels">Labels</div>
+        <div class="tab" data-tab="quickreplies">Quick Replies</div>
+        <div class="tab" data-tab="agents">Agents</div>
+      </div>
+      <div class="scroll-area" id="settings-content"></div>
+    </div>`;
+
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+      loadSettingsTab(t.dataset.tab);
+    });
+  });
+
+  loadSettingsTab('phones');
+}
+
+async function loadSettingsTab(tab) {
+  const el = document.getElementById('settings-content');
+  if (!el) return;
+  el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+
+  if (tab === 'phones') {
+    try {
+      const phones = await Api.phones.list();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="add-phone-btn">+ Add Phone</button>
+        </div>
+        <div class="settings-grid" id="phones-grid">
+          ${phones.map(p => `
+            <div class="content-card">
+              <div class="card-header">
+                ${esc(p.name||p.phone_number)}
+                <div class="header-actions">
+                  <span class="pill ${p.waha_status==='WORKING'?'pill-resolved':'pill-in_progress'}">${p.waha_status||'unknown'}</span>
+                </div>
+              </div>
+              <div class="card-body" style="font-size:12px;color:var(--text-2)">
+                <div>Number: <strong>${esc(p.phone_number)}</strong></div>
+                <div>Session: ${esc(p.session_name)}</div>
+                <div style="margin-top:.5rem;display:flex;gap:.35rem;flex-wrap:wrap">
+                  <button class="btn btn-secondary btn-sm phone-qr" data-pid="${p.id}">Show QR</button>
+                  <button class="btn btn-secondary btn-sm phone-start" data-pid="${p.id}">Start Session</button>
+                  <button class="btn btn-danger btn-sm phone-del" data-pid="${p.id}">Remove</button>
+                </div>
+              </div>
+            </div>`).join('')}
+        </div>`;
+      if (!phones.length) document.getElementById('phones-grid').innerHTML = `<p class="text-muted">No phones added yet</p>`;
+
+      document.getElementById('add-phone-btn').addEventListener('click', () => showPhoneModal());
+      el.querySelectorAll('.phone-qr').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          try {
+            const res = await Api.phones.qr(btn.dataset.pid);
+            showModal('Scan QR Code', `<div style="text-align:center"><img src="${res.qr||res}" style="max-width:260px;border-radius:4px"><p class="text-muted" style="margin-top:.5rem">Scan with WhatsApp to connect</p></div>`);
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.phone-start').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          try { await Api.phones.start(btn.dataset.pid); toast('Session started', 'success'); loadSettingsTab('phones'); }
+          catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.phone-del').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          if (!confirm('Remove phone?')) return;
+          try { await Api.phones.del(btn.dataset.pid); toast('Removed', 'success'); loadSettingsTab('phones'); loadPhones(); }
+          catch(e) { toast(e.message, 'error'); }
+        });
+      });
+    } catch(_) { el.innerHTML = '<div class="loading-center text-muted">Could not load phones</div>'; }
+  }
+
+  else if (tab === 'labels') {
+    try {
+      const lbls = await Api.labels.list();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="add-label-btn">+ New Label</button>
+        </div>
+        ${lbls.map(l => `
+          <div style="display:flex;align-items:center;gap:.75rem;padding:.6rem .85rem;border-bottom:1px solid var(--border-light)">
+            <div style="width:14px;height:14px;border-radius:3px;background:${esc(l.color)};flex-shrink:0"></div>
+            <span style="font-weight:600;font-size:13px">${esc(l.name)}</span>
+            <div style="margin-left:auto;display:flex;gap:.35rem">
+              <button class="btn btn-danger btn-sm lbl-del" data-id="${l.id}">Del</button>
+            </div>
+          </div>`).join('') || '<p class="text-muted" style="padding:.5rem">No labels yet</p>'}`;
+
+      document.getElementById('add-label-btn').addEventListener('click', () => {
+        showModal('New Label', `
+          <div class="form-group"><label>Name *</label><input type="text" id="lbl-name" placeholder="e.g. VIP, Support, Sales"></div>
+          <div class="form-group"><label>Color</label><input type="color" id="lbl-color" value="#0D8C7C"></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="lbl-save">Create</button>
+          </div>`);
+        document.getElementById('lbl-save').addEventListener('click', async () => {
+          const name = document.getElementById('lbl-name').value.trim();
+          if (!name) return toast('Name required', 'error');
+          try { await Api.labels.create({ name, color: document.getElementById('lbl-color').value }); closeModal(); toast('Label created', 'success'); loadSettingsTab('labels'); loadLabels(); }
+          catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.lbl-del').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          if (!confirm('Delete label?')) return;
+          try { await Api.labels.del(btn.dataset.id); toast('Deleted', 'success'); loadSettingsTab('labels'); loadLabels(); }
+          catch(e) { toast(e.message, 'error'); }
+        });
+      });
+    } catch(_) {}
+  }
+
+  else if (tab === 'quickreplies') {
+    try {
+      const qrs = await Api.quickReplies.list();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="add-qr-btn">+ New Quick Reply</button>
+        </div>
+        ${qrs.map(q => `
+          <div style="display:flex;align-items:flex-start;gap:.75rem;padding:.75rem .85rem;border-bottom:1px solid var(--border-light)">
+            <div style="flex:1">
+              <div style="font-weight:700;font-size:13px;color:var(--accent)">/${esc(q.command)}</div>
+              <div style="font-size:12px;color:var(--text-2);margin-top:.1rem">${esc(q.message)}</div>
+            </div>
+            <button class="btn btn-danger btn-sm qr-del" data-id="${q.id}">Del</button>
+          </div>`).join('') || '<p class="text-muted" style="padding:.5rem">No quick replies yet</p>'}`;
+
+      document.getElementById('add-qr-btn').addEventListener('click', () => {
+        showModal('New Quick Reply', `
+          <div class="form-group"><label>Command *</label><input type="text" id="qr-cmd" placeholder="e.g. hello (no slash)"></div>
+          <div class="form-group"><label>Message *</label><textarea id="qr-msg" placeholder="Message text to send..."></textarea></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="qr-save">Create</button>
+          </div>`);
+        document.getElementById('qr-save').addEventListener('click', async () => {
+          const cmd = document.getElementById('qr-cmd').value.trim();
+          const msg = document.getElementById('qr-msg').value.trim();
+          if (!cmd || !msg) return toast('Command and message required', 'error');
+          try { await Api.quickReplies.create({ command: cmd, message: msg }); closeModal(); toast('Created', 'success'); loadSettingsTab('quickreplies'); }
+          catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.qr-del').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          if (!confirm('Delete?')) return;
+          try { await Api.quickReplies.del(btn.dataset.id); toast('Deleted', 'success'); loadSettingsTab('quickreplies'); }
+          catch(e) { toast(e.message, 'error'); }
+        });
+      });
+    } catch(_) {}
+  }
+
+  else if (tab === 'agents') {
+    try {
+      const agents = await Api.auth.agents();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="invite-agent-btn">+ Invite Agent</button>
+        </div>
+        ${agents.map(a => `
+          <div style="display:flex;align-items:center;gap:.75rem;padding:.65rem .85rem;border-bottom:1px solid var(--border-light)">
+            <div class="agent-avatar" style="background:${avatarColor(a.name)};width:32px;height:32px;font-size:12px">${initials(a.name)}</div>
+            <div style="flex:1">
+              <div style="font-weight:600;font-size:13px">${esc(a.name)}</div>
+              <div style="font-size:11px;color:var(--text-3)">${esc(a.email)} · ${a.role}</div>
+            </div>
+            <span class="pill ${a.is_active ? 'pill-resolved' : 'pill-closed'}">${a.is_active ? 'Active' : 'Inactive'}</span>
+          </div>`).join('')}`;
+
+      document.getElementById('invite-agent-btn').addEventListener('click', () => {
+        showModal('Invite Team Member', `
+          <div class="form-group"><label>Full Name *</label><input type="text" id="inv-name"></div>
+          <div class="form-group"><label>Email *</label><input type="email" id="inv-email"></div>
+          <div class="form-group"><label>Password *</label><input type="password" id="inv-pass"></div>
+          <div class="form-group"><label>Role</label>
+            <select id="inv-role"><option value="agent">Agent</option><option value="admin">Admin</option><option value="viewer">Viewer</option></select>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="inv-save">Invite</button>
+          </div>`);
+        document.getElementById('inv-save').addEventListener('click', async () => {
+          const name = document.getElementById('inv-name').value.trim();
+          const email = document.getElementById('inv-email').value.trim();
+          const pass = document.getElementById('inv-pass').value;
+          if (!name || !email || !pass) return toast('All fields required', 'error');
+          try {
+            await Api.auth.register({ name, email, password: pass, role: document.getElementById('inv-role').value });
+            closeModal(); toast('Agent created', 'success'); loadSettingsTab('agents');
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+    } catch(_) {}
+  }
+}
+
+function showPhoneModal() {
+  showModal('Add Phone Number', `
+    <div class="form-group"><label>Display Name</label><input type="text" id="ph-name" placeholder="e.g. Sales, Support"></div>
+    <div class="form-group"><label>Phone Number *</label><input type="text" id="ph-number" placeholder="+1234567890"></div>
+    <div class="form-group"><label>WAHA Session Name *</label><input type="text" id="ph-session" placeholder="e.g. sales-session"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="ph-save">Add Phone</button>
+    </div>`);
+  document.getElementById('ph-save').addEventListener('click', async () => {
+    const number = document.getElementById('ph-number').value.trim();
+    const session = document.getElementById('ph-session').value.trim();
+    if (!number || !session) return toast('Number and session required', 'error');
+    try {
+      await Api.phones.create({ name: document.getElementById('ph-name').value, phone_number: number, session_name: session });
+      closeModal(); toast('Phone added', 'success'); loadSettingsTab('phones'); loadPhones();
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── DASHBOARD VIEW ──────────────────────────────────────────────── //
+function _stopDashWahaPoller() {
+  if (_dashWahaTimer) { clearInterval(_dashWahaTimer); _dashWahaTimer = null; }
+}
+
+async function _updateDashWaha(phoneId) {
+  if (_dashWahaUpdating) return;
+  _dashWahaUpdating = true;
+  try {
+    const box = document.getElementById('dash-waha-box');
+    const label = document.getElementById('dash-waha-label');
+    const actions = document.getElementById('dash-waha-actions');
+    if (!box || !label || !actions) return;
+
+    let status = 'UNKNOWN';
+    try {
+      const r = await Api.phones.status(phoneId);
+      status = (r.status || 'UNKNOWN').toUpperCase();
+    } catch(_) { status = 'UNKNOWN'; }
+
+    if (status === 'WORKING') {
+      if (_dashWahaPrevStatus !== 'WORKING') {
+        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
+          <div style="width:64px;height:64px;border-radius:50%;background:#dcfce7;display:flex;align-items:center;justify-content:center">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#15803d" stroke-width="2.2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          </div>
+          <span style="font-size:12px;font-weight:600;color:#15803d;background:#dcfce7;padding:.25rem .75rem;border-radius:20px">Connected</span>
+        </div>`;
+        label.innerHTML = `<strong style="font-size:13px">Aarvi Technology</strong><br><span style="font-size:11px;color:var(--text-3)">+919510715498 · session: default</span>`;
+        actions.innerHTML = `
+          <button class="btn btn-secondary btn-sm" id="dash-btn-stop">Stop</button>
+          <button class="btn btn-primary btn-sm" id="dash-btn-restart">Restart</button>`;
+        _bindDashWahaButtons(phoneId);
+      }
+
+    } else if (status === 'SCAN_QR_CODE') {
+      if (_dashWahaPrevStatus !== 'SCAN_QR_CODE') {
+        box.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%">
+          <div style="width:28px;height:28px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+        </div>`;
+        label.innerHTML = `Loading QR code…`;
+        actions.innerHTML = `<button class="btn btn-secondary btn-sm" id="dash-btn-restart">Reconnect</button>`;
+        _bindDashWahaButtons(phoneId);
+      }
+      try {
+        const qrData = await Api.phones.qr(phoneId);
+        const boxNow = document.getElementById('dash-waha-box');
+        const lblNow = document.getElementById('dash-waha-label');
+        if (qrData && qrData.qr && boxNow) {
+          boxNow.innerHTML = `<img src="${qrData.qr}" style="width:100%;height:100%;display:block;object-fit:contain;" alt="WhatsApp QR">`;
+          if (lblNow) lblNow.innerHTML = `Scan to connect WhatsApp<br><span style="font-size:11px;color:var(--text-3)">Settings → Linked Devices → Link a Device</span>`;
+        }
+      } catch(_) {}
+
+    } else if (status === 'STARTING') {
+      if (_dashWahaPrevStatus !== 'STARTING') {
+        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.75rem;padding:1.5rem 0">
+          <div style="width:40px;height:40px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+          <span style="font-size:12px;color:var(--text-3)">Connecting…</span>
+        </div>`;
+        label.innerHTML = `Starting WhatsApp session`;
+        actions.innerHTML = ``;
+      }
+
+    } else if (status === 'STOPPED') {
+      if (_dashWahaPrevStatus !== 'STOPPED') {
+        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
+          <div style="width:64px;height:64px;border-radius:50%;background:#fee2e2;display:flex;align-items:center;justify-content:center">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+          </div>
+          <span style="font-size:12px;font-weight:600;color:#dc2626;background:#fee2e2;padding:.25rem .75rem;border-radius:20px">Disconnected</span>
+        </div>`;
+        label.innerHTML = `Session is stopped`;
+        actions.innerHTML = `<button class="btn btn-primary btn-sm" id="dash-btn-start">Start Session</button>`;
+        _bindDashWahaButtons(phoneId);
+      }
+
+    } else {
+      if (_dashWahaPrevStatus !== status) {
+        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
+          <div style="width:64px;height:64px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          </div>
+          <span style="font-size:12px;color:var(--text-3)">${status}</span>
+        </div>`;
+        label.innerHTML = `Unknown state`;
+        actions.innerHTML = `<button class="btn btn-secondary btn-sm" id="dash-btn-start">Start Session</button>`;
+        _bindDashWahaButtons(phoneId);
+      }
+    }
+    _dashWahaPrevStatus = status;
+  } finally {
+    _dashWahaUpdating = false;
+  }
+}
+
+function _bindDashWahaButtons(phoneId) {
+  document.getElementById('dash-btn-stop')?.addEventListener('click', async () => {
+    _stopDashWahaPoller();
+    const btn = document.getElementById('dash-btn-stop');
+    if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+    // Stop session and clear all synced WhatsApp data
+    await Api.phones.stop(phoneId).catch(()=>{});
+    await Api.phones.clearData(phoneId).catch(()=>{});
+    _dashWahaPrevStatus = '';
+    setTimeout(() => _startDashWahaPoller(phoneId), 1500);
+  });
+  document.getElementById('dash-btn-restart')?.addEventListener('click', async () => {
+    _stopDashWahaPoller();
+    const btn = document.getElementById('dash-btn-restart');
+    if (btn) { btn.disabled = true; btn.textContent = 'Restarting…'; }
+    await Api.phones.restart(phoneId).catch(()=>{});
+    _dashWahaPrevStatus = '';
+    setTimeout(() => _startDashWahaPoller(phoneId), 2000);
+  });
+  document.getElementById('dash-btn-start')?.addEventListener('click', async () => {
+    _stopDashWahaPoller();
+    const btn = document.getElementById('dash-btn-start');
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    await Api.phones.start(phoneId).catch(()=>{});
+    _dashWahaPrevStatus = '';
+    setTimeout(() => _startDashWahaPoller(phoneId), 2000);
+  });
+}
+
+function _startDashWahaPoller(phoneId) {
+  _dashWahaPrevStatus = '';
+  _dashWahaUpdating = false;
+  _updateDashWaha(phoneId);
+  _dashWahaTimer = setInterval(() => {
+    if (!document.getElementById('dash-waha-box')) { _stopDashWahaPoller(); return; }
+    _updateDashWaha(phoneId);
+  }, 5000);
+}
+
+async function renderDashboard() {
+  _stopDashWahaPoller();
+  const main = document.getElementById('main-content');
+
+  const cards = [
+    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`, title: 'Bulk Messages', desc: 'Send personalized broadcast messages to multiple contacts at once.', action: 'bulk', label: 'Send Now' },
+    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>`, title: 'Manage Team', desc: 'Invite agents and assign roles to manage customer conversations.', action: 'settings', label: 'Invite Agents' },
+    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>`, title: 'Add Phones', desc: 'Connect your WhatsApp numbers to start receiving messages.', action: 'settings', label: 'Add Phone' },
+    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>`, title: 'Manage Tickets', desc: 'Track and resolve customer support tickets from your inbox.', action: 'tickets', label: 'View Tickets' },
+    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>`, title: 'AI Agent', desc: 'Set up your Gemini AI agent to auto-handle conversations.', action: 'ai-agent', label: 'Configure AI' },
+    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`, title: 'Automation Rules', desc: 'Create rules to auto-assign, label and respond to messages.', action: 'automation', label: 'Create Rule' },
+  ];
+
+  main.innerHTML = `
+  <div class="dashboard-wrap">
+    <div class="dashboard-inner">
+      <div class="dashboard-title">Getting Started</div>
+      <div class="dashboard-sub">Follow the steps to connect your phone to Periskope</div>
+
+      <div class="dash-stats" id="dash-stats">
+        <div class="dash-stat accent">
+          <div class="dash-stat-label">Total Chats</div>
+          <div class="dash-stat-value" id="ds-total">—</div>
+          <div class="dash-stat-sub">All conversations</div>
+        </div>
+        <div class="dash-stat orange">
+          <div class="dash-stat-label">Open Tickets</div>
+          <div class="dash-stat-value" id="ds-tickets">—</div>
+          <div class="dash-stat-sub" id="ds-tickets-sub">Active support tickets</div>
+        </div>
+        <div class="dash-stat blue">
+          <div class="dash-stat-label">Unread Messages</div>
+          <div class="dash-stat-value" id="ds-unread">—</div>
+          <div class="dash-stat-sub">Needs attention</div>
+        </div>
+      </div>
+
+      <div class="gs-steps">
+        <div class="gs-steps-list">
+          <div class="gs-step">
+            <div class="gs-step-num">1</div>
+            <div class="gs-step-body">
+              <h4>Open the WhatsApp app with the number you want to connect</h4>
+              <p>This can be a WhatsApp personal or business number connected to any device.</p>
+            </div>
+          </div>
+          <div class="gs-step">
+            <div class="gs-step-num">2</div>
+            <div class="gs-step-body">
+              <h4>Scan the QR code to connect your phone</h4>
+              <p>On WhatsApp: Go to <strong>Settings → Linked Devices → Link a Device</strong><br>
+              Scan using a new device. The phone may need to be connected to the internet.</p>
+            </div>
+          </div>
+        </div>
+        <div class="gs-qr">
+          <div class="gs-qr-box" id="dash-waha-box">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1rem 0">
+              <div class="waha-spinner" style="width:36px;height:36px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+            </div>
+          </div>
+          <div class="gs-qr-label" id="dash-waha-label">Checking connection…</div>
+          <div class="gs-qr-actions" id="dash-waha-actions"></div>
+        </div>
+      </div>
+
+      <div class="gs-cards">
+        ${cards.map(c => `<div class="gs-card">
+          <div class="gs-card-icon">${c.icon}</div>
+          <h3>${c.title}</h3>
+          <p>${c.desc}</p>
+          <div class="gs-card-actions">
+            <button class="btn btn-primary btn-sm" onclick="switchView('${c.action}')">${c.label}</button>
+            <span class="gs-link" onclick="switchView('${c.action}')">
+              Watch tutorial
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            </span>
+          </div>
+        </div>`).join('')}
+      </div>
+    </div>
+  </div>`;
+
+  // Load quick stats asynchronously
+  try {
+    const [dash, tkt] = await Promise.all([
+      Api.analytics.dashboard(),
+      Api.analytics.tickets(),
+    ]);
+    const dsTotal = document.getElementById('ds-total');
+    const dsTickets = document.getElementById('ds-tickets');
+    const dsTicketsSub = document.getElementById('ds-tickets-sub');
+    const dsUnread = document.getElementById('ds-unread');
+    if (dsTotal) dsTotal.textContent = dash.total_chats ?? 0;
+    if (dsTickets) dsTickets.textContent = tkt.open ?? 0;
+    if (dsTicketsSub) dsTicketsSub.textContent = `${tkt.in_progress ?? 0} in progress`;
+    if (dsUnread) dsUnread.textContent = dash.unread_chats ?? 0;
+  } catch(_) {}
+
+  // Start live WAHA poller
+  try {
+    const phones = await Api.phones.list();
+    if (phones && phones.length > 0) {
+      _startDashWahaPoller(phones[0].id);
+    } else {
+      const box = document.getElementById('dash-waha-box');
+      const lbl = document.getElementById('dash-waha-label');
+      const act = document.getElementById('dash-waha-actions');
+      if (box) box.innerHTML = `<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="7" y="7" width="3" height="3" fill="#d1d5db" stroke="none"/><rect x="14" y="14" width="3" height="3" fill="#d1d5db" stroke="none"/></svg>`;
+      if (lbl) lbl.innerHTML = `Add a phone number to<br>generate QR code`;
+      if (act) act.innerHTML = `<button class="btn btn-secondary btn-sm" onclick="switchView('settings')">Add Phone</button>`;
+    }
+  } catch(_) {}
+}
+
+// ── COMMUNITIES VIEW ────────────────────────────────────────────── //
+async function renderCommunities() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Communities</h2>
+        <div class="header-actions" style="margin-left:auto">
+          <button class="btn btn-primary btn-sm" onclick="switchView('contacts')">Manage Contacts</button>
+        </div>
+      </div>
+      <div class="scroll-area">
+        <div class="empty-state" style="padding:4rem 2rem">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:52px;height:52px;opacity:.15"><path d="M3 21l9-18 9 18"/><path d="M6 15h12"/></svg>
+          <p style="font-size:14px;color:var(--text-3);max-width:320px;text-align:center;line-height:1.6">
+            Communities let you organize contacts and broadcast messages to specific groups.
+            Connect your WhatsApp to get started.
+          </p>
+          <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect a Phone</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── LOGS VIEW ───────────────────────────────────────────────────── //
+async function renderLogs() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Logs</h2>
+        <div class="header-actions" style="margin-left:auto">
+          <button class="btn btn-secondary btn-sm" onclick="switchView('analytics')">View Analytics</button>
+        </div>
+      </div>
+      <div class="scroll-area">
+        <div class="content-card">
+          <div class="card-header">Activity Log</div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr><th>Time</th><th>Event</th><th>Agent</th><th>Details</th></tr>
+              </thead>
+              <tbody id="logs-tbody">
+                <tr><td colspan="4" style="text-align:center;padding:3rem;color:var(--text-3)">
+                  No activity logs available yet. Logs will appear here as your team uses the platform.
+                </td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+// Alias so dashboard card buttons can call switchView(...)
+function switchView(view) { navigateTo(view); }
+
+// ── Boot ────────────────────────────────────────────────────────── //
+window.onerror = (msg, src, line, col, err) => {
+  console.error('[uncaught]', msg, 'at', src, line + ':' + col, err);
+};
+window.addEventListener('unhandledrejection', e => {
+  console.error('[unhandled promise]', e.reason);
+});
+checkAuth();

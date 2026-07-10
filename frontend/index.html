@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Periskope — WhatsApp CRM</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<!-- LOGIN SCREEN -->
+<div id="login-screen" class="login-screen has-panel">
+
+  <div class="ls-outer">
+  <div class="ls-wrap">
+
+    <!-- Logo above card -->
+    <div class="ls-brand">
+      <div class="ls-logo">
+        <svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" style="width:36px;height:36px">
+          <mask id="ls-mask" maskUnits="userSpaceOnUse"><circle cx="256" cy="256" r="256" fill="#3C3"/></mask>
+          <g mask="url(#ls-mask)">
+            <circle cx="256" cy="256" r="256" fill="#15803D"/>
+            <path fill="#fff" d="M88 258c0-55.228 44.772-100 100-100h100v369H88z"/>
+            <path fill="#fff" d="M218 158h125c55.228 0 100 44.772 100 100s-44.772 100-100 100H218z"/>
+            <circle cx="339" cy="258" r="75" fill="#15803D"/>
+            <path fill="#15803D" d="m256.478 322.112 12.879-37.603 26.712 34.08z"/>
+            <circle cx="310" cy="261" r="10" fill="#fff"/>
+            <circle cx="343" cy="261" r="10" fill="#fff"/>
+            <circle cx="376" cy="261" r="10" fill="#fff"/>
+          </g>
+        </svg>
+      </div>
+      <div class="ls-brand-name">
+        <span>Periskope</span>
+        <span class="ls-brand-tag">WhatsApp CRM Platform</span>
+      </div>
+    </div>
+
+    <!-- Form card -->
+    <div class="ls-card">
+
+      <div class="ls-card-head">
+        <h2>Log in to Periskope</h2>
+        <p>Enter your credentials to continue</p>
+      </div>
+
+      <form id="login-form" autocomplete="off" novalidate>
+
+        <div class="lf-group">
+          <label for="login-email">Email address</label>
+          <div class="lf-input-wrap">
+            <svg class="lf-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+            <input type="email" id="login-email" placeholder="admin@gmail.com" required autocomplete="email">
+          </div>
+        </div>
+
+        <div class="lf-group">
+          <label for="login-password">Password</label>
+          <div class="lf-input-wrap">
+            <svg class="lf-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            <input type="password" id="login-password" placeholder="••••••••••" required autocomplete="current-password">
+            <button type="button" class="lf-eye" id="toggle-password" tabindex="-1" aria-label="Show password">
+              <svg id="eye-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="login-error" class="lf-error" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span id="login-error-msg">Invalid email or password</span>
+        </div>
+
+        <button type="submit" class="lf-submit" id="login-btn">
+          <span id="login-btn-text">Sign In</span>
+          <svg id="login-btn-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          <svg id="login-btn-spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="display:none"><circle cx="12" cy="12" r="10" stroke-opacity=".2"/><path d="M12 2a10 10 0 0 1 10 10" stroke-linecap="round"/></svg>
+        </button>
+
+      </form>
+
+      <div class="lf-trust">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        Secured with JWT &amp; bcrypt encryption
+      </div>
+
+    </div>
+
+    <!-- Feature chips below card -->
+    <div class="ls-chips">
+      <span class="ls-chip">
+        <svg viewBox="0 0 16 16" fill="currentColor" width="11" height="11"><path d="M2 3a1 1 0 011-1h10a1 1 0 011 1v7a1 1 0 01-1 1H9l-2 2-2-2H3a1 1 0 01-1-1V3z"/></svg>
+        Multi-number Inbox
+      </span>
+      <span class="ls-chip">
+        <svg viewBox="0 0 16 16" fill="currentColor" width="11" height="11"><path fill-rule="evenodd" d="M9 1a1 1 0 000 2h2.586L7.293 7.293a1 1 0 101.414 1.414L13 4.414V7a1 1 0 002 0V2a1 1 0 00-1-1H9zM4 4a2 2 0 00-2 2v6a2 2 0 002 2h6a2 2 0 002-2v-1a1 1 0 00-2 0v1H4V6h1a1 1 0 000-2H4z" clip-rule="evenodd"/></svg>
+        Gemini AI Agent
+      </span>
+      <span class="ls-chip">
+        <svg viewBox="0 0 16 16" fill="currentColor" width="11" height="11"><path fill-rule="evenodd" d="M11.3 1.046A1 1 0 0112 2v3h3a1 1 0 01.8 1.6l-6 7.5A1 1 0 018 13v-3H5a1 1 0 01-.8-1.6l6-7.5a1 1 0 011.1-.354z" clip-rule="evenodd"/></svg>
+        Automation Rules
+      </span>
+    </div>
+
+    <p class="ls-footer">© 2025 Periskope · WhatsApp CRM Platform</p>
+
+  </div><!-- end ls-wrap -->
+
+  <!-- Changelog panel -->
+  <div class="ls-changelog">
+    <div class="ls-changelog-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+      What's New in Periskope
+    </div>
+    <div class="ls-cl-item">
+      <span class="ls-cl-version">v2.4</span>
+      <span class="ls-cl-date">June 2025</span>
+      <span class="ls-cl-text">Gemini AI Agent — auto-reply and takeover. Train on your knowledge base.</span>
+    </div>
+    <div class="ls-cl-item">
+      <span class="ls-cl-version">v2.3</span>
+      <span class="ls-cl-date">May 2025</span>
+      <span class="ls-cl-text">3-panel inbox with contact detail sidebar. Assign chats and manage labels inline.</span>
+    </div>
+    <div class="ls-cl-item">
+      <span class="ls-cl-version">v2.2</span>
+      <span class="ls-cl-date">Apr 2025</span>
+      <span class="ls-cl-text">Bulk messaging campaigns with scheduling and credit tracking.</span>
+    </div>
+    <div class="ls-cl-item">
+      <span class="ls-cl-version">v2.1</span>
+      <span class="ls-cl-date">Mar 2025</span>
+      <span class="ls-cl-text">Automation rules engine — auto-assign, label, and respond based on triggers.</span>
+    </div>
+    <div class="ls-cl-item">
+      <span class="ls-cl-version">v2.0</span>
+      <span class="ls-cl-date">Feb 2025</span>
+      <span class="ls-cl-text">Multi-number inbox. Connect multiple WhatsApp numbers to a single dashboard.</span>
+    </div>
+    <div class="ls-cl-item">
+      <span class="ls-cl-version">v1.9</span>
+      <span class="ls-cl-date">Jan 2025</span>
+      <span class="ls-cl-text">SLA tracking, ticket priorities, and breached SLA alerts for support teams.</span>
+    </div>
+  </div>
+
+  </div><!-- end ls-outer -->
+
+</div>
+
+<!-- MAIN APP SHELL -->
+<div id="app-shell" class="app-shell" style="display:none">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-top">
+      <div class="sidebar-brand">
+        <svg class="brand-svg" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <mask id="sb-mask" maskUnits="userSpaceOnUse"><circle cx="256" cy="256" r="256" fill="#3C3"/></mask>
+          <g mask="url(#sb-mask)">
+            <circle cx="256" cy="256" r="256" fill="#15803D"/>
+            <path fill="#fff" d="M88 258c0-55.228 44.772-100 100-100h100v369H88z"/>
+            <path fill="#fff" d="M218 158h125c55.228 0 100 44.772 100 100s-44.772 100-100 100H218z"/>
+            <circle cx="339" cy="258" r="75" fill="#15803D"/>
+            <path fill="#15803D" d="m256.478 322.112 12.879-37.603 26.712 34.08z"/>
+            <circle cx="310" cy="261" r="10" fill="#fff"/>
+            <circle cx="343" cy="261" r="10" fill="#fff"/>
+            <circle cx="376" cy="261" r="10" fill="#fff"/>
+          </g>
+        </svg>
+        <span>Periskope</span>
+      </div>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="#" class="nav-item" data-view="dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        <span>Dashboard</span>
+      </a>
+      <a href="#" class="nav-item active" data-view="inbox">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>Chats</span>
+        <span class="badge" id="unread-badge" style="display:none">0</span>
+      </a>
+      <a href="#" class="nav-item" data-view="tickets">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
+        <span>Tickets</span>
+      </a>
+      <a href="#" class="nav-item" data-view="analytics">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+        <span>Analytics</span>
+      </a>
+      <a href="#" class="nav-item" data-view="chat-list">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        <span>Chat List</span>
+      </a>
+      <a href="#" class="nav-item" data-view="bulk">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <span>Bulk Messages</span>
+      </a>
+      <a href="#" class="nav-item" data-view="contacts">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>Contacts</span>
+      </a>
+      <a href="#" class="nav-item" data-view="communities">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 21l9-18 9 18"/><path d="M6 15h12"/></svg>
+        <span>Communities</span>
+      </a>
+      <a href="#" class="nav-item" data-view="knowledge-base">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <span>Media</span>
+      </a>
+      <a href="#" class="nav-item" data-view="ai-agent">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        <span>AI</span>
+      </a>
+      <a href="#" class="nav-item" data-view="automation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <span>Automation Rules</span>
+      </a>
+      <a href="#" class="nav-item" data-view="logs">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        <span>Logs</span>
+      </a>
+      <a href="#" class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>Settings</span>
+      </a>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="agent-info" id="agent-display">
+        <div class="agent-avatar" id="agent-avatar">?</div>
+        <div class="agent-meta">
+          <div class="agent-name" id="agent-name">Loading...</div>
+          <div class="agent-role" id="agent-role">agent</div>
+        </div>
+      </div>
+      <button class="logout-btn" id="logout-btn" title="Sign out">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      </button>
+    </div>
+    <div class="sidebar-collapse">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 19l-7-7 7-7M18 19l-7-7 7-7"/></svg>
+      Collapse
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content" id="main-content-wrap">
+    <!-- Top app bar -->
+    <div class="app-topbar">
+      <div class="app-topbar-left">
+        <div class="app-breadcrumb" id="app-breadcrumb">Dashboard</div>
+      </div>
+      <div class="app-topbar-right">
+        <div class="ws-status" id="ws-status" title="Connecting…">
+          <span class="ws-dot"></span>
+          <span class="ws-label" id="ws-label">Connecting</span>
+        </div>
+        <div class="topbar-divider"></div>
+        <div class="topbar-phone-badge" id="topbar-phone-count" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
+          <span id="topbar-phone-num">0</span> phone
+        </div>
+        <div class="topbar-agent" id="topbar-agent">
+          <div class="topbar-avatar" id="topbar-avatar">?</div>
+          <span id="topbar-name">Account</span>
+        </div>
+      </div>
+    </div>
+    <div id="main-content" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+    <!-- Views injected by JS -->
+    </div>
+  </main>
+
+</div>
+
+<!-- TOAST -->
+<div id="toast" class="toast" style="display:none"></div>
+
+<!-- MODAL -->
+<div id="modal-overlay" class="modal-overlay" style="display:none">
+  <div class="modal" id="modal">
+    <div class="modal-header">
+      <h3 id="modal-title">Modal</h3>
+      <button class="modal-close" id="modal-close">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>
