@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_agent
@@ -280,6 +281,58 @@ async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depend
             pass
 
     return {"synced": synced}
+
+
+class BulkChatUpdateRequest(BaseModel):
+    chat_ids: list[int]
+    updates: dict | None = None          # is_archived / is_pinned / ai_active / is_flagged
+    mark_read: bool | None = None        # True → read, False → unread
+    add_label_id: int | None = None
+    remove_label_id: int | None = None
+
+
+@router.post("/bulk-update")
+def bulk_update_chats(
+    req: BulkChatUpdateRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Apply changes to many chats at once (chat-list bulk actions)."""
+    if not req.chat_ids:
+        raise HTTPException(400, "No chats selected")
+    ids = req.chat_ids[:500]
+    svc = InboxService(db)
+
+    allowed = {"is_archived", "is_pinned", "ai_active", "is_flagged"}
+    updates = {k: v for k, v in (req.updates or {}).items() if k in allowed}
+    if "ai_active" in updates:
+        updates["ai_state"] = "ACTIVE" if updates["ai_active"] else "INACTIVE"
+    if updates:
+        svc.bulk_update_chats(ids, **updates)
+
+    if req.mark_read is True:
+        from app.models.chat import Chat as _Chat
+        db.query(_Chat).filter(_Chat.id.in_(ids)).update({"unread_count": 0})
+        db.commit()
+    elif req.mark_read is False:
+        from app.models.chat import Chat as _Chat
+        db.query(_Chat).filter(_Chat.id.in_(ids), _Chat.unread_count == 0).update({"unread_count": 1})
+        db.commit()
+
+    if req.add_label_id:
+        for cid in ids:
+            svc.add_label_to_chat(cid, req.add_label_id)
+    if req.remove_label_id:
+        for cid in ids:
+            svc.remove_label_from_chat(cid, req.remove_label_id)
+
+    log_activity(
+        db, "chats_bulk_updated", entity_type="chat", agent_id=agent.id,
+        description=f"Bulk update on {len(ids)} chats: "
+                    f"{', '.join(list(updates.keys()) + (['read' if req.mark_read else 'unread'] if req.mark_read is not None else []) + (['+label'] if req.add_label_id else []) + (['-label'] if req.remove_label_id else []))}",
+        metadata={"chat_ids": ids},
+    )
+    return {"updated": len(ids)}
 
 
 @router.post("/chats/{chat_id}/labels/{label_id}")

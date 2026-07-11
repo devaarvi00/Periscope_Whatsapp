@@ -67,6 +67,7 @@ const Api = (() => {
     removeLabel:(cid, lid)    => del(`/inbox/chats/${cid}/labels/${lid}`),
     sync:          (pid)  => post(`/inbox/sync/${pid}`),
     syncMessages:  (cid, limit) => post(`/inbox/chats/${cid}/sync-messages${limit ? '?limit=' + limit : ''}`),
+    bulkUpdate:    (b)    => post('/inbox/bulk-update', b),
   };
 
   // Tickets
@@ -182,9 +183,10 @@ const Api = (() => {
 
   // Groups
   const groups = {
-    list:         (q)  => get('/groups', q),
-    participants: (id) => get(`/groups/${id}/participants`),
-    analytics:    (id, days) => get(`/groups/${id}/analytics`, { days: days || 30 }),
+    list:            (q)  => get('/groups', q),
+    participants:    (id) => get(`/groups/${id}/participants`),
+    analytics:       (id, days) => get(`/groups/${id}/analytics`, { days: days || 30 }),
+    addParticipants: (b)  => post('/groups/add-participants', b),
   };
 
   // Scheduled messages

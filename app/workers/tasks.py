@@ -242,6 +242,43 @@ async def run_scheduled_messages() -> None:
         db.close()
 
 
+async def check_task_reminders() -> None:
+    """Fire in-app reminders for tasks whose reminder time has arrived."""
+    from app.core.ws_manager import ws_manager
+    from app.db.session import SessionLocal
+    from app.models.task import Task
+
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        due = (
+            db.query(Task)
+            .filter(
+                Task.status == "open",
+                Task.reminder_sent == False,
+                Task.reminder_at.isnot(None),
+                Task.reminder_at <= now,
+            )
+            .limit(50)
+            .all()
+        )
+        for task in due:
+            payload = {
+                "task_id": task.id,
+                "title": task.title,
+                "due_date": task.due_date.isoformat() if task.due_date else None,
+                "priority": task.priority,
+            }
+            targets = {a for a in (task.assigned_to, task.created_by) if a}
+            for agent_id in targets:
+                await ws_manager.send_to_agent(agent_id, "task_reminder", payload)
+            task.reminder_sent = True
+            logger.info("Task reminder fired for task %s", task.id)
+        db.commit()
+    finally:
+        db.close()
+
+
 async def run_scheduled_bulk_jobs() -> None:
     """Execute bulk message jobs that are due."""
     from app.db.session import SessionLocal

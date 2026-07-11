@@ -8,6 +8,7 @@ class TicketCreate(BaseModel):
     message_id: int | None = None
     title: str
     description: str = ""
+    status: str = "open"
     priority: str = "medium"
     assigned_to: int | None = None
     due_date: datetime | None = None

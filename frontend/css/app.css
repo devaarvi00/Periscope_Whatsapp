@@ -1507,3 +1507,33 @@ textarea{resize:vertical;min-height:80px;}
 .prop-row label{font-size:11.5px;font-weight:600;color:var(--text-2);display:block;margin-bottom:2px;}
 .prop-row input,.prop-row select{height:32px !important;font-size:12.5px !important;padding:.3rem .55rem !important;}
 .prop-row .prop-multi label{display:flex;align-items:center;gap:.4rem;font-weight:400;font-size:12.5px;padding:.15rem 0;}
+
+/* ── Chat List bulk actions ─────────────────────────────────────── */
+.bulk-toolbar{
+  position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
+  z-index:450;display:flex;align-items:center;gap:.5rem;
+  background:#111827;color:#e5e7eb;border-radius:10px;
+  padding:.55rem .9rem;box-shadow:0 10px 32px rgba(0,0,0,.3);
+  font-size:12.5px;
+}
+.bulk-toolbar .bt-count{font-weight:700;color:#fff;margin-right:.35rem;white-space:nowrap;}
+.bulk-toolbar button{
+  color:#e5e7eb;font-size:12.5px;font-weight:600;
+  padding:.3rem .65rem;border-radius:7px;display:flex;align-items:center;gap:.35rem;
+}
+.bulk-toolbar button:hover{background:rgba(255,255,255,.12);}
+.chatlist-table td,.chatlist-table th{vertical-align:middle;}
+.chatlist-table input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);}
+
+/* ── Message context menu ───────────────────────────────────────── */
+.msg-context-menu{
+  position:fixed;z-index:700;min-width:170px;
+  background:#fff;border:1px solid var(--border);border-radius:9px;
+  box-shadow:var(--shadow-lg);padding:.3rem;
+}
+.msg-context-menu button{
+  display:flex;align-items:center;gap:.5rem;width:100%;
+  padding:.45rem .6rem;border-radius:6px;font-size:13px;color:var(--text-2);
+  text-align:left;
+}
+.msg-context-menu button:hover{background:var(--border-light);color:var(--text);}

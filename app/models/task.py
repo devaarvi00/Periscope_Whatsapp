@@ -21,3 +21,6 @@ class Task(Base, TimestampMixin):
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
     created_by: Mapped[int | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reminder_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reminder_sent: Mapped[bool] = mapped_column(default=False)
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id"), nullable=True)

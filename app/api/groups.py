@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -74,6 +75,42 @@ async def group_participants(chat_id: int, db: Session = Depends(get_db)):
             "is_admin": bool(p.get("isAdmin") or p.get("admin")),
         })
     return {"group": chat.name, "count": len(result), "participants": result}
+
+
+class AddParticipantsRequest(BaseModel):
+    chat_ids: list[int]        # group chats to add into
+    phone_numbers: list[str]   # digits only, e.g. "9198xxxxxx"
+
+
+@router.post("/add-participants")
+async def add_participants(
+    req: AddParticipantsRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Bulk action: add contacts to every selected group in one go."""
+    if not req.chat_ids or not req.phone_numbers:
+        raise HTTPException(400, "Select groups and enter at least one number")
+    wids = [n.strip().replace("+", "") + "@c.us" for n in req.phone_numbers if n.strip()]
+    results = []
+    for cid in req.chat_ids[:50]:
+        chat = db.query(Chat).filter(Chat.id == cid, Chat.is_group == True).first()
+        if not chat:
+            results.append({"chat_id": cid, "ok": False, "error": "Not a group"})
+            continue
+        phone = db.query(Phone).filter(Phone.id == chat.phone_id).first()
+        if not phone:
+            results.append({"chat_id": cid, "ok": False, "error": "Phone missing"})
+            continue
+        waha = WAHAService(session_name=phone.session_name)
+        ok = await waha.add_group_participants(chat.chat_wid, wids)
+        results.append({"chat_id": cid, "group": chat.name, "ok": ok})
+    from app.services.activity_service import log_activity
+    log_activity(
+        db, "group_participants_added", entity_type="chat", agent_id=agent.id,
+        description=f"Added {len(wids)} participant(s) to {sum(1 for r in results if r['ok'])} group(s)",
+    )
+    return {"results": results}
 
 
 @router.get("/{chat_id}/analytics")

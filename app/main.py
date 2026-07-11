@@ -75,6 +75,7 @@ async def lifespan(_: FastAPI):
     from app.workers.tasks import (
         check_no_reply_timeouts,
         check_sla_breaches,
+        check_task_reminders,
         run_scheduled_bulk_jobs,
         run_scheduled_messages,
         sync_phone_statuses,
@@ -87,6 +88,7 @@ async def lifespan(_: FastAPI):
     scheduler.add_job(run_scheduled_bulk_jobs, IntervalTrigger(minutes=1), id="bulk-jobs")
     scheduler.add_job(check_no_reply_timeouts, IntervalTrigger(minutes=5), id="no-reply-timeouts")
     scheduler.add_job(run_scheduled_messages, IntervalTrigger(minutes=1), id="scheduled-messages")
+    scheduler.add_job(check_task_reminders, IntervalTrigger(minutes=1), id="task-reminders")
     scheduler.start()
 
     yield

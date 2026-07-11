@@ -18,8 +18,10 @@ class TaskCreate(BaseModel):
     title: str
     notes: str | None = None
     priority: str = "low"
-    due_date: str | None = None  # ISO 8601
+    due_date: str | None = None      # ISO 8601
+    reminder_at: str | None = None   # ISO 8601 — notify assignee at this time
     chat_id: int | None = None
+    message_id: int | None = None    # message this task was created from
     assigned_to: int | None = None
 
 
@@ -29,6 +31,7 @@ class TaskUpdate(BaseModel):
     priority: str | None = None
     status: str | None = None
     due_date: str | None = None
+    reminder_at: str | None = None
     assigned_to: int | None = None
 
 
@@ -37,7 +40,8 @@ def _serialize(t: Task, agent_names: dict[int, str]) -> dict:
         "id": t.id, "title": t.title, "notes": t.notes,
         "status": t.status, "priority": t.priority,
         "due_date": t.due_date.isoformat() if t.due_date else None,
-        "chat_id": t.chat_id,
+        "reminder_at": t.reminder_at.isoformat() if t.reminder_at else None,
+        "chat_id": t.chat_id, "message_id": t.message_id,
         "assigned_to": t.assigned_to,
         "assignee_name": agent_names.get(t.assigned_to, ""),
         "created_by": t.created_by,
@@ -74,23 +78,28 @@ def list_tasks(
 
 
 @router.post("", status_code=201)
-def create_task(
+async def create_task(
     req: TaskCreate,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
     if not req.title.strip():
         raise HTTPException(400, "Title is required")
-    due = None
-    if req.due_date:
+
+    def _parse(value: str | None, field: str):
+        if not value:
+            return None
         try:
-            due = datetime.fromisoformat(req.due_date)
+            return datetime.fromisoformat(value)
         except ValueError:
-            raise HTTPException(400, "Invalid due_date (use ISO 8601)")
+            raise HTTPException(400, f"Invalid {field} (use ISO 8601)")
+
     task = Task(
         title=req.title.strip()[:500], notes=req.notes,
         priority=req.priority if req.priority in ("low", "medium", "high") else "low",
-        due_date=due, chat_id=req.chat_id,
+        due_date=_parse(req.due_date, "due_date"),
+        reminder_at=_parse(req.reminder_at, "reminder_at"),
+        chat_id=req.chat_id, message_id=req.message_id,
         assigned_to=req.assigned_to, created_by=agent.id,
     )
     db.add(task)
@@ -100,6 +109,14 @@ def create_task(
         db, "task_created", entity_type="task", entity_id=task.id,
         agent_id=agent.id, description=f"Task '{task.title}' created",
     )
+    # Notify the assignee right away
+    if task.assigned_to and task.assigned_to != agent.id:
+        from app.core.ws_manager import ws_manager
+        await ws_manager.send_to_agent(task.assigned_to, "task_assigned", {
+            "task_id": task.id, "title": task.title,
+            "by": agent.name, "priority": task.priority,
+            "due_date": task.due_date.isoformat() if task.due_date else None,
+        })
     return _serialize(task, _agent_names(db))
 
 
@@ -114,11 +131,14 @@ def update_task(
     if not task:
         raise HTTPException(404, "Task not found")
     changes = req.model_dump(exclude_none=True)
-    if "due_date" in changes:
-        try:
-            changes["due_date"] = datetime.fromisoformat(changes["due_date"])
-        except ValueError:
-            raise HTTPException(400, "Invalid due_date")
+    for field in ("due_date", "reminder_at"):
+        if field in changes:
+            try:
+                changes[field] = datetime.fromisoformat(changes[field])
+            except ValueError:
+                raise HTTPException(400, f"Invalid {field}")
+    if "reminder_at" in changes:
+        task.reminder_sent = False   # re-arm the reminder when time changes
     for k, v in changes.items():
         if hasattr(task, k):
             setattr(task, k, v)

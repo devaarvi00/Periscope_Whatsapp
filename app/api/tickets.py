@@ -12,6 +12,11 @@ from app.services.ticket_service import TicketService
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
 
+async def _notify_assignee(agent_id: int, payload: dict) -> None:
+    from app.core.ws_manager import ws_manager
+    await ws_manager.send_to_agent(agent_id, "ticket_assigned", payload)
+
+
 def _trigger_context(ticket) -> dict:
     return {
         "chat_id": ticket.chat_id,
@@ -49,6 +54,15 @@ def create_ticket(
 ):
     data = req.model_dump()
     data.setdefault("created_by", agent.id)
+    from app.models.ticket import TicketPriority, TicketStatus
+    try:
+        data["status"] = TicketStatus(str(data.get("status", "open")).lower())
+    except ValueError:
+        data["status"] = TicketStatus.OPEN
+    try:
+        data["priority"] = TicketPriority(str(data.get("priority", "medium")).lower())
+    except ValueError:
+        data["priority"] = TicketPriority.MEDIUM
     ticket = TicketService(db).create_ticket(**data)
     log_activity(
         db, "ticket_created", entity_type="ticket", entity_id=ticket.id,
@@ -57,6 +71,12 @@ def create_ticket(
     background.add_task(fire_trigger, "ticket_created", _trigger_context(ticket))
     from app.services.webhook_dispatcher import dispatch_event
     background.add_task(dispatch_event, "ticket.created", _trigger_context(ticket))
+    if ticket.assigned_to and ticket.assigned_to != agent.id:
+        background.add_task(_notify_assignee, ticket.assigned_to, {
+            "ticket_id": ticket.id, "title": ticket.title,
+            "by": agent.name,
+            "priority": ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority),
+        })
     return ticket
 
 
@@ -89,6 +109,12 @@ def update_ticket(
     background.add_task(fire_trigger, "ticket_updated", _trigger_context(ticket))
     from app.services.webhook_dispatcher import dispatch_event
     background.add_task(dispatch_event, "ticket.updated", _trigger_context(ticket))
+    if changes.get("assigned_to") and changes["assigned_to"] != agent.id:
+        background.add_task(_notify_assignee, changes["assigned_to"], {
+            "ticket_id": ticket.id, "title": ticket.title,
+            "by": agent.name,
+            "priority": ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority),
+        })
     return ticket
 
 
