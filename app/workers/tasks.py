@@ -128,10 +128,54 @@ async def check_no_reply_timeouts() -> None:
         db.close()
 
 
-async def run_scheduled_messages() -> None:
-    """Send due per-chat scheduled messages; reschedule daily/weekly repeats."""
+def _next_occurrence(item, after: datetime):
+    """Compute the next send time for a recurring schedule, or None if finished.
+
+    Supports: daily (optionally restricted to days_of_week, every N days),
+    weekly (every N weeks), monthly (every N months, optionally pinned to
+    day_of_month). Respects end_date.
+    """
     from datetime import timedelta
 
+    interval = max(1, item.interval or 1)
+    nxt = item.send_at
+
+    if item.repeat == "daily":
+        allowed = set(item.days_of_week or [])
+        step = timedelta(days=interval)
+        nxt = nxt + step
+        if allowed:
+            # advance day-by-day to the next allowed weekday (Mon=0)
+            for _ in range(0, 8):
+                if nxt.weekday() in allowed and nxt > after:
+                    break
+                nxt = nxt + timedelta(days=1)
+        else:
+            while nxt <= after:
+                nxt = nxt + step
+    elif item.repeat == "weekly":
+        step = timedelta(weeks=interval)
+        nxt = nxt + step
+        while nxt <= after:
+            nxt = nxt + step
+    elif item.repeat == "monthly":
+        import calendar
+        month_index = nxt.month - 1 + interval
+        year = nxt.year + month_index // 12
+        month = month_index % 12 + 1
+        day = item.day_of_month or nxt.day
+        day = min(day, calendar.monthrange(year, month)[1])
+        nxt = nxt.replace(year=year, month=month, day=day)
+    else:
+        return None
+
+    if item.end_date and nxt > item.end_date:
+        return None
+    return nxt
+
+
+async def run_scheduled_messages() -> None:
+    """Send due per-chat scheduled messages; reschedule recurring ones."""
     from app.db.session import SessionLocal
     from app.models.chat import Chat
     from app.models.phone import Phone
@@ -156,6 +200,18 @@ async def run_scheduled_messages() -> None:
                 item.last_error = "Chat or phone missing"
                 db.commit()
                 continue
+
+            # Daily schedules restricted to specific weekdays: skip disallowed
+            # days by rolling forward without sending.
+            if item.repeat == "daily" and item.days_of_week and now.weekday() not in item.days_of_week:
+                nxt = _next_occurrence(item, now)
+                if nxt is None:
+                    item.status = "sent"
+                else:
+                    item.send_at = nxt
+                db.commit()
+                continue
+
             try:
                 waha = WAHAService(session_name=phone.session_name)
                 result = await waha.send_text(chat.chat_wid, item.body)
@@ -171,12 +227,11 @@ async def run_scheduled_messages() -> None:
                     "timestamp": now,
                 })
                 item.sent_count = (item.sent_count or 0) + 1
-                if item.repeat == "daily":
-                    item.send_at = item.send_at + timedelta(days=1)
-                elif item.repeat == "weekly":
-                    item.send_at = item.send_at + timedelta(weeks=1)
-                else:
+                nxt = _next_occurrence(item, now)
+                if nxt is None:
                     item.status = "sent"
+                else:
+                    item.send_at = nxt
                 item.last_error = None
             except Exception as exc:
                 item.status = "failed"

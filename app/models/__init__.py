@@ -14,11 +14,13 @@ from app.models.bulk_message_job import BulkMessageJob
 from app.models.activity_log import ActivityLog
 from app.models.api_key import ApiKey, WebhookEndpoint
 from app.models.scheduled_message import ScheduledMessage
+from app.models.task import Task
+from app.models.property_definition import PropertyDefinition
 
 __all__ = [
     "Agent", "AgentPhone", "Phone", "Chat", "ChatLabel", "Message",
     "Ticket", "TicketLabel", "Contact", "ContactLabel", "Label",
     "Note", "QuickReply", "AutomationRule", "KnowledgeItem",
     "BulkMessageJob", "ActivityLog", "ApiKey", "WebhookEndpoint",
-    "ScheduledMessage",
+    "ScheduledMessage", "Task", "PropertyDefinition",
 ]

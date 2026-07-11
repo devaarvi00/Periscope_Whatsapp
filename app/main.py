@@ -23,7 +23,9 @@ from app.api.developer import router as developer_router
 from app.api.exports import router as exports_router
 from app.api.groups import router as groups_router
 from app.api.scheduled import router as scheduled_router
+from app.api.properties import router as properties_router
 from app.api.public_api import router as public_api_router
+from app.api.tasks import router as tasks_router
 from app.api.labels import router as labels_router
 from app.api.logs import router as logs_router
 from app.api.notes import router as notes_router
@@ -140,6 +142,8 @@ app.include_router(exports_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(developer_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(groups_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(scheduled_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(tasks_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(properties_router, prefix=PREFIX, dependencies=_auth)
 
 
 @app.websocket("/ws")

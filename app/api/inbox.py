@@ -213,8 +213,10 @@ async def send_message(
 
 
 @router.post("/chats/{chat_id}/sync-messages")
-async def sync_chat_messages(chat_id: int, db: Session = Depends(get_db)):
-    """Fetch recent messages from WAHA for a chat and save to DB."""
+async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depends(get_db)):
+    """Fetch recent messages from WAHA for a chat and save to DB.
+
+    Pass a larger `limit` to pull deeper history (capped at 500)."""
     svc = InboxService(db)
     chat = svc.get_chat(chat_id)
     if not chat:
@@ -225,7 +227,7 @@ async def sync_chat_messages(chat_id: int, db: Session = Depends(get_db)):
 
     waha = WAHAService(session_name=phone.session_name)
     try:
-        messages = await waha.get_messages(chat.chat_wid, limit=50)
+        messages = await waha.get_messages(chat.chat_wid, limit=min(max(limit, 1), 500))
     except Exception:
         messages = []
 

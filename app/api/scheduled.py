@@ -13,7 +13,7 @@ from app.services.activity_service import log_activity
 
 router = APIRouter(prefix="/scheduled", tags=["scheduled-messages"])
 
-REPEATS = ("none", "daily", "weekly")
+REPEATS = ("none", "daily", "weekly", "monthly")
 
 
 class ScheduledMessageCreate(BaseModel):
@@ -21,6 +21,38 @@ class ScheduledMessageCreate(BaseModel):
     body: str
     send_at: str  # ISO 8601
     repeat: str = "none"
+    interval: int = 1                       # every N days/weeks/months
+    days_of_week: list[int] | None = None   # 0=Mon … 6=Sun (daily repeat)
+    day_of_month: int | None = None         # 1-31 (monthly repeat)
+    end_date: str | None = None             # ISO 8601, optional
+
+
+class ScheduledMessageUpdate(BaseModel):
+    body: str | None = None
+    send_at: str | None = None
+    repeat: str | None = None
+    interval: int | None = None
+    days_of_week: list[int] | None = None
+    day_of_month: int | None = None
+    end_date: str | None = None
+
+
+def _repeat_summary(m: ScheduledMessage) -> str:
+    if m.repeat == "none":
+        return "Once"
+    every = f"every {m.interval} " if (m.interval or 1) > 1 else ""
+    if m.repeat == "daily":
+        days = m.days_of_week or []
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        picked = ", ".join(names[d] for d in sorted(days) if 0 <= d <= 6)
+        base = f"Daily ({picked})" if picked and len(days) < 7 else "Daily"
+        return f"{base}" + (f" · every {m.interval} days" if (m.interval or 1) > 1 else "")
+    if m.repeat == "weekly":
+        return f"{every}week" if every else "Weekly"
+    if m.repeat == "monthly":
+        dom = f" on day {m.day_of_month}" if m.day_of_month else ""
+        return (f"{every}month" if every else "Monthly") + dom
+    return m.repeat
 
 
 def _serialize(m: ScheduledMessage, chat_names: dict[int, str]) -> dict:
@@ -28,9 +60,42 @@ def _serialize(m: ScheduledMessage, chat_names: dict[int, str]) -> dict:
         "id": m.id, "chat_id": m.chat_id,
         "chat_name": chat_names.get(m.chat_id, ""),
         "body": m.body, "send_at": m.send_at.isoformat(),
-        "repeat": m.repeat, "status": m.status,
+        "repeat": m.repeat, "interval": m.interval or 1,
+        "days_of_week": m.days_of_week or [],
+        "day_of_month": m.day_of_month,
+        "end_date": m.end_date.isoformat() if m.end_date else None,
+        "repeat_summary": _repeat_summary(m),
+        "status": m.status,
         "sent_count": m.sent_count, "last_error": m.last_error,
     }
+
+
+def _parse_recurrence(req) -> dict:
+    if req.repeat is not None and req.repeat not in REPEATS:
+        raise HTTPException(400, f"repeat must be one of {REPEATS}")
+    out: dict = {}
+    if req.repeat is not None:
+        out["repeat"] = req.repeat
+    if req.interval is not None:
+        if not (1 <= req.interval <= 30):
+            raise HTTPException(400, "interval must be between 1 and 30")
+        out["interval"] = req.interval
+    if req.days_of_week is not None:
+        days = sorted({d for d in req.days_of_week if 0 <= int(d) <= 6})
+        out["days_of_week"] = days or None
+    if req.day_of_month is not None:
+        if not (1 <= req.day_of_month <= 31):
+            raise HTTPException(400, "day_of_month must be 1-31")
+        out["day_of_month"] = req.day_of_month
+    if req.end_date is not None:
+        if req.end_date == "":
+            out["end_date"] = None
+        else:
+            try:
+                out["end_date"] = datetime.fromisoformat(req.end_date)
+            except ValueError:
+                raise HTTPException(400, "Invalid end_date (use ISO 8601)")
+    return out
 
 
 @router.get("")
@@ -61,18 +126,22 @@ def create_scheduled(
     chat = db.query(Chat).filter(Chat.id == req.chat_id).first()
     if not chat:
         raise HTTPException(404, "Chat not found")
-    if req.repeat not in REPEATS:
-        raise HTTPException(400, f"repeat must be one of {REPEATS}")
     try:
         send_at = datetime.fromisoformat(req.send_at)
     except ValueError:
         raise HTTPException(400, "Invalid send_at (use ISO 8601)")
     if not req.body.strip():
         raise HTTPException(400, "Message body is empty")
+    rec = _parse_recurrence(req)
 
     msg = ScheduledMessage(
         chat_id=req.chat_id, body=req.body, send_at=send_at,
-        repeat=req.repeat, created_by=agent.id,
+        repeat=rec.get("repeat", "none"),
+        interval=rec.get("interval", 1),
+        days_of_week=rec.get("days_of_week"),
+        day_of_month=rec.get("day_of_month"),
+        end_date=rec.get("end_date"),
+        created_by=agent.id,
     )
     db.add(msg)
     db.commit()
@@ -80,9 +149,44 @@ def create_scheduled(
     log_activity(
         db, "scheduled_message_created", entity_type="scheduled_message",
         entity_id=msg.id, agent_id=agent.id,
-        description=f"Message scheduled for '{chat.name}' at {send_at.isoformat()} ({req.repeat})",
+        description=f"Message scheduled for '{chat.name}' at {send_at.isoformat()} ({_repeat_summary(msg)})",
     )
     return _serialize(msg, {chat.id: chat.name})
+
+
+@router.patch("/{msg_id}")
+def update_scheduled(
+    msg_id: int,
+    req: ScheduledMessageUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    msg = db.query(ScheduledMessage).filter(ScheduledMessage.id == msg_id).first()
+    if not msg:
+        raise HTTPException(404, "Scheduled message not found")
+    if msg.status not in ("pending",):
+        raise HTTPException(400, "Only pending schedules can be edited")
+    rec = _parse_recurrence(req)
+    if req.body is not None:
+        if not req.body.strip():
+            raise HTTPException(400, "Message body is empty")
+        msg.body = req.body
+    if req.send_at is not None:
+        try:
+            msg.send_at = datetime.fromisoformat(req.send_at)
+        except ValueError:
+            raise HTTPException(400, "Invalid send_at")
+    for k, v in rec.items():
+        setattr(msg, k, v)
+    db.commit()
+    db.refresh(msg)
+    log_activity(
+        db, "scheduled_message_updated", entity_type="scheduled_message",
+        entity_id=msg.id, agent_id=agent.id,
+        description=f"Scheduled message #{msg.id} updated ({_repeat_summary(msg)})",
+    )
+    chat = db.query(Chat).filter(Chat.id == msg.chat_id).first()
+    return _serialize(msg, {msg.chat_id: chat.name if chat else ""})
 
 
 @router.delete("/{msg_id}", status_code=204)

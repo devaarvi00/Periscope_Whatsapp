@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hyperscope — WhatsApp CRM</title>
-<link rel="stylesheet" href="/static/css/app.css?v=30">
+<link rel="stylesheet" href="/static/css/app.css?v=31">
 </head>
 <body>
 
@@ -256,6 +256,15 @@
           <span class="ws-dot"></span>
           <span class="ws-label" id="ws-label">Connecting</span>
         </div>
+        <button class="topbar-btn topbar-icon-btn" id="topbar-tasks" title="Tasks">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><polyline points="3 6 4 7 6 5"/><polyline points="3 12 4 13 6 11"/><polyline points="3 18 4 19 6 17"/></svg>
+        </button>
+        <div style="position:relative">
+          <button class="topbar-btn topbar-icon-btn" id="topbar-bell" title="Notification settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          </button>
+          <div class="notif-popover" id="notif-popover" style="display:none"></div>
+        </div>
         <div class="topbar-agent" id="topbar-agent">
           <div class="topbar-avatar" id="topbar-avatar">?</div>
           <span id="topbar-name">Account</span>
@@ -267,6 +276,27 @@
     </div>
   </main>
 
+</div>
+
+<!-- TASKS SIDE PANEL -->
+<div class="tasks-panel" id="tasks-panel" style="display:none">
+  <div class="tasks-panel-head">
+    <h3>Tasks</h3>
+    <div style="display:flex;gap:.5rem;align-items:center">
+      <button class="btn btn-primary btn-sm" id="tasks-create-btn">Create Task +</button>
+      <button class="modal-close" id="tasks-close">×</button>
+    </div>
+  </div>
+  <div class="tasks-panel-filter">
+    <select id="tasks-view">
+      <option value="my_open">My open tasks</option>
+      <option value="all_active">All active tasks</option>
+      <option value="all">All tasks</option>
+      <option value="assigned_to_me">Assigned to me</option>
+      <option value="high_priority">High priority tasks</option>
+    </select>
+  </div>
+  <div class="tasks-panel-body" id="tasks-panel-body"></div>
 </div>
 
 <!-- TOAST -->
@@ -283,7 +313,7 @@
   </div>
 </div>
 
-<script src="/static/js/api.js?v=30"></script>
-<script src="/static/js/app.js?v=30"></script>
+<script src="/static/js/api.js?v=31"></script>
+<script src="/static/js/app.js?v=31"></script>
 </body>
 </html>

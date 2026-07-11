@@ -50,8 +50,20 @@ function displayName(nameOrChat) {
   if (!raw.includes('@')) return raw;
   const [id, domain] = raw.split('@');
   if (domain === 'g.us') return `Group ${id.slice(-6)}`;
+  if (domain === 'lid') return 'WhatsApp user';
   if (/^\d{6,}$/.test(id)) return `+${id}`;
   return id;
+}
+
+// Thread subtitle: never expose raw WhatsApp IDs (@lid/@c.us/@g.us)
+function chatSubtitle(chat) {
+  if (!chat) return '';
+  if (chat.is_group) return '👥 Group';
+  const wid = chat.chat_wid || '';
+  const [id, domain] = wid.split('@');
+  if (domain === 'lid') return 'WhatsApp';           // anonymised id — not a dialable number
+  if (/^\d{6,}$/.test(id)) return `+${id}`;
+  return '';
 }
 
 function avatarColor(name) {
@@ -59,6 +71,73 @@ function avatarColor(name) {
   let h = 0;
   for (let i = 0; i < (name||'').length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xfffffff;
   return colors[h % colors.length];
+}
+
+// ── Label picker popover (create-on-the-fly, per docs) ──────────
+let _labelPickerEl = null;
+function closeLabelPicker() { if (_labelPickerEl) { _labelPickerEl.remove(); _labelPickerEl = null; } }
+document.addEventListener('click', e => {
+  if (_labelPickerEl && !_labelPickerEl.contains(e.target)) closeLabelPicker();
+});
+
+/**
+ * openLabelPicker(anchorEl, { applied:Set<int>, onToggle(label, nowApplied) })
+ * Shows all org labels with checkmarks; typing a new name offers "Create".
+ */
+function openLabelPicker(anchorEl, opts) {
+  closeLabelPicker();
+  const rect = anchorEl.getBoundingClientRect();
+  const el = document.createElement('div');
+  el.className = 'label-picker';
+  el.style.left = Math.min(rect.left, window.innerWidth - 250) + 'px';
+  el.style.top = (rect.bottom + 6) + 'px';
+  el.style.position = 'fixed';
+  document.body.appendChild(el);
+  _labelPickerEl = el;
+
+  function renderRows(query) {
+    const q = (query || '').toLowerCase();
+    const matches = State.labels.filter(l => !q || l.name.toLowerCase().includes(q));
+    const exact = State.labels.some(l => l.name.toLowerCase() === q);
+    el.querySelector('.lp-list').innerHTML =
+      matches.map(l => `
+        <div class="lp-row" data-lid="${l.id}">
+          <span class="lp-dot" style="background:${l.color}"></span>
+          <span style="flex:1">${esc(l.name)}</span>
+          ${opts.applied.has(l.id) ? '<span style="color:var(--accent)">✓</span>' : ''}
+        </div>`).join('') +
+      (q && !exact ? `<div class="lp-row lp-create" data-create="${esc(query)}">+ Create "${esc(query)}"</div>` : '') +
+      (!matches.length && !q ? '<div class="lp-row" style="color:var(--text-3)">No labels yet — type to create</div>' : '');
+
+    el.querySelectorAll('.lp-row[data-lid]').forEach(row => row.addEventListener('click', async () => {
+      const label = State.labels.find(l => l.id == row.dataset.lid);
+      const nowApplied = !opts.applied.has(label.id);
+      try {
+        await opts.onToggle(label, nowApplied);
+        nowApplied ? opts.applied.add(label.id) : opts.applied.delete(label.id);
+        renderRows(el.querySelector('input').value.trim());
+      } catch(e) { toast(e.message, 'error'); }
+    }));
+    const createRow = el.querySelector('.lp-row[data-create]');
+    if (createRow) createRow.addEventListener('click', async () => {
+      try {
+        const label = await Api.labels.create({ name: createRow.dataset.create });
+        State.labels.push(label);
+        await opts.onToggle(label, true);
+        opts.applied.add(label.id);
+        renderRows('');
+        el.querySelector('input').value = '';
+        toast(`Label "${label.name}" created`, 'success');
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  }
+
+  el.innerHTML = `<input type="text" placeholder="Search or create label..."><div class="lp-list"></div>`;
+  const input = el.querySelector('input');
+  input.addEventListener('input', () => renderRows(input.value.trim()));
+  input.addEventListener('click', e => e.stopPropagation());
+  renderRows('');
+  setTimeout(() => input.focus(), 30);
 }
 
 function toast(msg, type = 'default') {
@@ -381,6 +460,17 @@ function handleWSEvent(data) {
       const preview = (d.body || '').substring(0, 60);
       toast(`💬 New message: ${preview}`, 'default');
     }
+    if (!d.from_me && typeof notifyUser === 'function') {
+      notifyUser('new_messages', displayName(d.sender_name || d.chat_wid || 'New message'), d.body || 'Media message');
+    }
+    return;
+  }
+
+  if (event === 'note_mention') {
+    toast(`📝 ${esc(d.by)} mentioned you in ${esc(displayName(d.chat_name))}`, 'default');
+    if (typeof notifyUser === 'function') {
+      notifyUser('new_note', `${d.by} mentioned you`, d.content || '');
+    }
     return;
   }
 
@@ -467,6 +557,7 @@ async function renderInbox() {
           <span class="filter-chip" data-f="unread">Unread</span>
           <span class="filter-chip" data-f="flagged">Flagged</span>
           <span class="filter-chip" data-f="awaiting">Awaiting reply</span>
+          <span class="filter-chip" id="label-filter-chip">🏷 Label ▾</span>
         </div>
         <div class="chat-list" id="chat-list">
           <div class="loading-center"><div class="spinner"></div></div>
@@ -515,6 +606,22 @@ async function renderInbox() {
     } catch(e) { toast(e.message, 'error'); }
   });
 
+  // Label filter: show only chats carrying a chosen label
+  const lfChip = document.getElementById('label-filter-chip');
+  if (lfChip) lfChip.addEventListener('click', e => {
+    e.stopPropagation();
+    openLabelPicker(lfChip, {
+      applied: new Set(State.inbox.labelFilter ? [State.inbox.labelFilter] : []),
+      onToggle: async (label, nowApplied) => {
+        State.inbox.labelFilter = nowApplied ? label.id : null;
+        lfChip.textContent = nowApplied ? `🏷 ${label.name} ×` : '🏷 Label ▾';
+        lfChip.classList.toggle('active', nowApplied);
+        closeLabelPicker();
+        loadChats();
+      },
+    });
+  });
+
   document.getElementById('close-detail-btn').addEventListener('click', () => {
     document.getElementById('detail-panel').style.display = 'none';
     document.getElementById('inbox-layout').classList.remove('detail-open');
@@ -540,6 +647,7 @@ async function loadChats() {
   if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
   if (f === 'unread') {}
   if (f === 'awaiting') {}
+  if (State.inbox.labelFilter) q.label_id = State.inbox.labelFilter;
   if (State.inbox.search) q.search = State.inbox.search;
 
   try {
@@ -628,12 +736,22 @@ function renderChatList(chats) {
     </div>`;
   }).join('');
 
-  // "+ Label" chips: open the chat and let the detail panel handle labels
+  // "+ Label" chips: inline label picker with create-on-the-fly
   el.querySelectorAll('.add-label-chip').forEach(chip => {
     chip.addEventListener('click', e => {
       e.stopPropagation();
       const chat = State.inbox.chats?.find(x => x.id == chip.dataset.addlabel);
-      if (chat) openChat(chat);
+      if (!chat) return;
+      openLabelPicker(chip, {
+        applied: new Set(chat.labels || []),
+        onToggle: async (label, nowApplied) => {
+          if (nowApplied) await Api.inbox.addLabel(chat.id, label.id);
+          else await Api.inbox.removeLabel(chat.id, label.id);
+          chat.labels = nowApplied
+            ? [...(chat.labels || []), label.id]
+            : (chat.labels || []).filter(id => id !== label.id);
+        },
+      });
     });
   });
 
@@ -698,7 +816,7 @@ async function renderContactDetail(chat) {
     <div class="detail-contact-top">
       <div class="detail-avatar" style="background:${color}">${initials(displayName(chat))}</div>
       <div class="detail-contact-name">${esc(displayName(chat))}</div>
-      <div class="detail-contact-wid">${esc(chat.chat_wid||'')}</div>
+      <div class="detail-contact-wid">${esc(chatSubtitle(chat))}</div>
     </div>
 
     <div class="detail-section">
@@ -725,9 +843,14 @@ async function renderContactDetail(chat) {
     </div>
 
     <div class="detail-section">
+      <div class="detail-section-label">Properties</div>
+      <div id="detail-properties"><span style="font-size:12px;color:var(--text-3)">Loading…</span></div>
+    </div>
+
+    <div class="detail-section">
       <div class="detail-section-label">Phone</div>
       <div style="font-size:12.5px;color:var(--text-2)">
-        ${chat.is_group ? 'Group chat' : (chat.chat_wid || '—')}
+        ${chat.is_group ? 'Group chat' : (chatSubtitle(chat) || '—')}
       </div>
       ${(() => {
         if (chat.phone_id && State.phones.length) {
@@ -779,6 +902,62 @@ async function renderContactDetail(chat) {
       renderChatList(State.inbox.chats);
     } catch(err) { toast(err.message, 'error'); }
   });
+
+  // Custom properties: render definitions with current values, save on change
+  (async () => {
+    const wrap = document.getElementById('detail-properties');
+    if (!wrap) return;
+    try {
+      const [defs, valRes] = await Promise.all([
+        Api.properties.definitions('chat'),
+        Api.properties.chatValues(chat.id),
+      ]);
+      const values = valRes.custom_properties || {};
+      if (!defs.length) {
+        wrap.innerHTML = `<div style="font-size:11.5px;color:var(--text-3)">
+          No custom properties defined.
+          <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent)">Create in Settings</a></div>`;
+        return;
+      }
+      const sections = {};
+      defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
+      wrap.innerHTML = Object.entries(sections).map(([sec, list]) => `
+        ${Object.keys(sections).length > 1 ? `<div class="prop-section-title">${esc(sec)}</div>` : ''}
+        ${list.map(d => {
+          const v = values[String(d.id)];
+          if (d.prop_type === 'single_select') {
+            return `<div class="prop-row"><label>${esc(d.name)}</label>
+              <select data-prop="${d.id}"><option value="">—</option>
+                ${(d.options || []).map(o => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}
+              </select></div>`;
+          }
+          if (d.prop_type === 'multi_select') {
+            const cur = Array.isArray(v) ? v : [];
+            return `<div class="prop-row"><label>${esc(d.name)}</label>
+              <div class="prop-multi" data-prop-multi="${d.id}">
+                ${(d.options || []).map(o => `<label><input type="checkbox" value="${esc(o)}" ${cur.includes(o) ? 'checked' : ''}>${esc(o)}</label>`).join('')}
+              </div></div>`;
+          }
+          const type = d.prop_type === 'date' ? 'date' : d.prop_type === 'number' ? 'number' : 'text';
+          return `<div class="prop-row"><label>${esc(d.name)}</label>
+            <input type="${type}" data-prop="${d.id}" value="${v != null ? esc(String(v)) : ''}"></div>`;
+        }).join('')}`).join('');
+
+      const save = async (id, value) => {
+        try { await Api.properties.setChat(chat.id, { [id]: value }); toast('Property saved', 'success'); }
+        catch(e) { toast(e.message, 'error'); }
+      };
+      wrap.querySelectorAll('[data-prop]').forEach(inp =>
+        inp.addEventListener('change', () => save(inp.dataset.prop, inp.value)));
+      wrap.querySelectorAll('[data-prop-multi]').forEach(group =>
+        group.querySelectorAll('input').forEach(cb => cb.addEventListener('change', () => {
+          const vals = [...group.querySelectorAll('input:checked')].map(c => c.value);
+          save(group.dataset.propMulti, vals);
+        })));
+    } catch(_) {
+      wrap.innerHTML = '<span style="font-size:11.5px;color:var(--text-3)">Could not load properties</span>';
+    }
+  })();
 
   // Add label handler
   const addLabelSel = document.getElementById('detail-add-label-select');
@@ -838,7 +1017,7 @@ function renderThread(chat) {
         <div class="chat-avatar" style="background:${avatarColor(displayName(chat))};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(displayName(chat))}</div>
         <div class="thread-contact-text">
           <div class="thread-name">${esc(displayName(chat))}</div>
-          <div class="thread-meta">${chat.is_group ? '👥 Group' : esc((chat.chat_wid||'').replace('@s.whatsapp.net','').replace('@g.us',''))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
+          <div class="thread-meta">${esc(chatSubtitle(chat))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
         </div>
       </div>
       <div class="thread-actions">
@@ -1135,7 +1314,8 @@ function renderThread(chat) {
       if (composerMode === 'note') {
         await Api.notes.create({ chat_id: chat.id, content: text });
         document.getElementById('reply-text').value = '';
-        toast('Private note added', 'success');
+        toast('Private note added — team only', 'success');
+        await loadMessages(chat.id);   // show the note in the thread
       } else {
         const phoneId = document.getElementById('phone-select')?.value;
         if (!phoneId) { btn.disabled = false; return toast('Select a phone', 'error'); }
@@ -1148,7 +1328,57 @@ function renderThread(chat) {
   };
 
   document.getElementById('send-btn').addEventListener('click', sendMsg);
+
+  // Quick reply slash suggestions: type "/" and matching replies appear inline
+  const replyBar = document.querySelector('.reply-bar');
+  if (replyBar) replyBar.style.position = 'relative';
+  let qrCache = null, qrBox = null, qrSel = 0;
+  const closeQrSuggest = () => { if (qrBox) { qrBox.remove(); qrBox = null; } };
+
+  async function updateQrSuggest() {
+    const ta = document.getElementById('reply-text');
+    const text = ta.value;
+    if (!text.startsWith('/') || text.includes(' ') || composerMode === 'note') { closeQrSuggest(); return; }
+    if (!qrCache) {
+      try { qrCache = await Api.quickReplies.list(); } catch(_) { qrCache = []; }
+    }
+    const q = text.slice(1).toLowerCase();
+    const matches = qrCache.filter(r => r.command.toLowerCase().includes(q)).slice(0, 6);
+    if (!matches.length) { closeQrSuggest(); return; }
+    if (!qrBox) {
+      qrBox = document.createElement('div');
+      qrBox.className = 'qr-suggest';
+      replyBar.appendChild(qrBox);
+    }
+    qrSel = Math.min(qrSel, matches.length - 1);
+    qrBox.innerHTML = matches.map((r, i) => `
+      <div class="qr-row ${i === qrSel ? 'sel' : ''}" data-i="${i}">
+        <span class="qr-cmd">/${esc(r.command)}</span>
+        <span class="qr-msg">${esc(r.message)}</span>
+      </div>`).join('');
+    qrBox.querySelectorAll('.qr-row').forEach(row => row.addEventListener('mousedown', e => {
+      e.preventDefault();
+      ta.value = matches[+row.dataset.i].message;
+      closeQrSuggest();
+      ta.focus();
+    }));
+    qrBox._matches = matches;
+  }
+
+  document.getElementById('reply-text').addEventListener('input', updateQrSuggest);
+  document.getElementById('reply-text').addEventListener('blur', () => setTimeout(closeQrSuggest, 150));
   document.getElementById('reply-text').addEventListener('keydown', e => {
+    if (qrBox && qrBox._matches?.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); qrSel = (qrSel + 1) % qrBox._matches.length; updateQrSuggest(); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); qrSel = (qrSel - 1 + qrBox._matches.length) % qrBox._matches.length; updateQrSuggest(); return; }
+      if (e.key === 'Tab' || e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('reply-text').value = qrBox._matches[qrSel].message;
+        closeQrSuggest();
+        return;
+      }
+      if (e.key === 'Escape') { closeQrSuggest(); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
   });
 }
@@ -1162,15 +1392,75 @@ async function loadMessages(chatId, _alreadySynced) {
     let messages = await Api.inbox.messages(chatId, { limit: 50 });
     // Auto-fetch from WAHA if DB has no messages for this chat yet
     if (messages.length === 0 && !_alreadySynced) {
-      try { await Api.inbox.syncMessages(chatId); } catch(_) {}
+      try { await Api.inbox.syncMessages(chatId, 100); } catch(_) {}
       messages = await Api.inbox.messages(chatId, { limit: 50 });
     }
     State.inbox.messages = messages;
-    area.innerHTML = messages.map(m => renderMessage(m, isGroup)).join('') ||
-      `<div class="empty-state" style="flex:none;padding:2rem"><p>No messages yet</p></div>`;
+
+    // Interleave private team notes into the thread (visible to team only)
+    let notes = [];
+    try { notes = await Api.notes.list(chatId); } catch(_) {}
+    const thread = messages.map(m => ({ kind: 'msg', ts: m.timestamp, item: m }))
+      .concat(notes.map(n => ({ kind: 'note', ts: n.created_at, item: n })))
+      .sort((a, b) => new Date(a.ts) - new Date(b.ts));
+
+    area.innerHTML =
+      `<div style="text-align:center;padding:.35rem 0">
+        <button class="btn btn-secondary btn-sm" id="load-older-btn">↺ Load older messages</button>
+      </div>` +
+      (thread.map(t => t.kind === 'note' ? renderNoteBubble(t.item) : renderMessage(t.item, isGroup)).join('') ||
+        `<div class="empty-state" style="flex:none;padding:2rem"><p>No messages yet — try Load older messages</p></div>`);
     area.scrollTop = area.scrollHeight;
+    document.getElementById('load-older-btn')?.addEventListener('click', () => loadOlderMessages(chatId, isGroup));
   } catch(e) {
     area.innerHTML = `<div class="loading-center text-muted">Could not load messages</div>`;
+  }
+}
+
+function renderNoteBubble(n) {
+  const content = esc(n.content || '').replace(/@([\w.]+)/g, '<strong style="color:#a16207">@$1</strong>');
+  return `<div class="msg me note-inline">
+    <div class="msg-bubble">
+      <div class="note-author">📝 Private note · ${esc(n.agent_name || 'Team')}</div>
+      ${content}
+    </div>
+    <div class="msg-info">${fmt(n.created_at)} · team only</div>
+  </div>`;
+}
+
+async function loadOlderMessages(chatId, isGroup) {
+  const btn = document.getElementById('load-older-btn');
+  const area = document.getElementById('messages-area');
+  if (!btn || !area) return;
+  btn.disabled = true; btn.textContent = 'Loading…';
+  try {
+    const current = State.inbox.messages || [];
+    const oldestId = current.length ? current[0].id : null;
+
+    // First try older rows already in the DB
+    let older = oldestId ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId }) : [];
+
+    // DB exhausted — pull deeper history from WhatsApp via WAHA
+    if (!older.length) {
+      await Api.inbox.syncMessages(chatId, Math.min(current.length + 150, 500));
+      older = oldestId
+        ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId })
+        : await Api.inbox.messages(chatId, { limit: 50 });
+    }
+
+    if (!older.length) {
+      btn.textContent = 'No older messages';
+      setTimeout(() => { btn.disabled = false; btn.textContent = '↺ Load older messages'; }, 1500);
+      return;
+    }
+    State.inbox.messages = older.concat(current);
+    const prevHeight = area.scrollHeight;
+    btn.insertAdjacentHTML('afterend', older.map(m => renderMessage(m, isGroup)).join(''));
+    area.scrollTop = area.scrollHeight - prevHeight;   // keep viewport anchored
+    btn.disabled = false; btn.textContent = '↺ Load older messages';
+  } catch(e) {
+    toast(e.message, 'error');
+    btn.disabled = false; btn.textContent = '↺ Load older messages';
   }
 }
 
@@ -1183,9 +1473,14 @@ function renderMessage(m, isGroup) {
     </div>`;
   }
   const cls = m.from_me ? 'me' : 'them';
-  const senderDisplay = !m.from_me && (isGroup || m.sender_name)
-    ? (m.sender_name || m.sender_number || '').trim()
-    : '';
+  let senderDisplay = '';
+  if (!m.from_me && (isGroup || m.sender_name)) {
+    senderDisplay = (m.sender_name || '').trim();
+    if (!senderDisplay && m.sender_number) {
+      // never show raw @lid ids as sender
+      senderDisplay = /^\d{6,}$/.test(m.sender_number) ? `+${m.sender_number}` : '';
+    }
+  }
 
   let bubbleContent = '';
   const mtype = (m.message_type || 'text').toLowerCase();
@@ -1910,6 +2205,7 @@ async function renderSettings() {
         <div class="tab" data-tab="labels">Labels</div>
         <div class="tab" data-tab="quickreplies">Quick Replies</div>
         <div class="tab" data-tab="agents">Agents</div>
+        <div class="tab" data-tab="properties">Custom Properties</div>
         <div class="tab" data-tab="developer">Developer API</div>
         <div class="tab" data-tab="exports">Data Exports</div>
       </div>
@@ -2142,6 +2438,97 @@ async function loadSettingsTab(tab) {
         });
       });
     } catch(_) {}
+  }
+
+  else if (tab === 'properties') {
+    const entity = window._propEntity || 'chat';
+    try {
+      const defs = await Api.properties.definitions(entity);
+      const sections = {};
+      defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
+      el.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+          <div class="tab-bar" style="border:none">
+            <div class="tab ${entity === 'chat' ? 'active' : ''}" data-ent="chat">Chat properties</div>
+            <div class="tab ${entity === 'ticket' ? 'active' : ''}" data-ent="ticket">Ticket properties</div>
+          </div>
+          <button class="btn btn-primary btn-sm" id="new-prop-btn">+ New Property</button>
+        </div>
+        ${Object.keys(sections).length ? Object.entries(sections).map(([sec, list]) => `
+          <div class="content-card" style="margin-bottom:.8rem">
+            <div class="card-header">${esc(sec)}</div>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>Name</th><th>Type</th><th>Options</th><th>Required</th><th></th></tr></thead>
+              <tbody>${list.map(d => `<tr>
+                <td style="font-weight:600">${esc(d.name)}</td>
+                <td><span class="pill pill-open" style="font-size:11px">${esc(d.prop_type)}</span></td>
+                <td style="font-size:12px;color:var(--text-3)">${(d.options || []).map(esc).join(', ') || '—'}</td>
+                <td>${d.required ? 'Yes' : 'No'}</td>
+                <td><button class="btn btn-danger btn-sm prop-del" data-pid="${d.id}">Delete</button></td>
+              </tr>`).join('')}</tbody>
+            </table></div>
+          </div>`).join('')
+        : `<div class="empty-state" style="padding:3rem;text-align:center">
+            <p class="text-muted" style="font-size:13px">No custom ${entity} properties yet.<br>
+            Create fields like "Plan", "Renewal date" or "Account owner" — they appear in the ${entity === 'chat' ? 'chat detail panel' : 'ticket view'}.</p>
+          </div>`}`;
+      el.querySelectorAll('.tab[data-ent]').forEach(t => t.addEventListener('click', () => {
+        window._propEntity = t.dataset.ent; loadSettingsTab('properties');
+      }));
+      el.querySelectorAll('.prop-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete this property? Its values will stay stored but hidden.')) return;
+        try { await Api.properties.deleteDef(btn.dataset.pid); toast('Deleted', 'success'); loadSettingsTab('properties'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      document.getElementById('new-prop-btn').addEventListener('click', () => {
+        showModal('New Custom Property', `
+          <div class="form-group"><label>Entity</label><select id="pr-entity">
+            <option value="chat" ${entity === 'chat' ? 'selected' : ''}>Chat</option>
+            <option value="ticket" ${entity === 'ticket' ? 'selected' : ''}>Ticket</option>
+          </select></div>
+          <div class="form-group"><label>Section</label><input type="text" id="pr-section" value="General" placeholder="e.g. Account details"></div>
+          <div class="form-group"><label>Name *</label><input type="text" id="pr-name" placeholder="e.g. Plan"></div>
+          <div class="form-group"><label>Type</label><select id="pr-type">
+            <option value="text">Text</option>
+            <option value="number">Number</option>
+            <option value="date">Date</option>
+            <option value="single_select">Single-select dropdown</option>
+            <option value="multi_select">Multi-select dropdown</option>
+          </select></div>
+          <div class="form-group" id="pr-options-wrap" style="display:none">
+            <label>Options (comma separated) *</label>
+            <input type="text" id="pr-options" placeholder="Free, Pro, Enterprise">
+          </div>
+          <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+            <input type="checkbox" id="pr-required" style="width:15px;height:15px"> Required (tickets)</label></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="pr-save">Create</button>
+          </div>`);
+        const typeSel = document.getElementById('pr-type');
+        typeSel.addEventListener('change', () => {
+          document.getElementById('pr-options-wrap').style.display =
+            typeSel.value.endsWith('_select') ? 'block' : 'none';
+        });
+        document.getElementById('pr-save').addEventListener('click', async () => {
+          const name = document.getElementById('pr-name').value.trim();
+          if (!name) return toast('Name required', 'error');
+          try {
+            await Api.properties.createDef({
+              entity: document.getElementById('pr-entity').value,
+              section: document.getElementById('pr-section').value.trim() || 'General',
+              name,
+              prop_type: typeSel.value,
+              options: typeSel.value.endsWith('_select')
+                ? document.getElementById('pr-options').value.split(',').map(s => s.trim()).filter(Boolean)
+                : null,
+              required: document.getElementById('pr-required').checked,
+            });
+            closeModal(); toast('Property created', 'success'); loadSettingsTab('properties');
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
   }
 
   else if (tab === 'developer') {
@@ -2716,50 +3103,111 @@ async function loadScheduled() {
     const items = await Api.scheduled.list();
     if (!items.length) { el.innerHTML = `<div class="loading-center text-muted">Nothing scheduled yet</div>`; return; }
     el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
-      <thead><tr><th>Chat</th><th>Message</th><th>Send At</th><th>Repeat</th><th>Status</th><th>Sent</th><th></th></tr></thead>
+      <thead><tr><th>Chat</th><th>Message</th><th>Next Send</th><th>Repeat</th><th>Ends</th><th>Status</th><th>Sent</th><th></th></tr></thead>
       <tbody>${items.map(m => `<tr>
         <td style="font-weight:600">${esc(displayName(m.chat_name) || ('#' + m.chat_id))}</td>
-        <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
+        <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
         <td style="font-size:12px">${new Date(m.send_at).toLocaleString()}</td>
-        <td>${m.repeat === 'none' ? 'Once' : esc(m.repeat)}</td>
+        <td style="font-size:12px">${esc(m.repeat_summary || (m.repeat === 'none' ? 'Once' : m.repeat))}</td>
+        <td style="font-size:12px;color:var(--text-3)">${m.end_date ? new Date(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
         <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${m.status}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
         <td>${m.sent_count}</td>
-        <td>${m.status === 'pending' ? `<button class="btn btn-danger btn-sm sched-cancel" data-sid="${m.id}">Cancel</button>` : ''}</td>
+        <td style="white-space:nowrap">${m.status === 'pending' ? `
+          <button class="btn btn-secondary btn-sm sched-edit" data-sid="${m.id}">Edit</button>
+          <button class="btn btn-danger btn-sm sched-cancel" data-sid="${m.id}">Cancel</button>` : ''}</td>
       </tr>`).join('')}</tbody>
     </table></div></div>`;
     el.querySelectorAll('.sched-cancel').forEach(btn => btn.addEventListener('click', async () => {
       try { await Api.scheduled.cancel(btn.dataset.sid); toast('Cancelled', 'success'); loadScheduled(); }
       catch(e) { toast(e.message, 'error'); }
     }));
+    el.querySelectorAll('.sched-edit').forEach(btn => btn.addEventListener('click', () => {
+      const item = items.find(x => x.id == btn.dataset.sid);
+      if (item) showScheduleModal(null, null, item);
+    }));
   } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
 }
 
-async function showScheduleModal(prefillChatId, prefillBody) {
+async function showScheduleModal(prefillChatId, prefillBody, editItem) {
   let chats = [];
   try { chats = await Api.inbox.chats({ limit: 200 }); } catch(_) {}
-  const opts = chats.map(c => `<option value="${c.id}" ${prefillChatId == c.id ? 'selected' : ''}>${esc(displayName(c))}</option>`).join('');
-  showModal('Schedule Message', `
-    <div class="form-group"><label>Chat *</label><select id="sc-chat">${opts}</select></div>
-    <div class="form-group"><label>Message *</label><textarea id="sc-body" style="min-height:70px">${esc(prefillBody || '')}</textarea></div>
-    <div class="form-group"><label>Send At *</label><input type="datetime-local" id="sc-at"></div>
+  const selChat = editItem ? editItem.chat_id : prefillChatId;
+  const opts = chats.map(c => `<option value="${c.id}" ${selChat == c.id ? 'selected' : ''}>${esc(displayName(c))}</option>`).join('');
+  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const ed = editItem || {};
+
+  showModal(editItem ? 'Edit Scheduled Message' : 'Schedule Message', `
+    <div class="form-group"><label>Chat *</label><select id="sc-chat" ${editItem ? 'disabled' : ''}>${opts}</select></div>
+    <div class="form-group"><label>Message *</label><textarea id="sc-body" style="min-height:70px">${esc(ed.body || prefillBody || '')}</textarea></div>
+    <div class="form-group"><label>Send At *</label><input type="datetime-local" id="sc-at" value="${ed.send_at ? ed.send_at.slice(0, 16) : ''}"></div>
     <div class="form-group"><label>Repeat</label><select id="sc-repeat">
-      <option value="none">Once</option><option value="daily">Daily</option><option value="weekly">Weekly</option>
+      <option value="none">Once</option>
+      <option value="daily" ${ed.repeat === 'daily' ? 'selected' : ''}>Daily</option>
+      <option value="weekly" ${ed.repeat === 'weekly' ? 'selected' : ''}>Weekly</option>
+      <option value="monthly" ${ed.repeat === 'monthly' ? 'selected' : ''}>Monthly</option>
     </select></div>
+    <div id="sc-recur-opts" style="display:${ed.repeat && ed.repeat !== 'none' ? 'block' : 'none'}">
+      <div class="form-group"><label>Repeat every</label>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <input type="number" id="sc-interval" min="1" max="30" value="${ed.interval || 1}" style="width:80px">
+          <span id="sc-interval-unit" class="text-muted" style="font-size:12.5px">day(s)</span>
+        </div>
+      </div>
+      <div class="form-group" id="sc-days-wrap" style="display:${ed.repeat === 'daily' ? 'block' : 'none'}">
+        <label>On days (leave all unchecked = every day)</label>
+        <div style="display:flex;gap:.55rem;flex-wrap:wrap">
+          ${DAYS.map((d, i) => `<label style="display:flex;align-items:center;gap:.25rem;font-size:12.5px;font-weight:400">
+            <input type="checkbox" class="sc-day" value="${i}" ${(ed.days_of_week || []).includes(i) ? 'checked' : ''}>${d}</label>`).join('')}
+        </div>
+      </div>
+      <div class="form-group" id="sc-dom-wrap" style="display:${ed.repeat === 'monthly' ? 'block' : 'none'}">
+        <label>Day of month (1–31)</label>
+        <input type="number" id="sc-dom" min="1" max="31" value="${ed.day_of_month || ''}" placeholder="e.g. 1">
+      </div>
+      <div class="form-group"><label>End date (optional — leave empty for open-ended)</label>
+        <input type="date" id="sc-end" value="${ed.end_date ? ed.end_date.slice(0, 10) : ''}"></div>
+    </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="sc-save">Schedule</button>
+      <button class="btn btn-primary" id="sc-save">${editItem ? 'Save Changes' : 'Schedule'}</button>
     </div>`);
+
+  const repeatSel = document.getElementById('sc-repeat');
+  repeatSel.addEventListener('change', () => {
+    const r = repeatSel.value;
+    document.getElementById('sc-recur-opts').style.display = r === 'none' ? 'none' : 'block';
+    document.getElementById('sc-days-wrap').style.display = r === 'daily' ? 'block' : 'none';
+    document.getElementById('sc-dom-wrap').style.display = r === 'monthly' ? 'block' : 'none';
+    document.getElementById('sc-interval-unit').textContent =
+      r === 'weekly' ? 'week(s)' : r === 'monthly' ? 'month(s)' : 'day(s)';
+  });
+
   document.getElementById('sc-save').addEventListener('click', async () => {
     const body = document.getElementById('sc-body').value.trim();
     const at = document.getElementById('sc-at').value;
     if (!body || !at) return toast('Message and time required', 'error');
+    const repeat = repeatSel.value;
+    const payload = {
+      body, send_at: at, repeat,
+      interval: parseInt(document.getElementById('sc-interval')?.value) || 1,
+      days_of_week: repeat === 'daily'
+        ? [...document.querySelectorAll('.sc-day:checked')].map(c => +c.value)
+        : null,
+      day_of_month: repeat === 'monthly'
+        ? (parseInt(document.getElementById('sc-dom')?.value) || null)
+        : null,
+      end_date: document.getElementById('sc-end')?.value || (editItem ? '' : null),
+    };
     try {
-      await Api.scheduled.create({
-        chat_id: parseInt(document.getElementById('sc-chat').value),
-        body, send_at: at,
-        repeat: document.getElementById('sc-repeat').value,
-      });
-      closeModal(); toast('Message scheduled', 'success');
+      if (editItem) {
+        await Api.scheduled.update(editItem.id, payload);
+        toast('Schedule updated', 'success');
+      } else {
+        payload.chat_id = parseInt(document.getElementById('sc-chat').value);
+        await Api.scheduled.create(payload);
+        toast('Message scheduled', 'success');
+      }
+      closeModal();
       if (State.currentView === 'scheduled') loadScheduled();
     } catch(e) { toast(e.message, 'error'); }
   });
@@ -2828,6 +3276,174 @@ async function loadLogsTable(action) {
 
 // Alias so dashboard card buttons can call switchView(...)
 function switchView(view) { navigateTo(view); }
+
+// ══ TASKS PANEL (topbar) ══════════════════════════════════════════ //
+(() => {
+  const panel = document.getElementById('tasks-panel');
+  const openBtn = document.getElementById('topbar-tasks');
+  if (!panel || !openBtn) return;
+
+  const body = document.getElementById('tasks-panel-body');
+  const viewSel = document.getElementById('tasks-view');
+
+  async function loadTasks() {
+    body.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+    try {
+      const tasks = await Api.tasks.list({ view: viewSel.value });
+      if (!tasks.length) {
+        body.innerHTML = `<div class="empty-state" style="padding:3rem 1rem;text-align:center">
+          <p class="text-muted" style="font-size:13px">No tasks here yet</p>
+          <button class="btn btn-primary btn-sm" style="margin-top:.6rem" onclick="document.getElementById('tasks-create-btn').click()">Create Task +</button>
+        </div>`;
+        return;
+      }
+      body.innerHTML = tasks.map(t => `
+        <div class="task-row ${t.status === 'done' ? 'done' : ''}" data-tid="${t.id}">
+          <input type="checkbox" class="task-check" ${t.status === 'done' ? 'checked' : ''}>
+          <div style="flex:1;min-width:0">
+            <div class="task-title">${esc(t.title)}</div>
+            <div class="task-sub">
+              ${t.assignee_name ? esc(t.assignee_name) : 'Unassigned'}
+              ${t.due_date ? ' · due ' + new Date(t.due_date).toLocaleDateString() : ''}
+              ${t.notes ? ' · ' + esc(t.notes.slice(0, 40)) : ''}
+            </div>
+          </div>
+          <span class="task-prio ${esc(t.priority)}">${esc(t.priority)}</span>
+          <button class="modal-close task-del" title="Delete" style="font-size:14px">×</button>
+        </div>`).join('');
+      body.querySelectorAll('.task-check').forEach(cb => cb.addEventListener('change', async e => {
+        const id = e.target.closest('.task-row').dataset.tid;
+        try { await Api.tasks.update(id, { status: e.target.checked ? 'done' : 'open' }); loadTasks(); }
+        catch(err) { toast(err.message, 'error'); }
+      }));
+      body.querySelectorAll('.task-del').forEach(btn => btn.addEventListener('click', async e => {
+        const id = e.target.closest('.task-row').dataset.tid;
+        if (!confirm('Delete task?')) return;
+        try { await Api.tasks.del(id); loadTasks(); } catch(err) { toast(err.message, 'error'); }
+      }));
+    } catch(e) { body.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  openBtn.addEventListener('click', () => {
+    panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+    if (panel.style.display !== 'none') loadTasks();
+  });
+  document.getElementById('tasks-close').addEventListener('click', () => panel.style.display = 'none');
+  viewSel.addEventListener('change', loadTasks);
+
+  document.getElementById('tasks-create-btn').addEventListener('click', async () => {
+    let agents = [];
+    try { agents = await Api.auth.agents(); } catch(_) {}
+    showModal('Create Task', `
+      <div class="form-group"><label>Task *</label><input type="text" id="tk2-title" placeholder="Enter your task..."></div>
+      <div class="form-group"><label>Due Date</label><input type="date" id="tk2-due"></div>
+      <div class="form-group"><label>Assignee</label><select id="tk2-assignee">
+        <option value="">Unassigned</option>
+        ${agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}
+      </select></div>
+      <div class="form-group"><label>Priority</label><select id="tk2-prio">
+        <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
+      </select></div>
+      <div class="form-group"><label>Notes</label><textarea id="tk2-notes" style="min-height:60px" placeholder="Add notes here..."></textarea></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="tk2-save">Save</button>
+      </div>`);
+    document.getElementById('tk2-save').addEventListener('click', async () => {
+      const title = document.getElementById('tk2-title').value.trim();
+      if (!title) return toast('Task title required', 'error');
+      try {
+        await Api.tasks.create({
+          title,
+          due_date: document.getElementById('tk2-due').value || null,
+          assigned_to: parseInt(document.getElementById('tk2-assignee').value) || null,
+          priority: document.getElementById('tk2-prio').value,
+          notes: document.getElementById('tk2-notes').value.trim() || null,
+        });
+        closeModal(); toast('Task created', 'success'); loadTasks();
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  });
+})();
+
+// ══ NOTIFICATION SETTINGS (topbar bell) ═══════════════════════════ //
+const NotifPrefs = {
+  get() {
+    try { return JSON.parse(localStorage.getItem('notif_prefs')) || {}; } catch(_) { return {}; }
+  },
+  save(p) { localStorage.setItem('notif_prefs', JSON.stringify(p)); },
+};
+
+(() => {
+  const bell = document.getElementById('topbar-bell');
+  const pop = document.getElementById('notif-popover');
+  if (!bell || !pop) return;
+
+  const SETTINGS = [
+    ['inapp', 'In-App Notifications'],
+    ['desktop', 'Desktop Notifications'],
+    ['sound', 'Sound'],
+  ];
+  const TYPES = [
+    ['new_messages', 'New Messages'],
+    ['new_note', 'New Private Note'],
+    ['ticket_assign', 'Ticket Assignment'],
+    ['task_assign', 'Task Assignment'],
+    ['chat_assign', 'Chat Assignment'],
+  ];
+
+  function render() {
+    const p = NotifPrefs.get();
+    pop.innerHTML = `
+      <div class="np-title">Notification Settings</div>
+      ${SETTINGS.map(([k, label]) => `
+        <div class="notif-row">${label}
+          <label class="np-switch"><input type="checkbox" data-k="${k}" ${p[k] ? 'checked' : ''}><span class="np-slider"></span></label>
+        </div>`).join('')}
+      <div class="np-title">Notification Types</div>
+      ${TYPES.map(([k, label]) => `
+        <div class="notif-row">${label}
+          <input type="checkbox" class="np-check" data-k="${k}" ${p[k] !== false ? 'checked' : ''}>
+        </div>`).join('')}`;
+    pop.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('change', () => {
+      const prefs = NotifPrefs.get();
+      prefs[inp.dataset.k] = inp.checked;
+      NotifPrefs.save(prefs);
+      if (inp.dataset.k === 'desktop' && inp.checked && 'Notification' in window) {
+        Notification.requestPermission();
+      }
+    }));
+  }
+
+  bell.addEventListener('click', e => {
+    e.stopPropagation();
+    const open = pop.style.display !== 'none';
+    pop.style.display = open ? 'none' : 'block';
+    if (!open) render();
+  });
+  document.addEventListener('click', e => {
+    if (!pop.contains(e.target) && e.target !== bell) pop.style.display = 'none';
+  });
+})();
+
+// Called from the WS handler on incoming events
+function notifyUser(type, title, bodyText) {
+  const p = NotifPrefs.get();
+  if (p[type] === false) return;
+  if (p.inapp) toast(`${title}: ${bodyText}`.slice(0, 120), 'default');
+  if (p.desktop && 'Notification' in window && Notification.permission === 'granted') {
+    try { new Notification(title, { body: bodyText.slice(0, 140) }); } catch(_) {}
+  }
+  if (p.sound) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator(); const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = 880; gain.gain.value = 0.04;
+      osc.start(); osc.stop(ctx.currentTime + 0.12);
+    } catch(_) {}
+  }
+}
 
 // ── Boot ────────────────────────────────────────────────────────── //
 window.onerror = (msg, src, line, col, err) => {

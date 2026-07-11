@@ -66,7 +66,7 @@ const Api = (() => {
     addLabel:   (cid, lid)    => post(`/inbox/chats/${cid}/labels/${lid}`),
     removeLabel:(cid, lid)    => del(`/inbox/chats/${cid}/labels/${lid}`),
     sync:          (pid)  => post(`/inbox/sync/${pid}`),
-    syncMessages:  (cid)  => post(`/inbox/chats/${cid}/sync-messages`),
+    syncMessages:  (cid, limit) => post(`/inbox/chats/${cid}/sync-messages${limit ? '?limit=' + limit : ''}`),
   };
 
   // Tickets
@@ -88,6 +88,9 @@ const Api = (() => {
     create: (b)     => post('/contacts', b),
     update: (id, b) => patch(`/contacts/${id}`, b),
     del:    (id)    => del(`/contacts/${id}`),
+    labels:      (id)      => get(`/contacts/${id}/labels`),
+    addLabel:    (id, lid) => post(`/contacts/${id}/labels/${lid}`),
+    removeLabel: (id, lid) => del(`/contacts/${id}/labels/${lid}`),
   };
 
   // Labels
@@ -186,9 +189,30 @@ const Api = (() => {
 
   // Scheduled messages
   const scheduled = {
-    list:   (q)  => get('/scheduled', q),
-    create: (b)  => post('/scheduled', b),
-    cancel: (id) => del(`/scheduled/${id}`),
+    list:   (q)     => get('/scheduled', q),
+    create: (b)     => post('/scheduled', b),
+    update: (id, b) => patch(`/scheduled/${id}`, b),
+    cancel: (id)    => del(`/scheduled/${id}`),
+  };
+
+  // Tasks
+  const tasks = {
+    list:   (q)     => get('/tasks', q),
+    create: (b)     => post('/tasks', b),
+    update: (id, b) => patch(`/tasks/${id}`, b),
+    del:    (id)    => del(`/tasks/${id}`),
+  };
+
+  // Custom properties
+  const properties = {
+    definitions:  (entity) => get('/properties/definitions', entity ? { entity } : undefined),
+    createDef:    (b)      => post('/properties/definitions', b),
+    updateDef:    (id, b)  => patch(`/properties/definitions/${id}`, b),
+    deleteDef:    (id)     => del(`/properties/definitions/${id}`),
+    chatValues:   (id)     => get(`/properties/chat/${id}`),
+    setChat:      (id, values)   => req('PUT', `/properties/chat/${id}`, { values }),
+    ticketValues: (id)     => get(`/properties/ticket/${id}`),
+    setTicket:    (id, values)   => req('PUT', `/properties/ticket/${id}`, { values }),
   };
 
   // Developer platform
@@ -230,5 +254,6 @@ const Api = (() => {
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
     phones, analytics, automation, kb, bulk, ai, search,
     logs, groups, scheduled, developer, exports: exportsApi,
+    tasks, properties,
   };
 })();
