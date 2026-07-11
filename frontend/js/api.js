@@ -161,7 +161,17 @@ const Api = (() => {
     list:    ()      => get('/bulk/jobs'),
     create:  (b)     => post('/bulk/jobs', b),
     send:    (id)    => post(`/bulk/jobs/${id}/send`),
+    stop:    (id)    => post(`/bulk/jobs/${id}/stop`),
+    logs:    (id)    => get(`/bulk/jobs/${id}/logs`),
     credits: ()      => get('/bulk/credits'),
+    templates:      ()      => get('/bulk/templates'),
+    createTemplate: (b)     => post('/bulk/templates', b),
+    updateTemplate: (id, b) => patch(`/bulk/templates/${id}`, b),
+    delTemplate:    (id)    => del(`/bulk/templates/${id}`),
+    chatLists:      ()      => get('/bulk/chat-lists'),
+    createChatList: (b)     => post('/bulk/chat-lists', b),
+    updateChatList: (id, b) => patch(`/bulk/chat-lists/${id}`, b),
+    delChatList:    (id)    => del(`/bulk/chat-lists/${id}`),
   };
 
   // AI

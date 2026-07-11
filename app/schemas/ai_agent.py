@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -88,12 +90,20 @@ class BulkJobCreate(BaseModel):
     message_type: str = "text"  # text|image|file|poll
     media_url: str | None = None
     poll_options: list[str] | None = None
+    delay_seconds: int = 1
+    # Repeating broadcasts
+    repeat: str = "none"  # none|daily|weekly|monthly
+    interval: int = 1
+    days_of_week: list[int] | None = None
+    day_of_month: int | None = None
+    end_date: str | None = None
 
 
 class BulkJobOut(BaseModel):
     id: int
     name: str
     status: str
+    message: str = ""
     message_type: str = "text"
     media_url: str | None = None
     poll_options: list | None = None
@@ -101,5 +111,14 @@ class BulkJobOut(BaseModel):
     sent_count: int
     failed_count: int
     credits_used: int
+    delay_seconds: int = 1
+    repeat: str = "none"
+    interval: int = 1
+    days_of_week: list | None = None
+    day_of_month: int | None = None
+    end_date: datetime | None = None
+    scheduled_at: datetime | None = None
+    runs_count: int = 0
+    recipient_chat_ids: list | None = None
 
     model_config = {"from_attributes": True}

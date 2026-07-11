@@ -90,11 +90,20 @@ class BulkService:
             self.db.commit()
             return {"error": "Phone not found"}
 
+        from app.models.bulk_message_job import BulkMessageLog
+
         waha = WAHAService(session_name=phone.session_name)
         sent = 0
         failed = 0
+        run_no = (job.runs_count or 0) + 1
+        delay = max(0.5, float(job.delay_seconds or 1))
 
         for chat_id in recipients:
+            # Re-check status so a Stop request takes effect mid-run
+            self.db.refresh(job)
+            if job.status == "cancelled":
+                break
+            log_row = BulkMessageLog(job_id=job.id, run_number=run_no)
             try:
                 # recipient_chat_ids stores WIDs (e.g. "918320356326@c.us") or int IDs
                 chat_id_str = str(chat_id)
@@ -105,8 +114,14 @@ class BulkService:
                 if not chat:
                     logger.warning("Bulk: chat %s not found, skipping", chat_id)
                     failed += 1
+                    log_row.status = "skipped"
+                    log_row.error = f"Chat {chat_id} not found"
+                    self.db.add(log_row)
+                    self.db.commit()
                     continue
 
+                log_row.chat_id = chat.id
+                log_row.chat_name = chat.name or chat.chat_wid
                 text = self._render_variables(job.message, chat)
                 if job.message_type == "image" and job.media_url:
                     await waha.send_image(chat.chat_wid, job.media_url, caption=text)
@@ -117,21 +132,56 @@ class BulkService:
                 else:
                     await waha.send_text(chat.chat_wid, text)
                 sent += 1
-                await asyncio.sleep(0.5)
+                log_row.status = "sent"
+                self.db.add(log_row)
+                self.db.commit()
+                await asyncio.sleep(delay)
             except Exception as exc:
                 logger.warning("Bulk send failed for chat %s: %s", chat_id, exc)
                 failed += 1
+                log_row.status = "failed"
+                log_row.error = str(exc)[:500]
+                self.db.add(log_row)
+                self.db.commit()
 
-        job.sent_count = sent
-        job.failed_count = failed
-        job.credits_used = sent
-        job.status = "done"
+        job.sent_count = (job.sent_count or 0) + sent
+        job.failed_count = (job.failed_count or 0) + failed
+        job.credits_used = (job.credits_used or 0) + sent
+        job.runs_count = run_no
+
+        # Repeating broadcasts: line up the next run instead of finishing
+        if job.status != "cancelled" and (job.repeat or "none") != "none":
+            nxt = self._next_run(job)
+            if nxt:
+                job.scheduled_at = nxt
+                job.status = "pending"
+            else:
+                job.status = "done"
+        elif job.status != "cancelled":
+            job.status = "done"
         self.db.commit()
 
         from app.services.activity_service import log_activity
         log_activity(
             self.db, "bulk_job_completed", entity_type="bulk_job", entity_id=job.id,
-            description=f"Bulk job '{job.name}': {sent} sent, {failed} failed",
-            metadata={"sent": sent, "failed": failed, "credits_used": sent},
+            description=f"Bulk job '{job.name}' run #{run_no}: {sent} sent, {failed} failed"
+                        + (f", next run {job.scheduled_at}" if job.status == "pending" else ""),
+            metadata={"sent": sent, "failed": failed, "credits_used": sent, "run": run_no},
         )
         return {"sent": sent, "failed": failed}
+
+    def _next_run(self, job) -> datetime | None:
+        """Next occurrence for a repeating broadcast (reuses scheduler math)."""
+        from app.workers.tasks import _next_occurrence
+
+        class _Shim:
+            pass
+
+        shim = _Shim()
+        shim.send_at = job.scheduled_at or datetime.utcnow()
+        shim.repeat = job.repeat
+        shim.interval = job.interval or 1
+        shim.days_of_week = job.days_of_week
+        shim.day_of_month = job.day_of_month
+        shim.end_date = job.end_date
+        return _next_occurrence(shim, datetime.utcnow())

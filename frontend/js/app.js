@@ -2275,10 +2275,20 @@ async function renderBulk() {
           <button class="btn btn-primary btn-sm" id="new-bulk-btn">+ New Campaign</button>
         </div>
       </div>
+      <div class="tab-bar" id="bulk-tabs">
+        <div class="tab active" data-btab="campaigns">Campaigns</div>
+        <div class="tab" data-btab="templates">Message Templates</div>
+        <div class="tab" data-btab="chatlists">Saved Chat Lists</div>
+      </div>
       <div class="scroll-area" id="bulk-list"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>`;
-  await loadBulkJobs();
+  document.querySelectorAll('#bulk-tabs .tab').forEach(t => t.addEventListener('click', () => {
+    document.querySelectorAll('#bulk-tabs .tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    loadBulkTab(t.dataset.btab);
+  }));
   document.getElementById('new-bulk-btn').addEventListener('click', () => showBulkModal());
+  await loadBulkTab('campaigns');
   try {
     const c = await Api.bulk.credits();
     const chip = document.getElementById('bulk-credits');
@@ -2286,40 +2296,256 @@ async function renderBulk() {
   } catch(_) {}
 }
 
-async function loadBulkJobs() {
-  try {
-    const jobs = await Api.bulk.list();
-    const el = document.getElementById('bulk-list');
-    if (!el) return;
-    if (!jobs.length) { el.innerHTML = `<div class="loading-center text-muted">No bulk jobs yet</div>`; return; }
-    el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
-      <thead><tr><th>Name</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Credits</th><th>Scheduled</th><th></th></tr></thead>
-      <tbody>${jobs.map(j => `<tr>
-        <td style="font-weight:600">${esc(j.name)}</td>
-        <td><span class="${pillClass(j.status==='completed'?'resolved':j.status==='running'?'in_progress':'open')}">${j.status}</span></td>
-        <td>${(j.recipient_chat_ids||[]).length}</td>
-        <td>${j.sent_count||0}</td>
-        <td>${j.failed_count||0}</td>
-        <td>${j.credits_used||0}</td>
-        <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? new Date(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
-        <td>${j.status==='pending' ? `<button class="btn btn-primary btn-sm bulk-send" data-jid="${j.id}">Send Now</button>` : ''}</td>
-      </tr>`).join('')}</tbody>
-    </table></div></div>`;
-    el.querySelectorAll('.bulk-send').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        if (!confirm('Send now?')) return;
-        try { await Api.bulk.send(btn.dataset.jid); toast('Sending...', 'success'); setTimeout(loadBulkJobs, 1500); }
-        catch(e) { toast(e.message, 'error'); }
-      });
-    });
-  } catch(_) {}
+function _bulkRepeatSummary(j) {
+  if (!j.repeat || j.repeat === 'none') return j.scheduled_at ? 'Once' : 'Immediate';
+  const every = (j.interval || 1) > 1 ? `every ${j.interval} ` : '';
+  const names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  if (j.repeat === 'daily') {
+    const days = (j.days_of_week || []).map(d => names[d]).join(', ');
+    return 'Daily' + (days ? ` (${days})` : '') + (every ? ` · ${every}days` : '');
+  }
+  if (j.repeat === 'weekly') return every ? `Every ${j.interval} weeks` : 'Weekly';
+  if (j.repeat === 'monthly') return (every ? `Every ${j.interval} months` : 'Monthly') + (j.day_of_month ? ` on day ${j.day_of_month}` : '');
+  return j.repeat;
 }
 
-function showBulkModal() {
+async function loadBulkTab(tab) {
+  const el = document.getElementById('bulk-list');
+  if (!el) return;
+  el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+
+  if (tab === 'campaigns') {
+    try {
+      const jobs = await Api.bulk.list();
+      if (!jobs.length) { el.innerHTML = `<div class="loading-center text-muted">No campaigns yet — create one to get started</div>`; return; }
+      el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
+        <thead><tr><th>Name</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Repeat</th><th>Runs</th><th>Next / Scheduled</th><th></th></tr></thead>
+        <tbody>${jobs.map(j => `<tr>
+          <td style="font-weight:600">${esc(j.name)}</td>
+          <td><span class="${pillClass(j.status==='done'?'resolved':j.status==='running'?'in_progress':j.status==='failed'||j.status==='cancelled'?'urgent':'open')}">${j.status}</span>${j.error_message ? ` <span title="${esc(j.error_message)}">⚠️</span>` : ''}</td>
+          <td>${(j.recipient_chat_ids||[]).length}</td>
+          <td>${j.sent_count||0}</td>
+          <td>${j.failed_count||0}</td>
+          <td style="font-size:12px">${esc(_bulkRepeatSummary(j))}${j.end_date ? `<div style="color:var(--text-3);font-size:11px">until ${new Date(j.end_date).toLocaleDateString()}</div>` : ''}</td>
+          <td>${j.runs_count||0}</td>
+          <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? new Date(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
+          <td style="white-space:nowrap">
+            <button class="btn btn-secondary btn-sm bulk-logs" data-jid="${j.id}">Logs</button>
+            ${j.status==='pending' ? `<button class="btn btn-primary btn-sm bulk-send" data-jid="${j.id}">Send Now</button>
+            <button class="btn btn-danger btn-sm bulk-stop" data-jid="${j.id}">Stop</button>` : ''}
+          </td>
+        </tr>`).join('')}</tbody>
+      </table></div></div>`;
+      el.querySelectorAll('.bulk-send').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Send this campaign now?')) return;
+        try { await Api.bulk.send(btn.dataset.jid); toast('Sending…', 'success'); setTimeout(() => loadBulkTab('campaigns'), 1500); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      el.querySelectorAll('.bulk-stop').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Stop this campaign (and any repeats)?')) return;
+        try { await Api.bulk.stop(btn.dataset.jid); toast('Stopped', 'success'); loadBulkTab('campaigns'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      el.querySelectorAll('.bulk-logs').forEach(btn => btn.addEventListener('click', () => showBulkLogs(btn.dataset.jid)));
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  else if (tab === 'templates') {
+    try {
+      const templates = await Api.bulk.templates();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="new-tpl-btn">+ New Template</button>
+        </div>
+        ${templates.length ? `<div class="content-card"><div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Name</th><th>Message</th><th></th></tr></thead>
+          <tbody>${templates.map(t => `<tr>
+            <td style="font-weight:600;white-space:nowrap">${esc(t.name)}</td>
+            <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;color:var(--text-2)">${esc(t.body)}</td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-secondary btn-sm tpl-edit" data-tid="${t.id}">Edit</button>
+              <button class="btn btn-danger btn-sm tpl-del" data-tid="${t.id}">Delete</button>
+            </td></tr>`).join('')}</tbody>
+        </table></div></div>`
+        : `<div class="empty-state" style="padding:3rem;text-align:center"><p class="text-muted" style="font-size:13px">
+            No templates yet. Save frequently used broadcasts once and reuse them —<br>{{name}}, {{phone}} and {{company}} personalize per recipient.</p></div>`}`;
+      const openTplModal = (tpl) => {
+        showModal(tpl ? 'Edit Template' : 'New Template', `
+          <div class="form-group"><label>Template Name *</label><input type="text" id="tpl-name" value="${tpl ? esc(tpl.name) : ''}"></div>
+          <div class="form-group"><label>Message *</label>
+            <textarea id="tpl-body" style="min-height:110px" placeholder="Hi {{name}}, ...">${tpl ? esc(tpl.body) : ''}</textarea>
+            <small class="text-muted">Variables: {{name}}, {{phone}}, {{company}}</small></div>
+          <div class="form-group"><label>Preview</label>
+            <div id="tpl-preview" style="background:#efeae2;border-radius:8px;padding:.8rem">
+              <div style="background:var(--bubble-out);border-radius:8px;padding:.5rem .7rem;font-size:13px;max-width:85%;margin-left:auto;white-space:pre-wrap"></div>
+            </div></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="tpl-save">${tpl ? 'Update Template' : 'Save Template'}</button>
+          </div>`);
+        const bodyTa = document.getElementById('tpl-body');
+        const prevBubble = document.querySelector('#tpl-preview > div');
+        const updPrev = () => prevBubble.textContent =
+          (bodyTa.value || 'Your message preview…').replace(/{{\s*name\s*}}/g, 'Ravi').replace(/{{\s*phone\s*}}/g, '9198…').replace(/{{\s*company\s*}}/g, 'Acme');
+        bodyTa.addEventListener('input', updPrev); updPrev();
+        document.getElementById('tpl-save').addEventListener('click', async () => {
+          const name = document.getElementById('tpl-name').value.trim();
+          const body = bodyTa.value.trim();
+          if (!name || !body) return toast('Name and message required', 'error');
+          try {
+            if (tpl) await Api.bulk.updateTemplate(tpl.id, { name, body });
+            else await Api.bulk.createTemplate({ name, body });
+            closeModal(); toast('Template saved', 'success'); loadBulkTab('templates');
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      };
+      document.getElementById('new-tpl-btn').addEventListener('click', () => openTplModal(null));
+      el.querySelectorAll('.tpl-edit').forEach(btn => btn.addEventListener('click', () =>
+        openTplModal(templates.find(t => t.id == btn.dataset.tid))));
+      el.querySelectorAll('.tpl-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete template?')) return;
+        try { await Api.bulk.delTemplate(btn.dataset.tid); toast('Deleted', 'success'); loadBulkTab('templates'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  else if (tab === 'chatlists') {
+    try {
+      const lists = await Api.bulk.chatLists();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="new-cl-btn">+ New Chat List</button>
+        </div>
+        ${lists.length ? `<div class="content-card"><div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Name</th><th>Chats</th><th></th></tr></thead>
+          <tbody>${lists.map(l => `<tr>
+            <td style="font-weight:600">${esc(l.name)}</td>
+            <td>${l.count}</td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-secondary btn-sm cl-edit" data-lid="${l.id}">Edit</button>
+              <button class="btn btn-danger btn-sm cl-del" data-lid="${l.id}">Delete</button>
+            </td></tr>`).join('')}</tbody>
+        </table></div></div>`
+        : `<div class="empty-state" style="padding:3rem;text-align:center"><p class="text-muted" style="font-size:13px">
+            No saved chat lists yet. Save a recipient selection once and reuse it in every campaign.</p></div>`}`;
+      document.getElementById('new-cl-btn').addEventListener('click', () => showChatListModal(null));
+      el.querySelectorAll('.cl-edit').forEach(btn => btn.addEventListener('click', () =>
+        showChatListModal(lists.find(l => l.id == btn.dataset.lid))));
+      el.querySelectorAll('.cl-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete chat list?')) return;
+        try { await Api.bulk.delChatList(btn.dataset.lid); toast('Deleted', 'success'); loadBulkTab('chatlists'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+}
+
+async function showBulkLogs(jobId) {
+  showModal('Campaign Logs', '<div class="loading-center"><div class="spinner"></div></div>');
+  try {
+    const res = await Api.bulk.logs(jobId);
+    const html = `
+      <div style="display:flex;gap:1rem;margin-bottom:.8rem">
+        <div class="stat-mini"><div class="stat-mini-num">${res.job.sent}</div><div class="stat-mini-label">Sent</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${res.job.failed}</div><div class="stat-mini-label">Failed</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${res.job.runs}</div><div class="stat-mini-label">Runs</div></div>
+      </div>
+      <div class="table-wrap" style="max-height:320px;overflow-y:auto"><table class="data-table">
+        <thead><tr><th>Chat</th><th>Status</th><th>Run</th><th>Time</th><th>Remarks</th></tr></thead>
+        <tbody>${res.logs.map(r => `<tr>
+          <td>${esc(displayName(r.chat_name) || ('#' + (r.chat_id || '?')))}</td>
+          <td><span class="${pillClass(r.status === 'sent' ? 'resolved' : 'urgent')}">${r.status}</span></td>
+          <td>${r.run}</td>
+          <td style="font-size:11.5px;color:var(--text-3)">${r.at ? new Date(r.at).toLocaleString() : ''}</td>
+          <td style="font-size:11.5px;color:var(--text-3)">${esc(r.error || '—')}</td>
+        </tr>`).join('') || '<tr><td colspan="5" class="text-muted">No delivery logs yet — logs appear after the campaign runs</td></tr>'}</tbody>
+      </table></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="bl-export">Export CSV</button>
+        <button class="btn btn-primary" onclick="closeModal()">Close</button>
+      </div>`;
+    document.getElementById('modal-body').innerHTML = html;
+    document.getElementById('modal-title').textContent = `Logs — ${res.job.name}`;
+    document.getElementById('bl-export').addEventListener('click', () => {
+      const csv = ['chat,status,run,time,error'].concat(res.logs.map(r =>
+        `"${(r.chat_name || '').replace(/"/g, '""')}",${r.status},${r.run},${r.at || ''},"${(r.error || '').replace(/"/g, '""')}"`)).join('\n');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+      a.download = `campaign_${jobId}_logs.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+  } catch(e) { toast(e.message, 'error'); closeModal(); }
+}
+
+async function showChatListModal(existing) {
+  let chats = [];
+  try { chats = await Api.inbox.chats({ limit: 200 }); } catch(_) {}
+  const selected = new Set(existing ? existing.chat_ids : []);
+  showModal(existing ? 'Edit Chat List' : 'New Chat List', `
+    <div class="form-group"><label>List Name *</label><input type="text" id="cl-name" value="${existing ? esc(existing.name) : ''}" placeholder="e.g. VIP customers"></div>
+    <div class="form-group"><label>Chats (<span id="cl-count">${selected.size}</span> selected)</label>
+      <input type="text" id="cl-filter" placeholder="Filter chats..." style="margin-bottom:.4rem">
+      <div id="cl-chats" style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:7px;padding:.3rem"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="cl-save">${existing ? 'Update List' : 'Save List'}</button>
+    </div>`);
+  const listEl = document.getElementById('cl-chats');
+  const render = (q) => {
+    const ql = (q || '').toLowerCase();
+    listEl.innerHTML = chats
+      .filter(c => !ql || displayName(c).toLowerCase().includes(ql))
+      .map(c => `<label style="display:flex;align-items:center;gap:.5rem;padding:.25rem .3rem;font-size:12.5px;font-weight:400">
+        <input type="checkbox" class="cl-pick" value="${c.id}" ${selected.has(c.id) ? 'checked' : ''}>
+        ${esc(displayName(c))}${c.is_group ? ' <span class="pill pill-in_progress" style="font-size:10px">group</span>' : ''}
+      </label>`).join('') || '<div class="text-muted" style="padding:.5rem;font-size:12px">No chats</div>';
+    listEl.querySelectorAll('.cl-pick').forEach(cb => cb.addEventListener('change', () => {
+      cb.checked ? selected.add(+cb.value) : selected.delete(+cb.value);
+      document.getElementById('cl-count').textContent = selected.size;
+    }));
+  };
+  document.getElementById('cl-filter').addEventListener('input', e => render(e.target.value));
+  render('');
+  document.getElementById('cl-save').addEventListener('click', async () => {
+    const name = document.getElementById('cl-name').value.trim();
+    if (!name) return toast('Name required', 'error');
+    if (!selected.size) return toast('Select at least one chat', 'error');
+    try {
+      if (existing) await Api.bulk.updateChatList(existing.id, { name, chat_ids: [...selected] });
+      else await Api.bulk.createChatList({ name, chat_ids: [...selected] });
+      closeModal(); toast('Chat list saved', 'success');
+      if (document.querySelector('#bulk-tabs .tab.active')?.dataset.btab === 'chatlists') loadBulkTab('chatlists');
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+async function showBulkModal() {
   const phoneOpts = State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('');
+  let templates = [], chatLists = [], chats = [];
+  try { [templates, chatLists, chats] = await Promise.all([
+    Api.bulk.templates().catch(() => []),
+    Api.bulk.chatLists().catch(() => []),
+    Api.inbox.chats({ limit: 200 }).catch(() => []),
+  ]); } catch(_) {}
+  const selected = new Set();
+  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
   showModal('New Bulk Campaign', `
     <div class="form-group"><label>Campaign Name *</label><input type="text" id="bk-name"></div>
     <div class="form-group"><label>Phone</label><select id="bk-phone">${phoneOpts}</select></div>
+
+    <div class="form-group"><label>Recipients (<span id="bk-count">0</span> selected) *</label>
+      ${chatLists.length ? `<select id="bk-savedlist" style="margin-bottom:.4rem">
+        <option value="">— Load a saved chat list —</option>
+        ${chatLists.map(l => `<option value="${l.id}">${esc(l.name)} (${l.count})</option>`).join('')}
+      </select>` : ''}
+      <input type="text" id="bk-filter" placeholder="Filter chats..." style="margin-bottom:.4rem">
+      <div id="bk-chats" style="max-height:170px;overflow-y:auto;border:1px solid var(--border);border-radius:7px;padding:.3rem"></div>
+      <div style="margin-top:.35rem"><a href="#" id="bk-savelist" style="font-size:12px;color:var(--accent)">💾 Save selection as chat list</a></div>
+    </div>
+
     <div class="form-group"><label>Type</label><select id="bk-type">
       <option value="text">Text</option>
       <option value="image">Image + caption</option>
@@ -2332,16 +2558,92 @@ function showBulkModal() {
     <div class="form-group" id="bk-poll-wrap" style="display:none">
       <label>Poll Options (comma separated) *</label><input type="text" id="bk-poll" placeholder="Yes, No, Maybe">
     </div>
+
     <div class="form-group"><label id="bk-msg-label">Message *</label>
+      ${templates.length ? `<select id="bk-template" style="margin-bottom:.4rem">
+        <option value="">— Use a template (optional) —</option>
+        ${templates.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}
+      </select>` : ''}
       <textarea id="bk-msg" style="min-height:80px" placeholder="Hi {{name}}, ..."></textarea>
       <small class="text-muted">Personalize with {{name}}, {{phone}}, {{company}}</small>
     </div>
-    <div class="form-group"><label>Recipient Chat IDs (comma separated)</label><input type="text" id="bk-ids" placeholder="1,2,3..."></div>
-    <div class="form-group"><label>Schedule At (leave empty for manual send)</label><input type="datetime-local" id="bk-schedule"></div>
+
+    <div class="form-group"><label>Delivery</label><select id="bk-delivery">
+      <option value="now">Send manually (Send Now button)</option>
+      <option value="once">Schedule once</option>
+      <option value="repeat">Schedule repeating broadcasts</option>
+    </select></div>
+    <div class="form-group" id="bk-schedule-wrap" style="display:none">
+      <label>First send at *</label><input type="datetime-local" id="bk-schedule">
+    </div>
+    <div id="bk-repeat-wrap" style="display:none">
+      <div class="form-group"><label>Repeat</label><select id="bk-repeat">
+        <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+      </select></div>
+      <div class="form-group"><label>Repeat every</label>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <input type="number" id="bk-interval" min="1" max="30" value="1" style="width:80px">
+          <span id="bk-interval-unit" class="text-muted" style="font-size:12.5px">day(s)</span>
+        </div></div>
+      <div class="form-group" id="bk-days-wrap"><label>On days (unchecked = every day)</label>
+        <div style="display:flex;gap:.55rem;flex-wrap:wrap">
+          ${DAYS.map((d, i) => `<label style="display:flex;align-items:center;gap:.25rem;font-size:12.5px;font-weight:400">
+            <input type="checkbox" class="bk-day" value="${i}">${d}</label>`).join('')}
+        </div></div>
+      <div class="form-group" id="bk-dom-wrap" style="display:none"><label>Day of month (1–31)</label>
+        <input type="number" id="bk-dom" min="1" max="31" placeholder="e.g. 1"></div>
+      <div class="form-group"><label>End date (optional)</label><input type="date" id="bk-end"></div>
+    </div>
+    <div class="form-group"><label>Delay between messages (seconds)</label>
+      <input type="number" id="bk-delay" min="1" max="60" value="1" style="width:100px"></div>
+
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="bk-save">Create Campaign</button>
     </div>`);
+
+  // Recipient picker
+  const chatsEl = document.getElementById('bk-chats');
+  const renderChats = (q) => {
+    const ql = (q || '').toLowerCase();
+    chatsEl.innerHTML = chats
+      .filter(c => !ql || displayName(c).toLowerCase().includes(ql))
+      .map(c => `<label style="display:flex;align-items:center;gap:.5rem;padding:.22rem .3rem;font-size:12.5px;font-weight:400">
+        <input type="checkbox" class="bk-pick" value="${c.id}" ${selected.has(c.id) ? 'checked' : ''}>
+        ${esc(displayName(c))}${c.is_group ? ' <span class="pill pill-in_progress" style="font-size:10px">group</span>' : ''}
+      </label>`).join('') || '<div class="text-muted" style="padding:.5rem;font-size:12px">No chats</div>';
+    chatsEl.querySelectorAll('.bk-pick').forEach(cb => cb.addEventListener('change', () => {
+      cb.checked ? selected.add(+cb.value) : selected.delete(+cb.value);
+      document.getElementById('bk-count').textContent = selected.size;
+    }));
+  };
+  document.getElementById('bk-filter').addEventListener('input', e => renderChats(e.target.value));
+  renderChats('');
+
+  document.getElementById('bk-savedlist')?.addEventListener('change', e => {
+    const list = chatLists.find(l => l.id == e.target.value);
+    if (!list) return;
+    list.chat_ids.forEach(id => selected.add(id));
+    document.getElementById('bk-count').textContent = selected.size;
+    renderChats(document.getElementById('bk-filter').value);
+    toast(`Loaded "${list.name}" (${list.count} chats)`, 'success');
+  });
+  document.getElementById('bk-savelist').addEventListener('click', async e => {
+    e.preventDefault();
+    if (!selected.size) return toast('Select chats first', 'error');
+    const name = prompt('Chat list name:');
+    if (!name) return;
+    try { await Api.bulk.createChatList({ name, chat_ids: [...selected] }); toast('Chat list saved', 'success'); }
+    catch(err) { toast(err.message, 'error'); }
+  });
+
+  // Template picker fills the compose box
+  document.getElementById('bk-template')?.addEventListener('change', e => {
+    const t = templates.find(x => x.id == e.target.value);
+    if (t) document.getElementById('bk-msg').value = t.body;
+  });
+
+  // Type toggles
   const typeSel = document.getElementById('bk-type');
   typeSel.addEventListener('change', () => {
     const t = typeSel.value;
@@ -2349,28 +2651,52 @@ function showBulkModal() {
     document.getElementById('bk-poll-wrap').style.display = t === 'poll' ? '' : 'none';
     document.getElementById('bk-msg-label').textContent = t === 'poll' ? 'Poll Question *' : 'Message *';
   });
+
+  // Delivery mode toggles
+  const deliverySel = document.getElementById('bk-delivery');
+  const repeatSel = document.getElementById('bk-repeat');
+  deliverySel.addEventListener('change', () => {
+    const mode = deliverySel.value;
+    document.getElementById('bk-schedule-wrap').style.display = mode === 'now' ? 'none' : 'block';
+    document.getElementById('bk-repeat-wrap').style.display = mode === 'repeat' ? 'block' : 'none';
+  });
+  repeatSel.addEventListener('change', () => {
+    document.getElementById('bk-days-wrap').style.display = repeatSel.value === 'daily' ? 'block' : 'none';
+    document.getElementById('bk-dom-wrap').style.display = repeatSel.value === 'monthly' ? 'block' : 'none';
+    document.getElementById('bk-interval-unit').textContent =
+      repeatSel.value === 'weekly' ? 'week(s)' : repeatSel.value === 'monthly' ? 'month(s)' : 'day(s)';
+  });
+
   document.getElementById('bk-save').addEventListener('click', async () => {
     const name = document.getElementById('bk-name').value.trim();
     const msg = document.getElementById('bk-msg').value.trim();
     if (!name || !msg) return toast('Name and message required', 'error');
-    const idsRaw = document.getElementById('bk-ids').value;
-    const ids = idsRaw ? idsRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : [];
+    if (!selected.size) return toast('Select at least one recipient', 'error');
+    const mode = deliverySel.value;
+    const schedule = document.getElementById('bk-schedule').value;
+    if (mode !== 'now' && !schedule) return toast('Pick the first send time', 'error');
     const type = typeSel.value;
-    const pollRaw = document.getElementById('bk-poll').value;
     try {
-      const body = {
+      await Api.bulk.create({
         name, message: msg,
         phone_id: parseInt(document.getElementById('bk-phone').value),
-        recipient_chat_ids: ids,
-        scheduled_at: document.getElementById('bk-schedule').value || null,
+        recipient_chat_ids: [...selected].map(String),
+        scheduled_at: mode === 'now' ? null : schedule,
         message_type: type,
         media_url: document.getElementById('bk-media').value.trim() || null,
         poll_options: type === 'poll'
-          ? pollRaw.split(',').map(s => s.trim()).filter(Boolean)
+          ? document.getElementById('bk-poll').value.split(',').map(s => s.trim()).filter(Boolean)
           : null,
-      };
-      await Api.bulk.create(body);
-      closeModal(); toast('Campaign created', 'success'); loadBulkJobs();
+        delay_seconds: parseInt(document.getElementById('bk-delay').value) || 1,
+        repeat: mode === 'repeat' ? repeatSel.value : 'none',
+        interval: parseInt(document.getElementById('bk-interval')?.value) || 1,
+        days_of_week: mode === 'repeat' && repeatSel.value === 'daily'
+          ? [...document.querySelectorAll('.bk-day:checked')].map(c => +c.value) : null,
+        day_of_month: mode === 'repeat' && repeatSel.value === 'monthly'
+          ? (parseInt(document.getElementById('bk-dom')?.value) || null) : null,
+        end_date: mode === 'repeat' ? (document.getElementById('bk-end').value || null) : null,
+      });
+      closeModal(); toast('Campaign created', 'success'); loadBulkTab('campaigns');
     } catch(e) { toast(e.message, 'error'); }
   });
 }

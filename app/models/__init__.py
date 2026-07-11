@@ -10,7 +10,12 @@ from app.models.note import Note
 from app.models.quick_reply import QuickReply
 from app.models.automation_rule import AutomationRule
 from app.models.knowledge_item import KnowledgeItem
-from app.models.bulk_message_job import BulkMessageJob
+from app.models.bulk_message_job import (
+    BulkMessageJob,
+    BulkMessageLog,
+    MessageTemplate,
+    SavedChatList,
+)
 from app.models.activity_log import ActivityLog
 from app.models.api_key import ApiKey, WebhookEndpoint
 from app.models.scheduled_message import ScheduledMessage
@@ -23,4 +28,5 @@ __all__ = [
     "Note", "QuickReply", "AutomationRule", "KnowledgeItem",
     "BulkMessageJob", "ActivityLog", "ApiKey", "WebhookEndpoint",
     "ScheduledMessage", "Task", "PropertyDefinition",
+    "BulkMessageLog", "MessageTemplate", "SavedChatList",
 ]
