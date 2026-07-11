@@ -183,6 +183,9 @@ const Api = (() => {
     suggestReply:  (chatId) => post(`/ai/chat/${chatId}/suggest-reply`),
     translate:     (text, lang) => post('/ai/translate', { text, target_language: lang }),
     polish:        (text, tone) => post('/ai/polish', { text, tone: tone || 'professional' }),
+    settings:      ()   => get('/ai/settings'),
+    saveSettings:  (b)  => req('PUT', '/ai/settings', b),
+    assistant:     (b)  => post('/ai/assistant', b),
   };
 
   // Activity logs

@@ -210,6 +210,12 @@ async def send_message(
         logger.exception("upsert_message failed after successful WAHA send")
         raise HTTPException(500, f"DB save failed: {exc}")
 
+    # A human replied — snooze the AI for the configured quiet period
+    if chat.ai_active and chat.ai_state != "SNOOZED":
+        chat.ai_state = "SNOOZED"
+        chat.ai_snoozed_at = datetime.utcnow()
+        db.commit()
+
     return {"ok": True, "message_id": msg.id}
 
 

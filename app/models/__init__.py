@@ -17,6 +17,7 @@ from app.models.bulk_message_job import (
     SavedChatList,
 )
 from app.models.activity_log import ActivityLog
+from app.models.ai_settings import AIAgentSettings
 from app.models.api_key import ApiKey, WebhookEndpoint
 from app.models.scheduled_message import ScheduledMessage
 from app.models.task import Task
@@ -28,5 +29,5 @@ __all__ = [
     "Note", "QuickReply", "AutomationRule", "KnowledgeItem",
     "BulkMessageJob", "ActivityLog", "ApiKey", "WebhookEndpoint",
     "ScheduledMessage", "Task", "PropertyDefinition",
-    "BulkMessageLog", "MessageTemplate", "SavedChatList",
+    "BulkMessageLog", "MessageTemplate", "SavedChatList", "AIAgentSettings",
 ]

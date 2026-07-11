@@ -2022,6 +2022,12 @@ async function renderAIAgent() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header"><h2>AI Agent</h2></div>
       <div class="scroll-area">
+        <div class="content-card" style="margin-bottom:1rem">
+          <div class="card-header">Agent Settings
+            <div class="header-actions"><button class="btn btn-primary btn-sm" id="ai-cfg-save">Save Settings</button></div>
+          </div>
+          <div class="card-body" id="ai-cfg-body"><div class="spinner"></div></div>
+        </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
           <div class="content-card">
             <div class="card-header">Active AI Chats</div>
@@ -2052,6 +2058,74 @@ async function renderAIAgent() {
     </div>`;
 
   document.getElementById('goto-kb').addEventListener('click', e => { e.preventDefault(); navigateTo('knowledge-base'); });
+
+  // Agent Settings form (org-wide personalization + behavior)
+  try {
+    const cfg = await Api.ai.settings();
+    const el = document.getElementById('ai-cfg-body');
+    el.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.8rem 1.2rem">
+        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+          <input type="checkbox" id="cfg-enabled" ${cfg.enabled ? 'checked' : ''} style="width:15px;height:15px">
+          <strong>AI agent enabled</strong> (master switch)</label></div>
+        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+          <input type="checkbox" id="cfg-autoact" ${cfg.auto_activate_new_chats ? 'checked' : ''} style="width:15px;height:15px">
+          Auto-activate on new chats</label></div>
+        <div class="form-group"><label>Agent name (shown to customers)</label>
+          <input type="text" id="cfg-name" value="${esc(cfg.agent_name)}"></div>
+        <div class="form-group"><label>Personality</label><select id="cfg-personality">
+          <option value="friendly" ${cfg.personality === 'friendly' ? 'selected' : ''}>Friendly — warm, moderate detail</option>
+          <option value="grounded" ${cfg.personality === 'grounded' ? 'selected' : ''}>Grounded — strictly factual</option>
+          <option value="spartan" ${cfg.personality === 'spartan' ? 'selected' : ''}>Spartan — ultra-brief</option>
+          <option value="sales" ${cfg.personality === 'sales' ? 'selected' : ''}>Sales — benefit-oriented</option>
+        </select></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Role & business context</label>
+          <textarea id="cfg-role" style="min-height:50px" placeholder="e.g. Support agent for Acme Store — we sell electronics, ship India-wide in 3-5 days...">${esc(cfg.role_description)}</textarea></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Operational instructions</label>
+          <textarea id="cfg-instructions" style="min-height:50px" placeholder="e.g. Technical bugs → say the engineering team will call back. Pricing → share the plans page...">${esc(cfg.custom_instructions)}</textarea></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Hard restrictions (the agent must never do these)</label>
+          <textarea id="cfg-restrictions" style="min-height:40px" placeholder="e.g. Never promise refunds, never share internal phone numbers, never schedule calls...">${esc(cfg.restrictions)}</textarea></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Activation rules (when to reply / ignore)</label>
+          <textarea id="cfg-rules" style="min-height:40px" placeholder="e.g. Do not reply to plain greetings or thank-you messages. Only reply to actual questions.">${esc(cfg.activation_rules)}</textarea></div>
+        <div class="form-group"><label>Response delay (seconds, lets humans answer first)</label>
+          <input type="number" id="cfg-delay" min="0" max="6000" value="${cfg.response_delay_seconds}"></div>
+        <div class="form-group"><label>Snooze after human reply (seconds)</label>
+          <input type="number" id="cfg-snooze" min="0" max="6000" value="${cfg.snooze_after_human_seconds}"></div>
+        <div class="form-group"><label>Operating hours start (HH:MM, empty = always)</label>
+          <input type="text" id="cfg-hstart" value="${esc(cfg.hours_start)}" placeholder="09:00"></div>
+        <div class="form-group"><label>Operating hours end</label>
+          <input type="text" id="cfg-hend" value="${esc(cfg.hours_end)}" placeholder="18:00"></div>
+        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+          <input type="checkbox" id="cfg-flag" ${cfg.flag_enabled ? 'checked' : ''} style="width:15px;height:15px">
+          AI auto-flag important messages</label></div>
+        <div class="form-group"><label>Flag criteria</label>
+          <input type="text" id="cfg-flagcrit" value="${esc(cfg.flag_criteria)}" placeholder="urgent requests, complaints, refunds..."></div>
+      </div>`;
+    document.getElementById('ai-cfg-save').addEventListener('click', async () => {
+      try {
+        await Api.ai.saveSettings({
+          enabled: document.getElementById('cfg-enabled').checked,
+          auto_activate_new_chats: document.getElementById('cfg-autoact').checked,
+          agent_name: document.getElementById('cfg-name').value.trim() || 'AI Assistant',
+          personality: document.getElementById('cfg-personality').value,
+          role_description: document.getElementById('cfg-role').value.trim(),
+          custom_instructions: document.getElementById('cfg-instructions').value.trim(),
+          restrictions: document.getElementById('cfg-restrictions').value.trim(),
+          activation_rules: document.getElementById('cfg-rules').value.trim(),
+          response_delay_seconds: parseInt(document.getElementById('cfg-delay').value) || 0,
+          snooze_after_human_seconds: parseInt(document.getElementById('cfg-snooze').value) || 0,
+          hours_start: document.getElementById('cfg-hstart').value.trim(),
+          hours_end: document.getElementById('cfg-hend').value.trim(),
+          flag_enabled: document.getElementById('cfg-flag').checked,
+          flag_criteria: document.getElementById('cfg-flagcrit').value.trim(),
+        });
+        toast('AI agent settings saved', 'success');
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  } catch(e) {
+    const el = document.getElementById('ai-cfg-body');
+    if (el) el.innerHTML = `<p class="text-muted" style="font-size:12.5px">${esc(e.message)}</p>`;
+  }
 
   try {
     const chats = await Api.inbox.chats({ ai_active: true });
@@ -4094,6 +4168,100 @@ function notifyUser(type, title, bodyText) {
     } catch(_) {}
   }
 }
+
+// ══ ASK AI (Org & Chat Assistant) ═════════════════════════════════ //
+(() => {
+  const fab = document.getElementById('ask-ai-fab');
+  const panel = document.getElementById('ai-panel');
+  if (!fab || !panel) return;
+  const body = document.getElementById('ai-panel-body');
+  const input = document.getElementById('ai-panel-q');
+  const scopeChip = document.getElementById('ai-scope');
+
+  // Show the FAB once logged in
+  const bootWatch = setInterval(() => {
+    if (State.agent) { fab.style.display = 'flex'; clearInterval(bootWatch); }
+  }, 800);
+
+  const ORG_RECIPES = [
+    ['summarize_24h', '📋 Summarize last 24 hours'],
+    ['find_followups', '💬 Find chats needing follow-up'],
+    ['triage_unassigned', '👥 Triage unassigned'],
+    ['stale_tickets', '🎫 Find stale tickets'],
+  ];
+  const CHAT_RECIPES = [
+    ['summarize_chat', '📋 Summarize this chat'],
+    ['sentiment', '🙂 Sentiment scan'],
+    ['draft_reply', '✍️ Draft a reply'],
+  ];
+
+  function currentChatId() {
+    return State.currentView === 'inbox' ? State.inbox.selectedChatId : null;
+  }
+
+  function renderIntro() {
+    const chatId = currentChatId();
+    const chat = chatId ? State.inbox.chats?.find(c => c.id == chatId) : null;
+    scopeChip.textContent = chat ? `Chat: ${displayName(chat).slice(0, 22)}` : 'Org Assistant';
+    const recipes = chat ? CHAT_RECIPES.concat(ORG_RECIPES.slice(0, 2)) : ORG_RECIPES;
+    body.innerHTML = `
+      <div class="ai-greeting">Hi ${esc((State.agent?.name || '').split(' ')[0] || 'there')} 👋</div>
+      <div class="ai-sub">I can answer questions about your workspace${chat ? ' and this conversation' : ''} — powered by Gemini. I analyze and draft; I never send anything myself.</div>
+      <div class="ai-chips">${recipes.map(([k, label]) =>
+        `<button class="ai-chip" data-recipe="${k}">${label}</button>`).join('')}</div>
+      <div id="ai-thread"></div>`;
+    body.querySelectorAll('.ai-chip').forEach(chip =>
+      chip.addEventListener('click', () => ask('', chip.dataset.recipe, chip.textContent)));
+  }
+
+  async function ask(prompt, recipe, label) {
+    const thread = document.getElementById('ai-thread');
+    if (!thread) return;
+    const chatId = currentChatId();
+    thread.insertAdjacentHTML('beforeend',
+      `<div class="ai-msg q">${esc(label || prompt)}</div>
+       <div class="ai-msg a ai-pending">Thinking…</div>`);
+    body.scrollTop = body.scrollHeight;
+    try {
+      const isChatRecipe = recipe && CHAT_RECIPES.some(([k]) => k === recipe);
+      const res = await Api.ai.assistant({
+        prompt: prompt || '',
+        recipe: recipe || null,
+        chat_id: isChatRecipe ? chatId : (!recipe && chatId ? chatId : null),
+      });
+      const pending = thread.querySelector('.ai-pending');
+      if (pending) { pending.classList.remove('ai-pending'); pending.textContent = res.answer; }
+    } catch(e) {
+      const pending = thread.querySelector('.ai-pending');
+      if (pending) { pending.classList.remove('ai-pending'); pending.textContent = '⚠️ ' + e.message; }
+    }
+    body.scrollTop = body.scrollHeight;
+  }
+
+  fab.addEventListener('click', () => {
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'flex';
+    if (!open) { renderIntro(); setTimeout(() => input.focus(), 50); }
+  });
+  document.getElementById('ai-panel-close').addEventListener('click', () => panel.style.display = 'none');
+
+  const send = () => {
+    const q = input.value.trim();
+    if (!q) return;
+    input.value = '';
+    ask(q, null, null);
+  };
+  document.getElementById('ai-panel-send').addEventListener('click', send);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+  // Ctrl+K opens the assistant
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      fab.click();
+    }
+  });
+})();
 
 // ── Boot ────────────────────────────────────────────────────────── //
 window.onerror = (msg, src, line, col, err) => {

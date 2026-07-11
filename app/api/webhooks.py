@@ -65,11 +65,16 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                 chat_name = chat_name or f"Group {chat_wid.split('@')[0][-6:]}"
             else:
                 chat_name = notify_name or chat_wid.split("@")[0]
+            from app.models.ai_settings import get_ai_settings
+            _cfg = get_ai_settings(db)
             chat = inbox.upsert_chat({
                 "chat_wid": chat_wid,
                 "phone_id": phone.id,
                 "name": str(chat_name),
                 "is_group": is_group,
+                # Org setting: auto-activate the AI agent on new chats
+                "ai_active": bool(_cfg.enabled and _cfg.auto_activate_new_chats),
+                "ai_state": "ACTIVE" if (_cfg.enabled and _cfg.auto_activate_new_chats) else "INACTIVE",
             })
         elif not chat.is_group and notify_name:
             # Upgrade WID-looking names to the sender's push name once we learn it
@@ -159,10 +164,14 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             await automation.run_rules("message_keyword", rule_context)
 
         # AI auto-flag: mark important inbound messages per the configured criteria
-        if not from_me and body and settings.ai_auto_flag_enabled:
+        from app.models.ai_settings import get_ai_settings as _get_ai_cfg
+        _ai_cfg = _get_ai_cfg(db)
+        _flag_on = settings.ai_auto_flag_enabled or _ai_cfg.flag_enabled
+        _flag_criteria = _ai_cfg.flag_criteria or settings.ai_auto_flag_criteria
+        if not from_me and body and _flag_on:
             try:
                 from app.services.gemini_service import GeminiService
-                if await GeminiService().flag_message(body, settings.ai_auto_flag_criteria):
+                if await GeminiService().flag_message(body, _flag_criteria):
                     msg_row = db.query(Message).filter(Message.message_wid == msg_wid).first()
                     if msg_row:
                         msg_row.is_flagged = True

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hyperscope — WhatsApp CRM</title>
-<link rel="stylesheet" href="/static/css/app.css?v=33">
+<link rel="stylesheet" href="/static/css/app.css?v=34">
 </head>
 <body>
 
@@ -240,6 +240,22 @@
 
 </div>
 
+<!-- ASK AI FAB + PANEL -->
+<button class="ask-ai-fab" id="ask-ai-fab" title="Ask AI (workspace assistant)" style="display:none">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9z"/></svg>
+</button>
+<div class="ai-panel" id="ai-panel" style="display:none">
+  <div class="ai-panel-head">
+    <h3>✨ Ask AI <span class="ai-scope-chip" id="ai-scope">Org Assistant</span></h3>
+    <button class="modal-close" id="ai-panel-close">×</button>
+  </div>
+  <div class="ai-panel-body" id="ai-panel-body"></div>
+  <div class="ai-panel-input">
+    <input type="text" id="ai-panel-q" placeholder="Ask me anything about your workspace...">
+    <button class="btn btn-primary btn-sm" id="ai-panel-send">➤</button>
+  </div>
+</div>
+
 <!-- TASKS SIDE PANEL -->
 <div class="tasks-panel" id="tasks-panel" style="display:none">
   <div class="tasks-panel-head">
@@ -275,7 +291,7 @@
   </div>
 </div>
 
-<script src="/static/js/api.js?v=33"></script>
-<script src="/static/js/app.js?v=33"></script>
+<script src="/static/js/api.js?v=34"></script>
+<script src="/static/js/app.js?v=34"></script>
 </body>
 </html>

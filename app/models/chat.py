@@ -26,6 +26,7 @@ class Chat(Base, TimestampMixin):
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
     contact_id: Mapped[int | None] = mapped_column(ForeignKey("contacts.id"), nullable=True)
     custom_properties: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    ai_snoozed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ChatLabel(Base):

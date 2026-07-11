@@ -30,10 +30,11 @@ class GeminiService:
         prompt = f"Summarize this WhatsApp conversation in 3-5 bullet points. Be concise.\n\n{convo}"
         return await self._text(prompt, temperature=0.3)
 
-    async def generate_reply(self, context: str, knowledge: str = "") -> str:
+    async def generate_reply(self, context: str, knowledge: str = "", persona: str = "") -> str:
+        head = persona or "You are a helpful customer support agent on WhatsApp."
         kb = f"\nKnowledge base context:\n{knowledge}" if knowledge else ""
         prompt = (
-            f"You are a helpful customer support agent on WhatsApp.{kb}\n\n"
+            f"{head}{kb}\n\n"
             f"Recent conversation:\n{context}\n\n"
             "Write a short, natural reply to the last customer message. WhatsApp style, no markdown."
         )
@@ -64,12 +65,25 @@ Message: {message}"""
         except Exception:
             return {"should_respond": True, "is_question": True, "sentiment": "neutral", "suggested_intent": "general"}
 
-    async def answer_from_knowledge(self, question: str, knowledge_items: list[dict]) -> str:
+    async def answer_from_knowledge(self, question: str, knowledge_items: list[dict], persona: str = "") -> str:
         kb = "\n\n".join(f"Q: {k.get('title')}\nA: {k.get('content')}" for k in knowledge_items)
+        head = (persona + "\n") if persona else ""
         prompt = (
-            f"Answer this customer question based only on the knowledge base below.\n"
+            f"{head}Answer this customer question based only on the knowledge base below.\n"
             f"If the answer is not in the knowledge base, say you'll escalate to a human.\n\n"
             f"Knowledge Base:\n{kb}\n\nQuestion: {question}"
+        )
+        return await self._text(prompt, temperature=0.3)
+
+    async def assistant_answer(self, question: str, context_pack: str) -> str:
+        """Org/Chat assistant: answer a workspace question from real data only."""
+        prompt = (
+            "You are the workspace assistant for a WhatsApp CRM. Answer the team member's "
+            "question using ONLY the workspace data below. Be concise and specific — use "
+            "names and numbers from the data. If the data doesn't contain the answer, say "
+            "so plainly. Format with short lines suitable for a side panel; no markdown tables.\n\n"
+            f"=== WORKSPACE DATA ===\n{context_pack}\n\n"
+            f"=== QUESTION ===\n{question}"
         )
         return await self._text(prompt, temperature=0.3)
 

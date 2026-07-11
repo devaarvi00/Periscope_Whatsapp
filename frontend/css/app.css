@@ -1537,3 +1537,52 @@ textarea{resize:vertical;min-height:80px;}
   text-align:left;
 }
 .msg-context-menu button:hover{background:var(--border-light);color:var(--text);}
+
+/* ── Ask AI floating button + panel ─────────────────────────────── */
+.ask-ai-fab{
+  position:fixed;right:22px;bottom:22px;z-index:480;
+  width:46px;height:46px;border-radius:50%;
+  background:var(--accent);color:#fff;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 6px 20px rgba(21,128,61,.45);
+  transition:transform .15s,box-shadow .15s;
+}
+.ask-ai-fab:hover{transform:scale(1.07);box-shadow:0 8px 26px rgba(21,128,61,.55);}
+.ask-ai-fab svg{width:20px;height:20px;}
+
+.ai-panel{
+  position:fixed;top:0;right:0;bottom:0;width:420px;z-index:490;
+  background:#fff;border-left:1px solid var(--border);
+  box-shadow:-8px 0 32px rgba(0,0,0,.1);
+  display:flex;flex-direction:column;
+}
+.ai-panel-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:.9rem 1rem;border-bottom:1px solid var(--border-light);
+}
+.ai-panel-head h3{font-size:15px;font-weight:700;display:flex;align-items:center;gap:.4rem;}
+.ai-panel-body{flex:1;overflow-y:auto;padding:1rem;}
+.ai-greeting{font-size:15px;font-weight:700;margin-bottom:.2rem;}
+.ai-sub{font-size:12.5px;color:var(--text-3);margin-bottom:1rem;}
+.ai-chips{display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:1rem;}
+.ai-chip{
+  font-size:12px;font-weight:500;color:var(--text-2);
+  border:1px solid var(--border);border-radius:8px;
+  padding:.4rem .7rem;cursor:pointer;background:#fff;
+  transition:border-color .12s,color .12s;
+}
+.ai-chip:hover{border-color:var(--accent);color:var(--accent);}
+.ai-msg{
+  border-radius:10px;padding:.7rem .9rem;margin-bottom:.7rem;
+  font-size:13px;line-height:1.55;white-space:pre-wrap;
+}
+.ai-msg.q{background:var(--accent-light);color:var(--accent-dark);margin-left:2rem;}
+.ai-msg.a{background:var(--border-light);color:var(--text);margin-right:1.5rem;}
+.ai-panel-input{
+  display:flex;gap:.5rem;padding:.75rem 1rem;border-top:1px solid var(--border-light);
+}
+.ai-panel-input input{flex:1;}
+.ai-scope-chip{
+  font-size:11px;font-weight:600;border-radius:99px;padding:.15rem .6rem;
+  background:var(--accent-light);color:var(--accent-dark);
+}
