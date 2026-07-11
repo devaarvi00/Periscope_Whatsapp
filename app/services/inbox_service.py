@@ -85,17 +85,27 @@ class InboxService:
         return q.order_by(desc(Message.timestamp)).limit(limit).all()
 
     def upsert_message(self, data: dict[str, Any]) -> Message:
+        from sqlalchemy.exc import IntegrityError
         existing = self.db.query(Message).filter(
             Message.message_wid == data["message_wid"]
         ).first()
         if existing:
             return existing
-        msg = Message(**data)
-        self.db.add(msg)
-        self.db.commit()
-        self.db.refresh(msg)
-        self._update_chat_last_message(data["chat_id"], data.get("body", ""), data.get("timestamp"))
-        return msg
+        try:
+            with self.db.begin_nested():
+                msg = Message(**data)
+                self.db.add(msg)
+            self.db.commit()
+            self.db.refresh(msg)
+            self._update_chat_last_message(data["chat_id"], data.get("body", ""), data.get("timestamp"))
+            return msg
+        except IntegrityError:
+            existing = self.db.query(Message).filter(
+                Message.message_wid == data["message_wid"]
+            ).first()
+            if existing:
+                return existing
+            raise
 
     def _update_chat_last_message(self, chat_id: int, body: str, ts: datetime | None) -> None:
         chat = self.get_chat(chat_id)

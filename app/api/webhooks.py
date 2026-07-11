@@ -38,11 +38,15 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         if not msg_wid:
             return
 
-        chat_data = msg_data.get("chatId") or msg_data.get("from") or ""
+        from_me = bool(msg_data.get("fromMe", False))
+        chat_data = msg_data.get("chatId")
+        if not chat_data:
+            chat_data = msg_data.get("to") if from_me else msg_data.get("from")
+
         if isinstance(chat_data, dict):
             chat_wid = chat_data.get("_serialized") or chat_data.get("id", "")
         else:
-            chat_wid = str(chat_data)
+            chat_wid = str(chat_data or "")
 
         if not chat_wid:
             return
@@ -294,6 +298,17 @@ async def _process_session_status(payload: dict[str, Any]) -> None:
 
         chat_ids = [r[0] for r in db.query(Chat.id).filter(Chat.phone_id == phone.id).all()]
         if chat_ids:
+            from app.models.note import Note
+            from app.models.ticket import Ticket
+            from app.models.bulk_message_job import BulkMessageLog
+            from app.models.scheduled_message import ScheduledMessage
+            from app.models.task import Task
+
+            db.execute(delete(Note).where(Note.chat_id.in_(chat_ids)))
+            db.execute(delete(Ticket).where(Ticket.chat_id.in_(chat_ids)))
+            db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
+            db.execute(delete(ScheduledMessage).where(ScheduledMessage.chat_id.in_(chat_ids)))
+            db.execute(delete(Task).where(Task.chat_id.in_(chat_ids)))
             db.execute(delete(ChatLabel).where(ChatLabel.chat_id.in_(chat_ids)))
             db.execute(delete(Message).where(Message.phone_id == phone.id))
             db.execute(delete(Chat).where(Chat.phone_id == phone.id))
@@ -321,8 +336,11 @@ async def waha_webhook(
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     try:
+        import json
         body = await request.json()
-    except Exception:
+        logger.info("WAHA WEBHOOK BODY: %s", json.dumps(body))
+    except Exception as exc:
+        logger.exception("Failed to parse or log webhook JSON: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     event = body.get("event", "")

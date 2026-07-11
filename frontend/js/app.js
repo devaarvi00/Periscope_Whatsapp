@@ -1798,8 +1798,18 @@ async function loadTickets(status = '') {
   } catch(e) { toast('Failed to load tickets', 'error'); }
 }
 
-function showCreateTicketModal() {
+async function showCreateTicketModal() {
+  let chats = [];
+  try {
+    chats = await Api.inbox.chats({ limit: 200 }).catch(() => []);
+  } catch (_) {}
+
+  const chatOpts = chats.map(c => `<option value="${c.id}">${esc(displayName(c))}</option>`).join('');
+
   showModal('New Ticket', `
+    <div class="form-group"><label>Customer Chat *</label>
+      <select id="ntk-chat">${chatOpts || '<option value="">— No active chats —</option>'}</select>
+    </div>
     <div class="form-group"><label>Title *</label><input type="text" id="ntk-title"></div>
     <div class="form-group"><label>Description</label><textarea id="ntk-desc"></textarea></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
@@ -1812,13 +1822,27 @@ function showCreateTicketModal() {
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="ntk-save">Create</button>
     </div>`);
+
   document.getElementById('ntk-save').addEventListener('click', async () => {
+    const chatSelect = document.getElementById('ntk-chat');
+    const chat_id = chatSelect ? parseInt(chatSelect.value) : null;
+    if (!chat_id) return toast('Chat selection required', 'error');
     const title = document.getElementById('ntk-title').value.trim();
     if (!title) return toast('Title required', 'error');
     try {
-      await Api.tickets.create({ title, description: document.getElementById('ntk-desc').value, priority: document.getElementById('ntk-priority').value, due_date: document.getElementById('ntk-due').value || null });
-      closeModal(); toast('Ticket created', 'success'); loadTickets();
-    } catch(e) { toast(e.message, 'error'); }
+      await Api.tickets.create({
+        chat_id,
+        title,
+        description: document.getElementById('ntk-desc').value,
+        priority: document.getElementById('ntk-priority').value,
+        due_date: document.getElementById('ntk-due').value || null
+      });
+      closeModal();
+      toast('Ticket created', 'success');
+      loadTickets();
+    } catch(e) {
+      toast(e.message, 'error');
+    }
   });
 }
 

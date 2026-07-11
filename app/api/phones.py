@@ -100,6 +100,19 @@ async def clear_phone_data(phone_id: int, db: Session = Depends(get_db)):
     chat_ids = [r[0] for r in db.query(Chat.id).filter(Chat.phone_id == phone_id).all()]
 
     if chat_ids:
+        from app.models.note import Note
+        from app.models.ticket import Ticket
+        from app.models.bulk_message_job import BulkMessageLog
+        from app.models.scheduled_message import ScheduledMessage
+        from app.models.task import Task
+        from app.models.chat_label import ChatLabel
+        from app.models.message import Message
+
+        db.execute(delete(Note).where(Note.chat_id.in_(chat_ids)))
+        db.execute(delete(Ticket).where(Ticket.chat_id.in_(chat_ids)))
+        db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
+        db.execute(delete(ScheduledMessage).where(ScheduledMessage.chat_id.in_(chat_ids)))
+        db.execute(delete(Task).where(Task.chat_id.in_(chat_ids)))
         db.execute(delete(ChatLabel).where(ChatLabel.chat_id.in_(chat_ids)))
         db.execute(delete(Message).where(Message.phone_id == phone_id))
         db.execute(delete(Chat).where(Chat.phone_id == phone_id))
