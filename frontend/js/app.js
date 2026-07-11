@@ -184,7 +184,7 @@ const VIEW_LABELS = {
   analytics: 'Analytics', 'ai-agent': 'AI',
   automation: 'Automation Rules', 'knowledge-base': 'Media',
   bulk: 'Bulk Messages', settings: 'Settings',
-  communities: 'Communities', logs: 'Logs',
+  communities: 'Groups', logs: 'Logs', scheduled: 'Scheduled Messages',
 };
 
 function navigateTo(view) {
@@ -211,6 +211,7 @@ function navigateTo(view) {
     settings:         renderSettings,
     communities:      renderCommunities,
     logs:             renderLogs,
+    scheduled:        renderScheduled,
   }[view] || (() => { main.innerHTML = `<div class="loading-center">View not found</div>`; }))();
 }
 
@@ -799,6 +800,9 @@ function renderThread(chat) {
     <div class="reply-area">
       <div class="reply-toolbar" id="reply-toolbar">
         <button class="btn btn-ghost btn-sm" id="btn-qr">/ Quick Reply</button>
+        <button class="btn btn-ghost btn-sm" id="btn-polish" title="AI polish: fix grammar and tone">✨ Polish</button>
+        <button class="btn btn-ghost btn-sm" id="btn-attach" title="Send image or file by URL">📎 Media</button>
+        <button class="btn btn-ghost btn-sm" id="btn-schedule" title="Schedule this message">🕐 Schedule</button>
         <select id="phone-select" class="btn btn-secondary btn-sm" style="border:1px solid var(--border);padding:3px 6px">
           ${State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('')}
         </select>
@@ -835,6 +839,54 @@ function renderThread(chat) {
       document.getElementById('reply-text').value = res.suggestion || res.reply || JSON.stringify(res);
       toast('Reply suggestion ready', 'success');
     } catch(e) { toast(e.message, 'error'); }
+  });
+
+  // Polish draft reply
+  document.getElementById('btn-polish').addEventListener('click', async () => {
+    const ta = document.getElementById('reply-text');
+    const draft = ta.value.trim();
+    if (!draft) return toast('Type a draft first', 'error');
+    const btn = document.getElementById('btn-polish');
+    btn.disabled = true; btn.textContent = '✨ Polishing…';
+    try {
+      const res = await Api.ai.polish(draft);
+      ta.value = res.polished || draft;
+      toast('Reply polished', 'success');
+    } catch(e) { toast(e.message, 'error'); }
+    btn.disabled = false; btn.textContent = '✨ Polish';
+  });
+
+  // Send media by URL
+  document.getElementById('btn-attach').addEventListener('click', () => {
+    showModal('Send Media', `
+      <div class="form-group"><label>Type</label><select id="md-type">
+        <option value="image">Image</option><option value="file">File / PDF</option>
+      </select></div>
+      <div class="form-group"><label>Media URL *</label><input type="text" id="md-url" placeholder="https://example.com/photo.jpg"></div>
+      <div class="form-group"><label>Caption</label><input type="text" id="md-caption"></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="md-send">Send</button>
+      </div>`);
+    document.getElementById('md-send').addEventListener('click', async () => {
+      const url = document.getElementById('md-url').value.trim();
+      if (!url) return toast('Media URL required', 'error');
+      try {
+        await Api.inbox.send({
+          chat_id: chat.id,
+          body: document.getElementById('md-caption').value.trim(),
+          phone_id: parseInt(document.getElementById('phone-select').value) || null,
+          message_type: document.getElementById('md-type').value,
+          media_url: url,
+        });
+        closeModal(); toast('Media sent', 'success'); loadMessages(chat.id);
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  });
+
+  // Schedule current draft
+  document.getElementById('btn-schedule').addEventListener('click', () => {
+    showScheduleModal(chat.id, document.getElementById('reply-text').value.trim());
   });
 
   // Summarize
@@ -1625,12 +1677,20 @@ async function renderBulk() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
         <h2>Bulk Messaging</h2>
-        <div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-bulk-btn">+ New Campaign</button></div>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.6rem;align-items:center">
+          <span class="credits-chip" id="bulk-credits">credits: …</span>
+          <button class="btn btn-primary btn-sm" id="new-bulk-btn">+ New Campaign</button>
+        </div>
       </div>
       <div class="scroll-area" id="bulk-list"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>`;
   await loadBulkJobs();
   document.getElementById('new-bulk-btn').addEventListener('click', () => showBulkModal());
+  try {
+    const c = await Api.bulk.credits();
+    const chip = document.getElementById('bulk-credits');
+    if (chip) chip.textContent = `${c.remaining.toLocaleString()} / ${c.monthly_limit.toLocaleString()} credits left`;
+  } catch(_) {}
 }
 
 async function loadBulkJobs() {
@@ -1667,25 +1727,54 @@ function showBulkModal() {
   showModal('New Bulk Campaign', `
     <div class="form-group"><label>Campaign Name *</label><input type="text" id="bk-name"></div>
     <div class="form-group"><label>Phone</label><select id="bk-phone">${phoneOpts}</select></div>
-    <div class="form-group"><label>Message *</label><textarea id="bk-msg" style="min-height:80px" placeholder="Your broadcast message..."></textarea></div>
+    <div class="form-group"><label>Type</label><select id="bk-type">
+      <option value="text">Text</option>
+      <option value="image">Image + caption</option>
+      <option value="file">File / PDF + caption</option>
+      <option value="poll">Poll</option>
+    </select></div>
+    <div class="form-group" id="bk-media-wrap" style="display:none">
+      <label>Media URL *</label><input type="text" id="bk-media" placeholder="https://example.com/image.png">
+    </div>
+    <div class="form-group" id="bk-poll-wrap" style="display:none">
+      <label>Poll Options (comma separated) *</label><input type="text" id="bk-poll" placeholder="Yes, No, Maybe">
+    </div>
+    <div class="form-group"><label id="bk-msg-label">Message *</label>
+      <textarea id="bk-msg" style="min-height:80px" placeholder="Hi {{name}}, ..."></textarea>
+      <small class="text-muted">Personalize with {{name}}, {{phone}}, {{company}}</small>
+    </div>
     <div class="form-group"><label>Recipient Chat IDs (comma separated)</label><input type="text" id="bk-ids" placeholder="1,2,3..."></div>
     <div class="form-group"><label>Schedule At (leave empty for manual send)</label><input type="datetime-local" id="bk-schedule"></div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="bk-save">Create Campaign</button>
     </div>`);
+  const typeSel = document.getElementById('bk-type');
+  typeSel.addEventListener('change', () => {
+    const t = typeSel.value;
+    document.getElementById('bk-media-wrap').style.display = (t === 'image' || t === 'file') ? '' : 'none';
+    document.getElementById('bk-poll-wrap').style.display = t === 'poll' ? '' : 'none';
+    document.getElementById('bk-msg-label').textContent = t === 'poll' ? 'Poll Question *' : 'Message *';
+  });
   document.getElementById('bk-save').addEventListener('click', async () => {
     const name = document.getElementById('bk-name').value.trim();
     const msg = document.getElementById('bk-msg').value.trim();
     if (!name || !msg) return toast('Name and message required', 'error');
     const idsRaw = document.getElementById('bk-ids').value;
     const ids = idsRaw ? idsRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : [];
+    const type = typeSel.value;
+    const pollRaw = document.getElementById('bk-poll').value;
     try {
       const body = {
         name, message: msg,
         phone_id: parseInt(document.getElementById('bk-phone').value),
         recipient_chat_ids: ids,
         scheduled_at: document.getElementById('bk-schedule').value || null,
+        message_type: type,
+        media_url: document.getElementById('bk-media').value.trim() || null,
+        poll_options: type === 'poll'
+          ? pollRaw.split(',').map(s => s.trim()).filter(Boolean)
+          : null,
       };
       await Api.bulk.create(body);
       closeModal(); toast('Campaign created', 'success'); loadBulkJobs();
@@ -1704,6 +1793,8 @@ async function renderSettings() {
         <div class="tab" data-tab="labels">Labels</div>
         <div class="tab" data-tab="quickreplies">Quick Replies</div>
         <div class="tab" data-tab="agents">Agents</div>
+        <div class="tab" data-tab="developer">Developer API</div>
+        <div class="tab" data-tab="exports">Data Exports</div>
       </div>
       <div class="scroll-area" id="settings-content"></div>
     </div>`;
@@ -1876,7 +1967,39 @@ async function loadSettingsTab(tab) {
               <div style="font-size:11px;color:var(--text-3)">${esc(a.email)} · ${a.role}</div>
             </div>
             <span class="pill ${a.is_active ? 'pill-resolved' : 'pill-closed'}">${a.is_active ? 'Active' : 'Inactive'}</span>
+            <button class="btn btn-secondary btn-sm agent-numbers" data-aid="${a.id}" data-name="${esc(a.name)}">Numbers</button>
           </div>`).join('')}`;
+
+      el.querySelectorAll('.agent-numbers').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          try {
+            const [perm, phones] = await Promise.all([
+              Api.auth.agentPhones(btn.dataset.aid), Api.phones.list(),
+            ]);
+            const allowed = new Set(perm.phone_ids);
+            showModal(`Number Access — ${btn.dataset.name}`, `
+              <p class="text-muted" style="font-size:12.5px;margin-bottom:.75rem">
+                Select which WhatsApp numbers this agent can access. No selection = access to all numbers.
+              </p>
+              ${phones.map(p => `
+                <label style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;font-size:13px">
+                  <input type="checkbox" class="perm-phone" value="${p.id}" ${allowed.has(p.id) ? 'checked' : ''}>
+                  ${esc(p.name || p.phone_number)} (${esc(p.phone_number)})
+                </label>`).join('') || '<p class="text-muted">No phones connected</p>'}
+              <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" id="perm-save">Save</button>
+              </div>`);
+            document.getElementById('perm-save').addEventListener('click', async () => {
+              const ids = [...document.querySelectorAll('.perm-phone:checked')].map(c => parseInt(c.value));
+              try {
+                await Api.auth.setAgentPhones(btn.dataset.aid, ids);
+                closeModal(); toast('Number permissions saved', 'success');
+              } catch(e) { toast(e.message, 'error'); }
+            });
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
 
       document.getElementById('invite-agent-btn').addEventListener('click', () => {
         showModal('Invite Team Member', `
@@ -1902,6 +2025,144 @@ async function loadSettingsTab(tab) {
         });
       });
     } catch(_) {}
+  }
+
+  else if (tab === 'developer') {
+    try {
+      const [keys, hooks, events] = await Promise.all([
+        Api.developer.apiKeys(), Api.developer.webhooks(), Api.developer.webhookEvents(),
+      ]);
+      el.innerHTML = `
+        <div class="content-card" style="margin-bottom:1rem">
+          <div class="card-header">API Keys
+            <div class="header-actions"><button class="btn btn-primary btn-sm" id="new-key-btn">+ New Key</button></div>
+          </div>
+          <div class="card-body">
+            <p class="text-muted" style="font-size:12.5px;margin-bottom:.6rem">
+              Use keys with the public API: <code>X-API-Key</code> header on <code>/api/v1/public/v1/*</code>
+              (send messages, list chats &amp; numbers, create tickets).
+            </p>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>Name</th><th>Key</th><th>Status</th><th>Last Used</th><th></th></tr></thead>
+              <tbody>${keys.map(k => `<tr>
+                <td style="font-weight:600">${esc(k.name)}</td>
+                <td style="font-family:monospace;font-size:12px">${esc(k.key_prefix)}…</td>
+                <td><span class="pill ${k.is_active ? 'pill-resolved' : 'pill-closed'}">${k.is_active ? 'Active' : 'Revoked'}</span></td>
+                <td style="font-size:12px;color:var(--text-3)">${k.last_used_at ? timeAgo(k.last_used_at) : 'Never'}</td>
+                <td>${k.is_active ? `<button class="btn btn-danger btn-sm key-revoke" data-kid="${k.id}">Revoke</button>` : ''}</td>
+              </tr>`).join('') || '<tr><td colspan="5" class="text-muted">No API keys yet</td></tr>'}</tbody>
+            </table></div>
+          </div>
+        </div>
+        <div class="content-card">
+          <div class="card-header">Outbound Webhooks
+            <div class="header-actions"><button class="btn btn-primary btn-sm" id="new-hook-btn">+ Add Webhook</button></div>
+          </div>
+          <div class="card-body">
+            <p class="text-muted" style="font-size:12.5px;margin-bottom:.6rem">
+              We POST platform events (signed with HMAC-SHA256 when a secret is set) to your endpoints.
+            </p>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>URL</th><th>Events</th><th>Failures</th><th></th></tr></thead>
+              <tbody>${hooks.map(h => `<tr>
+                <td style="font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(h.url)}</td>
+                <td style="font-size:11.5px">${(h.events && h.events.length) ? h.events.map(esc).join(', ') : 'All events'}</td>
+                <td>${h.failure_count || 0}</td>
+                <td style="white-space:nowrap">
+                  <button class="btn btn-secondary btn-sm hook-test" data-hid="${h.id}">Test</button>
+                  <button class="btn btn-danger btn-sm hook-del" data-hid="${h.id}">Delete</button>
+                </td>
+              </tr>`).join('') || '<tr><td colspan="4" class="text-muted">No webhooks configured</td></tr>'}</tbody>
+            </table></div>
+          </div>
+        </div>`;
+
+      document.getElementById('new-key-btn').addEventListener('click', () => {
+        showModal('New API Key', `
+          <div class="form-group"><label>Key Name *</label><input type="text" id="key-name" placeholder="e.g. Zapier integration"></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="key-save">Create</button>
+          </div>`);
+        document.getElementById('key-save').addEventListener('click', async () => {
+          const name = document.getElementById('key-name').value.trim();
+          if (!name) return toast('Name required', 'error');
+          try {
+            const res = await Api.developer.createApiKey({ name });
+            showModal('API Key Created', `
+              <p style="font-size:13px;margin-bottom:.6rem">Copy this key now — it will <strong>not</strong> be shown again:</p>
+              <div class="api-key-box">${esc(res.api_key)}</div>
+              <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal();loadSettingsTab('developer')">Done</button></div>`);
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.key-revoke').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Revoke this API key?')) return;
+        try { await Api.developer.revokeApiKey(btn.dataset.kid); toast('Key revoked', 'success'); loadSettingsTab('developer'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+
+      document.getElementById('new-hook-btn').addEventListener('click', () => {
+        showModal('Add Outbound Webhook', `
+          <div class="form-group"><label>Endpoint URL *</label><input type="text" id="wh-url" placeholder="https://your-server.com/webhook"></div>
+          <div class="form-group"><label>Signing Secret (optional)</label><input type="text" id="wh-secret"></div>
+          <div class="form-group"><label>Events (default: all)</label>
+            ${events.map(ev => `<label style="display:flex;gap:.5rem;font-size:12.5px;padding:.2rem 0">
+              <input type="checkbox" class="wh-event" value="${ev}"> ${ev}</label>`).join('')}
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="wh-save">Add</button>
+          </div>`);
+        document.getElementById('wh-save').addEventListener('click', async () => {
+          const url = document.getElementById('wh-url').value.trim();
+          if (!url) return toast('URL required', 'error');
+          const evs = [...document.querySelectorAll('.wh-event:checked')].map(c => c.value);
+          try {
+            await Api.developer.createWebhook({
+              url, secret: document.getElementById('wh-secret').value.trim(),
+              events: evs.length ? evs : null,
+            });
+            closeModal(); toast('Webhook added', 'success'); loadSettingsTab('developer');
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.hook-test').forEach(btn => btn.addEventListener('click', async () => {
+        try { await Api.developer.testWebhook(btn.dataset.hid); toast('Test event queued', 'success'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      el.querySelectorAll('.hook-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete webhook?')) return;
+        try { await Api.developer.delWebhook(btn.dataset.hid); toast('Deleted', 'success'); loadSettingsTab('developer'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+    } catch(e) {
+      el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)} (admin only)</div>`;
+    }
+  }
+
+  else if (tab === 'exports') {
+    el.innerHTML = `
+      <div class="settings-grid">
+        ${[
+          ['Chats', 'chats', 'All chats with status, labels and assignment'],
+          ['Messages (30d)', 'messages', 'Message history for the last 30 days'],
+          ['Tickets', 'tickets', 'Tickets with status, priority and SLA info'],
+          ['Contacts', 'contacts', 'Contact book (masked numbers stay masked)'],
+          ['Audit Logs (30d)', 'logs', 'Full audit trail — admin only'],
+        ].map(([label, key, desc]) => `
+          <div class="content-card">
+            <div class="card-header">${label}</div>
+            <div class="card-body">
+              <p class="text-muted" style="font-size:12.5px;margin-bottom:.7rem">${desc}</p>
+              <button class="btn btn-secondary btn-sm export-btn" data-key="${key}">Download CSV</button>
+            </div>
+          </div>`).join('')}
+      </div>`;
+    el.querySelectorAll('.export-btn').forEach(btn => btn.addEventListener('click', async () => {
+      try { await Api.exports[btn.dataset.key](); toast('Export downloaded', 'success'); }
+      catch(e) { toast(e.message, 'error'); }
+    }));
   }
 }
 
@@ -2181,22 +2442,165 @@ async function renderCommunities() {
   main.innerHTML = `
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
-        <h2>Communities</h2>
-        <div class="header-actions" style="margin-left:auto">
-          <button class="btn btn-primary btn-sm" onclick="switchView('contacts')">Manage Contacts</button>
+        <h2>Groups</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
+          <input type="text" id="grp-search" class="search-input" placeholder="Search groups..." style="max-width:220px">
+          <button class="btn btn-secondary btn-sm" id="grp-refresh">Refresh</button>
         </div>
       </div>
-      <div class="scroll-area">
-        <div class="empty-state" style="padding:4rem 2rem">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:52px;height:52px;opacity:.15"><path d="M3 21l9-18 9 18"/><path d="M6 15h12"/></svg>
-          <p style="font-size:14px;color:var(--text-3);max-width:320px;text-align:center;line-height:1.6">
-            Communities let you organize contacts and broadcast messages to specific groups.
-            Connect your WhatsApp to get started.
-          </p>
-          <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect a Phone</button>
-        </div>
-      </div>
+      <div class="scroll-area" id="groups-list"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>`;
+  document.getElementById('grp-refresh').addEventListener('click', () => loadGroups());
+  let t; document.getElementById('grp-search').addEventListener('input', e => {
+    clearTimeout(t); t = setTimeout(() => loadGroups(e.target.value.trim()), 300);
+  });
+  await loadGroups();
+}
+
+async function loadGroups(search) {
+  const el = document.getElementById('groups-list');
+  if (!el) return;
+  try {
+    const groups = await Api.groups.list(search ? { search } : undefined);
+    if (!groups.length) {
+      el.innerHTML = `<div class="empty-state" style="padding:4rem 2rem">
+        <p style="font-size:14px;color:var(--text-3);max-width:340px;text-align:center;line-height:1.6">
+          No WhatsApp groups synced yet. Connect a phone and sync chats — group chats will appear here automatically.
+        </p>
+        <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect a Phone</button>
+      </div>`;
+      return;
+    }
+    el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
+      <thead><tr><th>Group</th><th>Messages (7d)</th><th>Unread</th><th>Last Activity</th><th></th></tr></thead>
+      <tbody>${groups.map(g => `<tr>
+        <td style="font-weight:600">${esc(g.name)}${g.is_flagged ? ' 🚩' : ''}</td>
+        <td>${g.messages_7d}</td>
+        <td>${g.unread_count || 0}</td>
+        <td style="font-size:12px;color:var(--text-3)">${g.last_message_at ? timeAgo(g.last_message_at) : '—'}</td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-secondary btn-sm grp-members" data-gid="${g.id}">Members</button>
+          <button class="btn btn-secondary btn-sm grp-stats" data-gid="${g.id}" data-name="${esc(g.name)}">Analytics</button>
+        </td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+    el.querySelectorAll('.grp-members').forEach(btn => btn.addEventListener('click', () => showGroupMembers(btn.dataset.gid)));
+    el.querySelectorAll('.grp-stats').forEach(btn => btn.addEventListener('click', () => showGroupAnalytics(btn.dataset.gid, btn.dataset.name)));
+  } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+}
+
+async function showGroupMembers(gid) {
+  showModal('Group Members', '<div class="loading-center"><div class="spinner"></div></div>');
+  try {
+    const res = await Api.groups.participants(gid);
+    const body = document.querySelector('#modal .modal-body') || document.querySelector('#modal-body');
+    const html = `
+      <p style="font-size:13px;color:var(--text-2);margin-bottom:.75rem"><strong>${esc(res.group)}</strong> — ${res.count} members</p>
+      <div class="table-wrap" style="max-height:320px;overflow-y:auto"><table class="data-table">
+        <thead><tr><th>Number</th><th>Role</th></tr></thead>
+        <tbody>${res.participants.map(p => `<tr>
+          <td>+${esc(p.number)}</td>
+          <td>${p.is_admin ? '<span class="pill pill-resolved">Admin</span>' : 'Member'}</td>
+        </tr>`).join('') || '<tr><td colspan="2" class="text-muted">Participant list unavailable (session offline?)</td></tr>'}</tbody>
+      </table></div>`;
+    if (body) body.innerHTML = html; else showModal('Group Members', html);
+  } catch(e) { toast(e.message, 'error'); closeModal(); }
+}
+
+async function showGroupAnalytics(gid, name) {
+  showModal(`Analytics — ${name}`, '<div class="loading-center"><div class="spinner"></div></div>');
+  try {
+    const a = await Api.groups.analytics(gid, 30);
+    const maxDay = Math.max(1, ...a.daily_volume.map(d => d.count));
+    const html = `
+      <div style="display:flex;gap:1rem;margin-bottom:1rem">
+        <div class="stat-mini"><div class="stat-mini-num">${a.total_messages}</div><div class="stat-mini-label">Messages (30d)</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${a.incoming}</div><div class="stat-mini-label">Incoming</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${a.outgoing}</div><div class="stat-mini-label">Outgoing</div></div>
+      </div>
+      <div style="display:flex;align-items:flex-end;gap:2px;height:60px;margin-bottom:1rem">
+        ${a.daily_volume.map(d => `<div title="${d.date}: ${d.count}" style="flex:1;background:var(--accent);opacity:.75;border-radius:2px 2px 0 0;height:${Math.max(4, Math.round(d.count / maxDay * 60))}px"></div>`).join('') || '<span class="text-muted">No activity</span>'}
+      </div>
+      <p style="font-size:12px;font-weight:600;margin-bottom:.35rem">Top senders</p>
+      <div class="table-wrap" style="max-height:200px;overflow-y:auto"><table class="data-table">
+        <tbody>${a.top_senders.map(s => `<tr><td>${esc(s.name)}</td><td style="text-align:right">${s.messages}</td></tr>`).join('') || '<tr><td class="text-muted">No senders yet</td></tr>'}</tbody>
+      </table></div>`;
+    const body = document.querySelector('#modal .modal-body') || document.querySelector('#modal-body');
+    if (body) body.innerHTML = html; else showModal(`Analytics — ${name}`, html);
+  } catch(e) { toast(e.message, 'error'); closeModal(); }
+}
+
+// ── SCHEDULED MESSAGES VIEW ─────────────────────────────────────── //
+async function renderScheduled() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Scheduled Messages</h2>
+        <div class="header-actions" style="margin-left:auto">
+          <button class="btn btn-primary btn-sm" id="new-sched-btn">+ Schedule Message</button>
+        </div>
+      </div>
+      <div class="scroll-area" id="sched-list"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>`;
+  document.getElementById('new-sched-btn').addEventListener('click', () => showScheduleModal());
+  await loadScheduled();
+}
+
+async function loadScheduled() {
+  const el = document.getElementById('sched-list');
+  if (!el) return;
+  try {
+    const items = await Api.scheduled.list();
+    if (!items.length) { el.innerHTML = `<div class="loading-center text-muted">Nothing scheduled yet</div>`; return; }
+    el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
+      <thead><tr><th>Chat</th><th>Message</th><th>Send At</th><th>Repeat</th><th>Status</th><th>Sent</th><th></th></tr></thead>
+      <tbody>${items.map(m => `<tr>
+        <td style="font-weight:600">${esc(m.chat_name || ('#' + m.chat_id))}</td>
+        <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
+        <td style="font-size:12px">${new Date(m.send_at).toLocaleString()}</td>
+        <td>${m.repeat === 'none' ? 'Once' : esc(m.repeat)}</td>
+        <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${m.status}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
+        <td>${m.sent_count}</td>
+        <td>${m.status === 'pending' ? `<button class="btn btn-danger btn-sm sched-cancel" data-sid="${m.id}">Cancel</button>` : ''}</td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+    el.querySelectorAll('.sched-cancel').forEach(btn => btn.addEventListener('click', async () => {
+      try { await Api.scheduled.cancel(btn.dataset.sid); toast('Cancelled', 'success'); loadScheduled(); }
+      catch(e) { toast(e.message, 'error'); }
+    }));
+  } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+}
+
+async function showScheduleModal(prefillChatId, prefillBody) {
+  let chats = [];
+  try { chats = await Api.inbox.chats({ limit: 200 }); } catch(_) {}
+  const opts = chats.map(c => `<option value="${c.id}" ${prefillChatId == c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
+  showModal('Schedule Message', `
+    <div class="form-group"><label>Chat *</label><select id="sc-chat">${opts}</select></div>
+    <div class="form-group"><label>Message *</label><textarea id="sc-body" style="min-height:70px">${esc(prefillBody || '')}</textarea></div>
+    <div class="form-group"><label>Send At *</label><input type="datetime-local" id="sc-at"></div>
+    <div class="form-group"><label>Repeat</label><select id="sc-repeat">
+      <option value="none">Once</option><option value="daily">Daily</option><option value="weekly">Weekly</option>
+    </select></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="sc-save">Schedule</button>
+    </div>`);
+  document.getElementById('sc-save').addEventListener('click', async () => {
+    const body = document.getElementById('sc-body').value.trim();
+    const at = document.getElementById('sc-at').value;
+    if (!body || !at) return toast('Message and time required', 'error');
+    try {
+      await Api.scheduled.create({
+        chat_id: parseInt(document.getElementById('sc-chat').value),
+        body, send_at: at,
+        repeat: document.getElementById('sc-repeat').value,
+      });
+      closeModal(); toast('Message scheduled', 'success');
+      if (State.currentView === 'scheduled') loadScheduled();
+    } catch(e) { toast(e.message, 'error'); }
+  });
 }
 
 // ── LOGS VIEW ───────────────────────────────────────────────────── //
@@ -2205,29 +2609,59 @@ async function renderLogs() {
   main.innerHTML = `
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
-        <h2>Logs</h2>
-        <div class="header-actions" style="margin-left:auto">
-          <button class="btn btn-secondary btn-sm" onclick="switchView('analytics')">View Analytics</button>
+        <h2>Audit Logs</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
+          <select id="log-action-filter" style="max-width:220px"><option value="">All events</option></select>
+          <button class="btn btn-secondary btn-sm" id="log-export">Export CSV</button>
         </div>
       </div>
       <div class="scroll-area">
         <div class="content-card">
-          <div class="card-header">Activity Log</div>
           <div class="table-wrap">
             <table class="data-table">
               <thead>
                 <tr><th>Time</th><th>Event</th><th>Agent</th><th>Details</th></tr>
               </thead>
               <tbody id="logs-tbody">
-                <tr><td colspan="4" style="text-align:center;padding:3rem;color:var(--text-3)">
-                  No activity logs available yet. Logs will appear here as your team uses the platform.
-                </td></tr>
+                <tr><td colspan="4" style="text-align:center;padding:3rem"><div class="spinner"></div></td></tr>
               </tbody>
             </table>
           </div>
         </div>
       </div>
     </div>`;
+  document.getElementById('log-export').addEventListener('click', async () => {
+    try { await Api.exports.logs(30); toast('Export downloaded', 'success'); }
+    catch(e) { toast(e.message, 'error'); }
+  });
+  try {
+    const actions = await Api.logs.actions();
+    const sel = document.getElementById('log-action-filter');
+    actions.forEach(a => { const o = document.createElement('option'); o.value = a; o.textContent = a; sel.appendChild(o); });
+    sel.addEventListener('change', () => loadLogsTable(sel.value));
+  } catch(_) {}
+  await loadLogsTable('');
+}
+
+async function loadLogsTable(action) {
+  const tbody = document.getElementById('logs-tbody');
+  if (!tbody) return;
+  try {
+    const logs = await Api.logs.list(action ? { action } : undefined);
+    if (!logs.length) {
+      tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;padding:3rem;color:var(--text-3)">
+        No activity logs yet. Logs will appear here as your team uses the platform.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = logs.map(l => `<tr>
+      <td style="font-size:12px;color:var(--text-3);white-space:nowrap">${new Date(l.created_at).toLocaleString()}</td>
+      <td><span class="pill pill-open" style="font-family:monospace;font-size:11px">${esc(l.action)}</span></td>
+      <td>${esc(l.agent_name || 'System')}</td>
+      <td style="font-size:12.5px">${esc(l.description || '')}</td>
+    </tr>`).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-muted" style="text-align:center;padding:2rem">${esc(e.message)}</td></tr>`;
+  }
 }
 
 // Alias so dashboard card buttons can call switchView(...)

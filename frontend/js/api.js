@@ -51,6 +51,8 @@ const Api = (() => {
     me:       ()                => get('/auth/me'),
     agents:   ()                => get('/auth/agents'),
     register: (data)            => post('/auth/register', data),
+    agentPhones:    (id)        => get(`/auth/agents/${id}/phones`),
+    setAgentPhones: (id, ids)   => req('PUT', `/auth/agents/${id}/phones`, ids),
   };
 
   // Inbox
@@ -74,6 +76,9 @@ const Api = (() => {
     create: (b)     => post('/tickets', b),
     update: (id, b) => patch(`/tickets/${id}`, b),
     del:    (id)    => del(`/tickets/${id}`),
+    labels:      (id)      => get(`/tickets/${id}/labels`),
+    addLabel:    (id, lid) => post(`/tickets/${id}/labels/${lid}`),
+    removeLabel: (id, lid) => del(`/tickets/${id}/labels/${lid}`),
   };
 
   // Contacts
@@ -131,6 +136,7 @@ const Api = (() => {
   // Automation
   const automation = {
     triggers: ()      => get('/automation/trigger-types'),
+    actions:  ()      => get('/automation/action-types'),
     list:     ()      => get('/automation/rules'),
     create:   (b)     => post('/automation/rules', b),
     update:   (id, b) => patch(`/automation/rules/${id}`, b),
@@ -148,9 +154,10 @@ const Api = (() => {
 
   // Bulk
   const bulk = {
-    list:   ()      => get('/bulk/jobs'),
-    create: (b)     => post('/bulk/jobs', b),
-    send:   (id)    => post(`/bulk/jobs/${id}/send`),
+    list:    ()      => get('/bulk/jobs'),
+    create:  (b)     => post('/bulk/jobs', b),
+    send:    (id)    => post(`/bulk/jobs/${id}/send`),
+    credits: ()      => get('/bulk/credits'),
   };
 
   // AI
@@ -161,6 +168,58 @@ const Api = (() => {
     summarize:     (chatId) => post(`/ai/chat/${chatId}/summarize`),
     suggestReply:  (chatId) => post(`/ai/chat/${chatId}/suggest-reply`),
     translate:     (text, lang) => post('/ai/translate', { text, target_language: lang }),
+    polish:        (text, tone) => post('/ai/polish', { text, tone: tone || 'professional' }),
+  };
+
+  // Activity logs
+  const logs = {
+    list:    (q) => get('/logs', q),
+    actions: ()  => get('/logs/actions'),
+  };
+
+  // Groups
+  const groups = {
+    list:         (q)  => get('/groups', q),
+    participants: (id) => get(`/groups/${id}/participants`),
+    analytics:    (id, days) => get(`/groups/${id}/analytics`, { days: days || 30 }),
+  };
+
+  // Scheduled messages
+  const scheduled = {
+    list:   (q)  => get('/scheduled', q),
+    create: (b)  => post('/scheduled', b),
+    cancel: (id) => del(`/scheduled/${id}`),
+  };
+
+  // Developer platform
+  const developer = {
+    apiKeys:       ()   => get('/developer/api-keys'),
+    createApiKey:  (b)  => post('/developer/api-keys', b),
+    revokeApiKey:  (id) => del(`/developer/api-keys/${id}`),
+    webhooks:      ()   => get('/developer/webhooks'),
+    webhookEvents: ()   => get('/developer/webhook-events'),
+    createWebhook: (b)  => post('/developer/webhooks', b),
+    testWebhook:   (id) => post(`/developer/webhooks/${id}/test`),
+    delWebhook:    (id) => del(`/developer/webhooks/${id}`),
+  };
+
+  // Exports: authenticated file downloads
+  async function download(path, filename) {
+    const r = await fetch(BASE + path, { headers: headers() });
+    if (!r.ok) throw new Error('Export failed');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }
+  const exportsApi = {
+    chats:    ()     => download('/exports/chats.csv', 'chats.csv'),
+    messages: (days) => download(`/exports/messages.csv?days=${days || 30}`, 'messages.csv'),
+    tickets:  ()     => download('/exports/tickets.csv', 'tickets.csv'),
+    contacts: ()     => download('/exports/contacts.csv', 'contacts.csv'),
+    logs:     (days) => download(`/exports/logs.csv?days=${days || 30}`, 'audit_logs.csv'),
   };
 
   // Search
@@ -170,5 +229,6 @@ const Api = (() => {
     setToken, clearToken, getToken,
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
     phones, analytics, automation, kb, bulk, ai, search,
+    logs, groups, scheduled, developer, exports: exportsApi,
   };
 })();
