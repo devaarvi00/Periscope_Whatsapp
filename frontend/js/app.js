@@ -42,6 +42,18 @@ function initials(name) {
   return name.split(' ').slice(0, 2).map(w => w[0]).join('').toUpperCase();
 }
 
+// Human-friendly chat name: hide raw WhatsApp IDs like 1203...@g.us / 987...@lid
+function displayName(nameOrChat) {
+  const raw = typeof nameOrChat === 'object'
+    ? (nameOrChat.name || nameOrChat.chat_wid || '')
+    : (nameOrChat || '');
+  if (!raw.includes('@')) return raw;
+  const [id, domain] = raw.split('@');
+  if (domain === 'g.us') return `Group ${id.slice(-6)}`;
+  if (/^\d{6,}$/.test(id)) return `+${id}`;
+  return id;
+}
+
 function avatarColor(name) {
   const colors = ['#0D8C7C','#2563EB','#7C3AED','#DB2777','#D97706','#059669'];
   let h = 0;
@@ -127,16 +139,6 @@ function renderAgent() {
   const tn = document.getElementById('topbar-name');
   if (ta) { ta.textContent = initials(a.name); ta.style.background = avatarColor(a.name); }
   if (tn) tn.textContent = a.name.split(' ')[0];
-}
-
-// ── Sidebar collapse ─────────────────────────────────────────────
-document.getElementById('sidebar-collapse')?.addEventListener('click', () => {
-  const sb = document.getElementById('sidebar');
-  sb.classList.toggle('collapsed');
-  localStorage.setItem('sidebar_collapsed', sb.classList.contains('collapsed') ? '1' : '');
-});
-if (localStorage.getItem('sidebar_collapsed')) {
-  document.getElementById('sidebar')?.classList.add('collapsed');
 }
 
 // ── Topbar: refresh current view ─────────────────────────────────
@@ -573,7 +575,7 @@ function renderChatList(chats) {
   }
   el.innerHTML = chats.map(c => {
     const active = c.id == State.inbox.selectedChatId ? ' active' : '';
-    const color = avatarColor(c.name || c.chat_wid);
+    const color = avatarColor(displayName(c));
     const isGroup = c.is_group;
     const unread = c.unread_count || 0;
 
@@ -606,10 +608,10 @@ function renderChatList(chats) {
     }
 
     return `<div class="chat-item${active}" data-cid="${c.id}">
-      <div class="chat-avatar${isGroup?' group':''}" style="background:${color}">${initials(c.name||c.chat_wid)}</div>
+      <div class="chat-avatar${isGroup?' group':''}" style="background:${color}">${initials(displayName(c))}</div>
       <div class="chat-meta">
         <div class="chat-meta-top">
-          <span class="chat-name">${esc(c.name||c.chat_wid)}</span>
+          <span class="chat-name">${esc(displayName(c))}</span>
           <span class="chat-time">${timeAgo(c.last_message_at)}</span>
         </div>
         <div class="chat-meta-bottom">
@@ -694,8 +696,8 @@ async function renderContactDetail(chat) {
 
   body.innerHTML = `
     <div class="detail-contact-top">
-      <div class="detail-avatar" style="background:${color}">${initials(chat.name||chat.chat_wid)}</div>
-      <div class="detail-contact-name">${esc(chat.name||chat.chat_wid)}</div>
+      <div class="detail-avatar" style="background:${color}">${initials(displayName(chat))}</div>
+      <div class="detail-contact-name">${esc(displayName(chat))}</div>
       <div class="detail-contact-wid">${esc(chat.chat_wid||'')}</div>
     </div>
 
@@ -833,9 +835,9 @@ function renderThread(chat) {
   panel.innerHTML = `
     <div class="thread-header">
       <div class="thread-contact-info">
-        <div class="chat-avatar" style="background:${avatarColor(chat.name||chat.chat_wid)};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(chat.name||chat.chat_wid)}</div>
+        <div class="chat-avatar" style="background:${avatarColor(displayName(chat))};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(displayName(chat))}</div>
         <div class="thread-contact-text">
-          <div class="thread-name">${esc(chat.name||chat.chat_wid)}</div>
+          <div class="thread-name">${esc(displayName(chat))}</div>
           <div class="thread-meta">${chat.is_group ? '👥 Group' : esc((chat.chat_wid||'').replace('@s.whatsapp.net','').replace('@g.us',''))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
         </div>
       </div>
@@ -1582,7 +1584,7 @@ async function renderAIAgent() {
     else {
       el.innerHTML = chats.map(c => `
         <div style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;border-bottom:1px solid var(--border-light)">
-          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(c.name||c.chat_wid)}</div>
+          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(displayName(c))}</div>
           <span class="${pillClass(c.ai_state||'ACTIVE')}">${c.ai_state||'ACTIVE'}</span></div>
           <button class="btn btn-ghost btn-sm ai-takeover" data-cid="${c.id}">Takeover</button>
         </div>`).join('');
@@ -2634,13 +2636,13 @@ async function loadGroups(search) {
     el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
       <thead><tr><th>Group</th><th>Messages (7d)</th><th>Unread</th><th>Last Activity</th><th></th></tr></thead>
       <tbody>${groups.map(g => `<tr>
-        <td style="font-weight:600">${esc(g.name)}${g.is_flagged ? ' 🚩' : ''}</td>
+        <td style="font-weight:600">${esc(displayName(g))}${g.is_flagged ? ' 🚩' : ''}</td>
         <td>${g.messages_7d}</td>
         <td>${g.unread_count || 0}</td>
         <td style="font-size:12px;color:var(--text-3)">${g.last_message_at ? timeAgo(g.last_message_at) : '—'}</td>
         <td style="white-space:nowrap">
           <button class="btn btn-secondary btn-sm grp-members" data-gid="${g.id}">Members</button>
-          <button class="btn btn-secondary btn-sm grp-stats" data-gid="${g.id}" data-name="${esc(g.name)}">Analytics</button>
+          <button class="btn btn-secondary btn-sm grp-stats" data-gid="${g.id}" data-name="${esc(displayName(g))}">Analytics</button>
         </td>
       </tr>`).join('')}</tbody>
     </table></div></div>`;
@@ -2716,7 +2718,7 @@ async function loadScheduled() {
     el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
       <thead><tr><th>Chat</th><th>Message</th><th>Send At</th><th>Repeat</th><th>Status</th><th>Sent</th><th></th></tr></thead>
       <tbody>${items.map(m => `<tr>
-        <td style="font-weight:600">${esc(m.chat_name || ('#' + m.chat_id))}</td>
+        <td style="font-weight:600">${esc(displayName(m.chat_name) || ('#' + m.chat_id))}</td>
         <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
         <td style="font-size:12px">${new Date(m.send_at).toLocaleString()}</td>
         <td>${m.repeat === 'none' ? 'Once' : esc(m.repeat)}</td>
@@ -2735,7 +2737,7 @@ async function loadScheduled() {
 async function showScheduleModal(prefillChatId, prefillBody) {
   let chats = [];
   try { chats = await Api.inbox.chats({ limit: 200 }); } catch(_) {}
-  const opts = chats.map(c => `<option value="${c.id}" ${prefillChatId == c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
+  const opts = chats.map(c => `<option value="${c.id}" ${prefillChatId == c.id ? 'selected' : ''}>${esc(displayName(c))}</option>`).join('');
   showModal('Schedule Message', `
     <div class="form-group"><label>Chat *</label><select id="sc-chat">${opts}</select></div>
     <div class="form-group"><label>Message *</label><textarea id="sc-body" style="min-height:70px">${esc(prefillBody || '')}</textarea></div>

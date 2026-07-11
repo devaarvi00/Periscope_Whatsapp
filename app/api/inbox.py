@@ -318,8 +318,37 @@ async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
             cid = cid.get("_serialized") or cid.get("id", "")
         if not cid:
             continue
-        name = c.get("name") or c.get("subject") or str(cid).split("@")[0]
         is_group = str(cid).endswith("@g.us")
+        name = c.get("name") or c.get("subject") or ""
+        if not name or "@" in name:
+            if is_group:
+                try:
+                    info = await waha.get_group_info(str(cid))
+                    name = info.get("subject") or info.get("name") or ""
+                except Exception:
+                    name = ""
+                name = name or f"Group {str(cid).split('@')[0][-6:]}"
+            else:
+                name = str(cid).split("@")[0]
         svc.upsert_chat({"chat_wid": str(cid), "phone_id": phone_id, "name": name, "is_group": is_group})
         synced += 1
+
+    # Repair previously synced chats that still have WID-looking names
+    from app.models.chat import Chat as _Chat
+    stale = (
+        db.query(_Chat)
+        .filter(_Chat.phone_id == phone_id, _Chat.is_group == True, _Chat.name.like("%@g.us%"))
+        .limit(100)
+        .all()
+    )
+    for chat in stale:
+        try:
+            info = await waha.get_group_info(chat.chat_wid)
+            subject = info.get("subject") or info.get("name") or ""
+            if subject:
+                chat.name = subject
+        except Exception:
+            continue
+    if stale:
+        db.commit()
     return {"synced": synced}

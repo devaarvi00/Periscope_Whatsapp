@@ -374,27 +374,7 @@ input,textarea,select{font:inherit;}
 }
 .logout-btn:hover{background:var(--sidebar-hover);color:var(--danger);}
 .logout-btn svg{width:15px;height:15px;}
-.sidebar-collapse{
-  padding:.5rem 0 .4rem;
-  display:flex;align-items:center;gap:.5rem;
-  font-size:12px;color:var(--text-3);
-  cursor:pointer;transition:color .12s;
-}
-.sidebar-collapse:hover{color:var(--text);}
-.sidebar-collapse svg{transition:transform .18s;}
 
-/* Collapsed rail */
-.sidebar.collapsed{width:56px;}
-.sidebar.collapsed .brand-meta,
-.sidebar.collapsed .nav-item span,
-.sidebar.collapsed .badge,
-.sidebar.collapsed .agent-meta,
-.sidebar.collapsed .logout-btn,
-.sidebar.collapsed .sidebar-collapse span{display:none;}
-.sidebar.collapsed .nav-item{justify-content:center;padding:.55rem 0;margin:1px .5rem;}
-.sidebar.collapsed .sidebar-collapse{justify-content:center;}
-.sidebar.collapsed .sidebar-collapse svg{transform:rotate(180deg);}
-.sidebar.collapsed .agent-info{justify-content:center;}
 
 /* ── Main Content ──────────────────────────────────────────────── */
 .main-content{flex:1;overflow:hidden;display:flex;flex-direction:column;}
@@ -535,14 +515,26 @@ input,textarea,select{font:inherit;}
 /* ── Forms ────────────────────────────────────────────────────────── */
 .form-group{margin-bottom:1.1rem;}
 .form-group label{display:block;font-size:13px;font-weight:500;color:var(--text-2);margin-bottom:.4rem;}
-input[type=text],input[type=email],input[type=password],input[type=search],textarea,select{
+input[type=text],input[type=email],input[type=password],input[type=search],
+input[type=date],input[type=datetime-local],input[type=time],input[type=number],
+textarea,select{
   width:100%;padding:.55rem .85rem;
   border:1px solid var(--border);border-radius:var(--radius);
   background:var(--surface);color:var(--text);
   font-size:14px;outline:none;
   transition:border-color .12s,box-shadow .12s;
   height:38px;
+  font-family:inherit;
 }
+input[type=date],input[type=datetime-local],input[type=time]{
+  color:var(--text-2);cursor:pointer;
+}
+input[type=date]::-webkit-calendar-picker-indicator,
+input[type=datetime-local]::-webkit-calendar-picker-indicator{
+  cursor:pointer;opacity:.55;padding:.2rem;border-radius:4px;
+}
+input[type=date]::-webkit-calendar-picker-indicator:hover,
+input[type=datetime-local]::-webkit-calendar-picker-indicator:hover{opacity:1;}
 textarea{height:auto;}
 input:focus,textarea:focus,select:focus{
   border-color:var(--accent);

@@ -50,18 +50,33 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         inbox = InboxService(db)
         chat = inbox.get_chat_by_wid(chat_wid)
         chat_is_new = chat is None
+        notify_name = msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName") or ""
         if not chat:
             is_group = chat_wid.endswith("@g.us")
-            chat_name = (
-                (msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName"))
-                if not is_group else chat_wid
-            ) or chat_wid
+            if is_group:
+                # Resolve the real group subject from WAHA instead of storing the WID
+                chat_name = ""
+                try:
+                    from app.services.waha_service import WAHAService
+                    info = await WAHAService(session_name=session).get_group_info(chat_wid)
+                    chat_name = info.get("subject") or info.get("name") or ""
+                except Exception:
+                    pass
+                chat_name = chat_name or f"Group {chat_wid.split('@')[0][-6:]}"
+            else:
+                chat_name = notify_name or chat_wid.split("@")[0]
             chat = inbox.upsert_chat({
                 "chat_wid": chat_wid,
                 "phone_id": phone.id,
                 "name": str(chat_name),
                 "is_group": is_group,
             })
+        elif not chat.is_group and notify_name:
+            # Upgrade WID-looking names to the sender's push name once we learn it
+            current = chat.name or ""
+            if current == chat_wid or current == chat_wid.split("@")[0] or "@" in current:
+                chat.name = str(notify_name)
+                db.commit()
 
         from_me = bool(msg_data.get("fromMe", False))
         body = msg_data.get("body") or msg_data.get("caption") or ""
