@@ -187,7 +187,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
 
 
 async def _process_reaction_event(payload: dict[str, Any]) -> None:
-    """Create a ticket when a message is reacted to with a ticket emoji (Periskope-style)."""
+    """Create a ticket when a message is reacted to with a ticket emoji (Hyperscope-style)."""
     db = SessionLocal()
     try:
         session = payload.get("session", settings.waha_session_name)

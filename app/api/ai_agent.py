@@ -90,7 +90,7 @@ class PolishRequest(BaseModel):
 
 @router.post("/polish")
 async def polish_reply(req: PolishRequest):
-    """Polish a draft reply: fix grammar, keep it WhatsApp-natural (Periskope 'Polish replies')."""
+    """Polish a draft reply: fix grammar, keep it WhatsApp-natural (Hyperscope 'Polish replies')."""
     if not req.text.strip():
         raise HTTPException(400, "Text is empty")
     try:

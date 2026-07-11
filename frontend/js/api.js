@@ -1,4 +1,4 @@
-/* ── Periskope API Client ──────────────────────────────────────── */
+/* ── Hyperscope API Client ──────────────────────────────────────── */
 const BASE = '/api/v1';
 
 const Api = (() => {

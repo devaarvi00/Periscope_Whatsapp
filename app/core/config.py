@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    app_name: str = "Periskope WhatsApp CRM"
+    app_name: str = "Hyperscope WhatsApp CRM"
     app_version: str = "1.0.0"
     environment: str = "development"
     api_prefix: str = "/api/v1"

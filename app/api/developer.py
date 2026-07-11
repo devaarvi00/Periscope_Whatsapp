@@ -155,7 +155,7 @@ async def test_webhook(
     if not hook:
         raise HTTPException(404, "Webhook not found")
     background.add_task(dispatch_event, "message.received", {
-        "test": True, "chat_id": 0, "body": "Test event from Periskope CRM",
+        "test": True, "chat_id": 0, "body": "Test event from Hyperscope CRM",
     })
     return {"ok": True, "message": "Test event queued"}
 

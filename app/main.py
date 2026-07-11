@@ -230,7 +230,7 @@ async def serve_frontend():
     index = _FRONTEND / "index.html"
     if index.exists():
         return FileResponse(str(index))
-    return {"message": "Periskope WhatsApp CRM API", "docs": "/docs"}
+    return {"message": "Hyperscope WhatsApp CRM API", "docs": "/docs"}
 
 
 @app.get("/{path:path}", include_in_schema=False)

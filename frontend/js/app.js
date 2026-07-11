@@ -1,4 +1,4 @@
-/* ── Periskope SPA ─────────────────────────────────────────────── */
+/* ── Hyperscope SPA ─────────────────────────────────────────────── */
 
 // ── Global State ──────────────────────────────────────────────── //
 const State = {
@@ -120,12 +120,78 @@ function renderAgent() {
   const av = document.getElementById('agent-avatar');
   av.textContent = initials(a.name);
   av.style.background = avatarColor(a.name);
+  const be = document.getElementById('brand-agent-email');
+  if (be) be.textContent = a.email || '';
   // Topbar
   const ta = document.getElementById('topbar-avatar');
   const tn = document.getElementById('topbar-name');
   if (ta) { ta.textContent = initials(a.name); ta.style.background = avatarColor(a.name); }
   if (tn) tn.textContent = a.name.split(' ')[0];
 }
+
+// ── Sidebar collapse ─────────────────────────────────────────────
+document.getElementById('sidebar-collapse')?.addEventListener('click', () => {
+  const sb = document.getElementById('sidebar');
+  sb.classList.toggle('collapsed');
+  localStorage.setItem('sidebar_collapsed', sb.classList.contains('collapsed') ? '1' : '');
+});
+if (localStorage.getItem('sidebar_collapsed')) {
+  document.getElementById('sidebar')?.classList.add('collapsed');
+}
+
+// ── Topbar: refresh current view ─────────────────────────────────
+document.getElementById('topbar-refresh')?.addEventListener('click', () => {
+  navigateTo(State.currentView || 'dashboard');
+});
+
+// ── Topbar: global search with dropdown results ──────────────────
+(() => {
+  const input = document.getElementById('global-search');
+  if (!input) return;
+  const wrap = input.parentElement;
+  let box = null, timer = null;
+
+  function closeResults() { if (box) { box.remove(); box = null; } }
+  document.addEventListener('click', e => { if (!wrap.contains(e.target)) closeResults(); });
+
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { closeResults(); return; }
+    timer = setTimeout(async () => {
+      try {
+        const res = await Api.search(q);
+        closeResults();
+        box = document.createElement('div');
+        box.className = 'gs-results';
+        const section = (title, rows) => rows && rows.length
+          ? `<div class="gs-group">${title}</div>` + rows.join('') : '';
+        const chatRows = (res.chats || []).slice(0, 5).map(c =>
+          `<div class="gs-row" data-go="chat" data-id="${c.id}">💬 ${esc(c.name)}<span class="gs-sub">${c.is_group ? 'group' : 'chat'}</span></div>`);
+        const msgRows = (res.messages || []).slice(0, 5).map(m =>
+          `<div class="gs-row" data-go="chat" data-id="${m.chat_id}">📩 ${esc((m.body || '').slice(0, 60))}<span class="gs-sub">message</span></div>`);
+        const tkRows = (res.tickets || []).slice(0, 5).map(t =>
+          `<div class="gs-row" data-go="tickets">🎫 ${esc(t.title)}<span class="gs-sub">${esc(t.status || '')}</span></div>`);
+        const ctRows = (res.contacts || []).slice(0, 5).map(c =>
+          `<div class="gs-row" data-go="contacts">👤 ${esc(c.name || c.phone_number)}<span class="gs-sub">contact</span></div>`);
+        const html = section('Chats', chatRows) + section('Messages', msgRows)
+                   + section('Tickets', tkRows) + section('Contacts', ctRows);
+        box.innerHTML = html || '<div class="gs-row" style="color:var(--text-3)">No results</div>';
+        wrap.appendChild(box);
+        box.querySelectorAll('.gs-row[data-go]').forEach(row => {
+          row.addEventListener('click', () => {
+            const go = row.dataset.go;
+            closeResults(); input.value = '';
+            if (go === 'chat' && row.dataset.id) {
+              navigateTo('inbox');
+              setTimeout(() => { const c = State.inbox.chats?.find(x => x.id == row.dataset.id); if (c) openChat(c); }, 600);
+            } else if (go) navigateTo(go);
+          });
+        });
+      } catch(_) {}
+    }, 300);
+  });
+})();
 
 // Password show/hide toggle
 document.getElementById('toggle-password')?.addEventListener('click', () => {
@@ -364,7 +430,18 @@ async function loadLabels() {
   try { State.labels = await Api.labels.list(); } catch(_) {}
 }
 async function loadPhones() {
-  try { State.phones = await Api.phones.list(); } catch(_) {}
+  try {
+    State.phones = await Api.phones.list();
+    const badge = document.getElementById('topbar-phone-count');
+    const num = document.getElementById('topbar-phone-num');
+    const total = document.getElementById('topbar-phone-total');
+    if (badge && num) {
+      const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
+      num.textContent = working;
+      if (total) total.textContent = State.phones.length;
+      badge.style.display = State.phones.length ? 'flex' : 'none';
+    }
+  } catch(_) {}
 }
 
 // ── INBOX VIEW ─────────────────────────────────────────────────── //
@@ -543,11 +620,20 @@ function renderChatList(chats) {
             ${unread ? `<span class="unread-dot">${unread > 99 ? '99+' : unread}</span>` : ''}
           </div>
         </div>
-        ${phoneTagHtml ? `<div style="display:flex;align-items:center;gap:.25rem;margin-top:2px">${phoneTagHtml}</div>` : ''}
+        ${phoneTagHtml ? `<div style="display:flex;align-items:center;gap:.25rem;margin-top:2px">${phoneTagHtml}${!labelsHtml ? `<span class="add-label-chip" data-addlabel="${c.id}">+ Label</span>` : ''}</div>` : (!labelsHtml ? `<div style="margin-top:2px"><span class="add-label-chip" data-addlabel="${c.id}">+ Label</span></div>` : '')}
         ${labelsHtml}
       </div>
     </div>`;
   }).join('');
+
+  // "+ Label" chips: open the chat and let the detail panel handle labels
+  el.querySelectorAll('.add-label-chip').forEach(chip => {
+    chip.addEventListener('click', e => {
+      e.stopPropagation();
+      const chat = State.inbox.chats?.find(x => x.id == chip.dataset.addlabel);
+      if (chat) openChat(chat);
+    });
+  });
 
   el.querySelectorAll('.chat-item').forEach(el => {
     el.addEventListener('click', () => openChat(+el.dataset.cid));
@@ -797,7 +883,11 @@ function renderThread(chat) {
     <div class="messages-area" id="messages-area">
       <div class="loading-center"><div class="spinner"></div></div>
     </div>
-    <div class="reply-area">
+    <div class="reply-area" id="reply-area">
+      <div class="composer-tabs">
+        <span class="composer-tab active" id="tab-whatsapp">WhatsApp</span>
+        <span class="composer-tab" id="tab-note">Private Note</span>
+      </div>
       <div class="reply-toolbar" id="reply-toolbar">
         <button class="btn btn-ghost btn-sm" id="btn-qr">/ Quick Reply</button>
         <button class="btn btn-ghost btn-sm" id="btn-polish" title="AI polish: fix grammar and tone">✨ Polish</button>
@@ -1014,18 +1104,43 @@ function renderThread(chat) {
     } catch(e) { toast(e.message, 'error'); }
   });
 
-  // Send message
+  // Composer mode: WhatsApp message vs. private team note
+  let composerMode = 'whatsapp';
+  const tabWA = document.getElementById('tab-whatsapp');
+  const tabNote = document.getElementById('tab-note');
+  const replyArea = document.getElementById('reply-area');
+  const setComposerMode = mode => {
+    composerMode = mode;
+    const note = mode === 'note';
+    tabWA.classList.toggle('active', !note);
+    tabNote.classList.toggle('active', false);
+    tabNote.classList.toggle('note-active', note);
+    replyArea.classList.toggle('note-mode', note);
+    document.getElementById('reply-text').placeholder = note
+      ? 'Write a private note — only your team can see this…'
+      : 'Type a message… (Enter to send, Shift+Enter for newline)';
+  };
+  tabWA.addEventListener('click', () => setComposerMode('whatsapp'));
+  tabNote.addEventListener('click', () => setComposerMode('note'));
+
+  // Send message (or save private note)
   const sendMsg = async () => {
     const text = document.getElementById('reply-text').value.trim();
     if (!text) return;
-    const phoneId = document.getElementById('phone-select')?.value;
-    if (!phoneId) return toast('Select a phone', 'error');
     const btn = document.getElementById('send-btn');
     btn.disabled = true;
     try {
-      await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
-      document.getElementById('reply-text').value = '';
-      await loadMessages(chat.id);
+      if (composerMode === 'note') {
+        await Api.notes.create({ chat_id: chat.id, content: text });
+        document.getElementById('reply-text').value = '';
+        toast('Private note added', 'success');
+      } else {
+        const phoneId = document.getElementById('phone-select')?.value;
+        if (!phoneId) { btn.disabled = false; return toast('Select a phone', 'error'); }
+        await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
+        document.getElementById('reply-text').value = '';
+        await loadMessages(chat.id);
+      }
     } catch(e) { toast(e.message, 'error'); }
     btn.disabled = false;
   };
@@ -2334,95 +2449,140 @@ async function renderDashboard() {
     { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`, title: 'Automation Rules', desc: 'Create rules to auto-assign, label and respond to messages.', action: 'automation', label: 'Create Rule' },
   ];
 
+  const wsName = 'Hyperscope';
   main.innerHTML = `
-  <div class="dashboard-wrap">
-    <div class="dashboard-inner">
-      <div class="dashboard-title">Getting Started</div>
-      <div class="dashboard-sub">Follow the steps to connect your phone to Periskope</div>
+  <div class="dashboard-wrap" style="overflow-y:auto">
+    <div class="dashboard-inner" style="max-width:1240px">
 
-      <div class="dash-stats" id="dash-stats">
-        <div class="dash-stat accent">
-          <div class="dash-stat-label">Total Chats</div>
-          <div class="dash-stat-value" id="ds-total">—</div>
-          <div class="dash-stat-sub">All conversations</div>
-        </div>
-        <div class="dash-stat orange">
-          <div class="dash-stat-label">Open Tickets</div>
-          <div class="dash-stat-value" id="ds-tickets">—</div>
-          <div class="dash-stat-sub" id="ds-tickets-sub">Active support tickets</div>
-        </div>
-        <div class="dash-stat blue">
-          <div class="dash-stat-label">Unread Messages</div>
-          <div class="dash-stat-value" id="ds-unread">—</div>
-          <div class="dash-stat-sub">Needs attention</div>
+      <div class="dash-workspace">
+        <div class="ws-logo">H</div>
+        <div>
+          <h2>${wsName}</h2>
+          <div class="ws-sub">${esc(State.agent?.email || 'workspace')}</div>
         </div>
       </div>
 
-      <div class="gs-steps">
-        <div class="gs-steps-list">
-          <div class="gs-step">
-            <div class="gs-step-num">1</div>
-            <div class="gs-step-body">
-              <h4>Open the WhatsApp app with the number you want to connect</h4>
-              <p>This can be a WhatsApp personal or business number connected to any device.</p>
+      <div class="dash-grid">
+        <div class="dash-main">
+
+          <div class="stat-cards">
+            <div class="stat-card">
+              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>All chats</div>
+              <div class="sc-num" id="ds-total">—</div>
+            </div>
+            <div class="stat-card">
+              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Unread chats</div>
+              <div class="sc-num" id="ds-unread">—</div>
+            </div>
+            <div class="stat-card flagged">
+              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Flagged chats</div>
+              <div class="sc-num" id="ds-flagged">—</div>
             </div>
           </div>
-          <div class="gs-step">
-            <div class="gs-step-num">2</div>
-            <div class="gs-step-body">
-              <h4>Scan the QR code to connect your phone</h4>
-              <p>On WhatsApp: Go to <strong>Settings → Linked Devices → Link a Device</strong><br>
-              Scan using a new device. The phone may need to be connected to the internet.</p>
+
+          <div class="dash-duo">
+            <div class="dash-panel">
+              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Team</div>
+              <div class="dp-body">
+                <div style="font-size:12.5px;color:var(--text-2);margin-bottom:.5rem"><span id="ds-online">—</span> online</div>
+                <div id="ds-team-avatars" style="display:flex;gap:.35rem"></div>
+              </div>
+            </div>
+            <div class="dash-panel">
+              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2z"/></svg>Tickets</div>
+              <div class="dp-body" style="display:flex;gap:2.5rem">
+                <div>
+                  <div style="font-size:12.5px;color:var(--text-3);display:flex;align-items:center;gap:.35rem"><span style="width:8px;height:8px;border-radius:50%;border:2px solid var(--danger);display:inline-block"></span>Open</div>
+                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets">—</div>
+                </div>
+                <div>
+                  <div style="font-size:12.5px;color:var(--text-3)">Assigned to me</div>
+                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-mine">—</div>
+                </div>
+                <div>
+                  <div style="font-size:12.5px;color:var(--text-3)">In progress</div>
+                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-prog">—</div>
+                </div>
+              </div>
             </div>
           </div>
+
+          <div class="quick-links-title">Quick links</div>
+          <div class="quick-links">
+            ${cards.map(c => `<div class="ql-card">
+              <h3>${c.icon} ${c.title}</h3>
+              <p>${c.desc}</p>
+              <div class="ql-actions">
+                <button class="btn btn-secondary btn-sm" onclick="switchView('${c.action}')">${c.label}</button>
+              </div>
+            </div>`).join('')}
+          </div>
+
         </div>
-        <div class="gs-qr">
-          <div class="gs-qr-box" id="dash-waha-box">
-            <div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1rem 0">
-              <div class="waha-spinner" style="width:36px;height:36px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+
+        <div class="dash-side">
+          <div class="phone-status-head">
+            <h3>Phone status</h3>
+            <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Add phone</button>
+          </div>
+          <div id="dash-phone-cards"></div>
+          <div class="dash-panel" style="margin-top:.4rem">
+            <div class="dp-body" style="text-align:center">
+              <div class="gs-qr-box" id="dash-waha-box" style="display:flex;align-items:center;justify-content:center;min-height:120px">
+                <div class="waha-spinner" style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+              </div>
+              <div class="gs-qr-label" id="dash-waha-label" style="font-size:12px;color:var(--text-3);margin-top:.5rem">Checking connection…</div>
+              <div class="gs-qr-actions" id="dash-waha-actions" style="margin-top:.5rem"></div>
             </div>
           </div>
-          <div class="gs-qr-label" id="dash-waha-label">Checking connection…</div>
-          <div class="gs-qr-actions" id="dash-waha-actions"></div>
         </div>
       </div>
 
-      <div class="gs-cards">
-        ${cards.map(c => `<div class="gs-card">
-          <div class="gs-card-icon">${c.icon}</div>
-          <h3>${c.title}</h3>
-          <p>${c.desc}</p>
-          <div class="gs-card-actions">
-            <button class="btn btn-primary btn-sm" onclick="switchView('${c.action}')">${c.label}</button>
-            <span class="gs-link" onclick="switchView('${c.action}')">
-              Watch tutorial
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-            </span>
-          </div>
-        </div>`).join('')}
-      </div>
     </div>
   </div>`;
 
   // Load quick stats asynchronously
   try {
-    const [dash, tkt] = await Promise.all([
+    const [dash, tkt, agents] = await Promise.all([
       Api.analytics.dashboard(),
       Api.analytics.tickets(),
+      Api.auth.agents().catch(() => []),
     ]);
-    const dsTotal = document.getElementById('ds-total');
-    const dsTickets = document.getElementById('ds-tickets');
-    const dsTicketsSub = document.getElementById('ds-tickets-sub');
-    const dsUnread = document.getElementById('ds-unread');
-    if (dsTotal) dsTotal.textContent = dash.total_chats ?? 0;
-    if (dsTickets) dsTickets.textContent = tkt.open ?? 0;
-    if (dsTicketsSub) dsTicketsSub.textContent = `${tkt.in_progress ?? 0} in progress`;
-    if (dsUnread) dsUnread.textContent = dash.unread_chats ?? 0;
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('ds-total', dash.total_chats ?? 0);
+    set('ds-unread', dash.unread_chats ?? 0);
+    set('ds-flagged', dash.flagged_chats ?? 0);
+    set('ds-tickets', tkt.open ?? 0);
+    set('ds-tickets-prog', tkt.in_progress ?? 0);
+    set('ds-tickets-mine', '-');
+    set('ds-online', `${dash.online_agents ?? agents.length} of ${agents.length || (dash.online_agents ?? 0)}`);
+    const avEl = document.getElementById('ds-team-avatars');
+    if (avEl) avEl.innerHTML = agents.slice(0, 8).map(a =>
+      `<div class="agent-avatar" title="${esc(a.name)}" style="background:${avatarColor(a.name)};width:28px;height:28px;font-size:11px">${initials(a.name)}</div>`
+    ).join('');
+    try {
+      const mine = await Api.tickets.list({ assigned_to: State.agent?.id, status: 'open' });
+      set('ds-tickets-mine', mine.length);
+    } catch(_) {}
   } catch(_) {}
 
-  // Start live WAHA poller
+  // Phone status cards + live WAHA poller
   try {
     const phones = await Api.phones.list();
+    const cardsEl = document.getElementById('dash-phone-cards');
+    if (cardsEl) cardsEl.innerHTML = phones.map(p => {
+      const ok = p.waha_status === 'WORKING';
+      return `<div class="phone-card">
+        <div class="pc-avatar">${initials(p.name || p.phone_number)}</div>
+        <div class="pc-meta">
+          <div class="pc-number">${esc(p.phone_number)}</div>
+          <div class="pc-name">${esc(p.name || '')}</div>
+        </div>
+        <div class="pc-status ${ok ? 'connected' : 'offline'}"><span class="dot"></span>${ok ? 'Connected' : esc(p.waha_status || 'Offline')}</div>
+        <button class="pc-menu-btn" title="Manage in Settings" onclick="switchView('settings')">⋯</button>
+      </div>`;
+    }).join('') || '';
+
     if (phones && phones.length > 0) {
       _startDashWahaPoller(phones[0].id);
     } else {

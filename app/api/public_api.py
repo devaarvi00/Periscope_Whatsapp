@@ -1,6 +1,6 @@
 """Public developer API — authenticated with an API key (X-API-Key header).
 
-Mirrors Periskope's "Custom APIs for WhatsApp groups, chats and numbers":
+Mirrors Hyperscope's "Custom APIs for WhatsApp groups, chats and numbers":
 send messages programmatically, list chats/messages, create tickets.
 """
 import hashlib
