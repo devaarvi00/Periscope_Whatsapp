@@ -2097,7 +2097,7 @@ async function loadTickets(status = '') {
         <td>${t.sla_breached ? '<span class="pill" style="background:#FEF2F2;color:#DC2626">Breached</span>' : '<span class="pill" style="background:var(--success-bg);color:var(--success)">OK</span>'}</td>
         <td style="text-align:right">
           <button class="btn btn-ghost btn-sm ticket-edit" data-tid="${t.id}">Edit</button>
-          <button class="btn btn-danger btn-sm ticket-del" data-tid="${t.id}">Del</button>
+          <button class="btn btn-danger btn-sm ticket-del icon-btn" data-tid="${t.id}" title="Delete ticket"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button>
         </td>
       </tr>`).join('');
 
@@ -2243,7 +2243,7 @@ async function loadContacts() {
         </div>
         <div style="display:flex;gap:.35rem;margin-left:auto">
           <button class="btn btn-ghost btn-sm contact-edit" data-cid="${c.id}">Edit</button>
-          <button class="btn btn-danger btn-sm contact-del" data-cid="${c.id}">Del</button>
+          <button class="btn btn-danger btn-sm contact-del icon-btn" data-cid="${c.id}" title="Delete contact"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button>
         </div>
       </div>`).join('');
     el.querySelectorAll('.contact-edit').forEach(btn => {
@@ -2786,7 +2786,7 @@ async function loadKB(type = '') {
           <div style="margin-left:auto;display:flex;gap:.35rem">
             ${i.status !== 'active' ? `<button class="btn btn-secondary btn-sm kb-approve" data-id="${i.id}">Approve</button>` : ''}
             <button class="btn btn-ghost btn-sm kb-edit" data-id="${i.id}">Edit</button>
-            <button class="btn btn-danger btn-sm kb-del" data-id="${i.id}">Del</button>
+            <button class="btn btn-danger btn-sm kb-del icon-btn" data-id="${i.id}" title="Delete"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button>
           </div>
         </div>
       </div>`).join('');
@@ -4137,6 +4137,17 @@ async function renderDashboard() {
             </div>
           </div>
 
+          <div class="dash-panel" style="margin:1rem 0">
+            <div class="dp-head">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              Recent Conversations
+              <button class="btn btn-ghost btn-sm" style="margin-left:auto;font-size:12px" onclick="switchView('inbox')">View all →</button>
+            </div>
+            <div class="dp-body" id="ds-recent-chats" style="padding:0">
+              <div style="padding:1.5rem;text-align:center;color:var(--text-3);font-size:13px">Loading…</div>
+            </div>
+          </div>
+
           <div class="quick-links-title">Quick links</div>
           <div class="quick-links">
             ${cards.map(c => `<div class="ql-card">
@@ -4196,6 +4207,40 @@ async function renderDashboard() {
     try {
       const mine = await Api.tickets.list({ assigned_to: State.agent?.id, status: 'open' });
       set('ds-tickets-mine', mine.length);
+    } catch(_) {}
+
+    // Recent conversations panel
+    try {
+      const recentEl = document.getElementById('ds-recent-chats');
+      if (recentEl && phoneConnected) {
+        const recent = await Api.inbox.chats({ limit: 8 });
+        if (!recent.length) {
+          recentEl.innerHTML = `<div style="padding:1.5rem;text-align:center;color:var(--text-3);font-size:13px">No conversations yet</div>`;
+        } else {
+          recentEl.innerHTML = recent.map(c => {
+            const unread = c.unread_count > 0;
+            const avatar = initials(c.name || c.chat_wid);
+            const color = avatarColor(c.name || c.chat_wid);
+            const preview = c.last_message
+              ? (c.last_message.length > 55 ? c.last_message.slice(0, 55) + '…' : c.last_message)
+              : '<span style="opacity:.45;font-style:italic">No messages</span>';
+            const time = c.last_message_at ? timeAgo(c.last_message_at) : '';
+            return `<div class="ds-chat-row" onclick="switchView('inbox');setTimeout(()=>openChat(${c.id}),300)" style="display:flex;align-items:center;gap:.65rem;padding:.55rem 1rem;cursor:pointer;border-bottom:1px solid var(--border-light);transition:background .1s" onmouseenter="this.style.background='var(--bg)'" onmouseleave="this.style.background=''">
+              <div class="agent-avatar" style="background:${color};width:34px;height:34px;font-size:12px;flex-shrink:0">${esc(avatar)}</div>
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:.5rem">
+                  <span style="font-size:13px;font-weight:${unread ? 700 : 500};color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(displayName(c))}</span>
+                  <span style="font-size:11px;color:var(--text-4);flex-shrink:0">${time}</span>
+                </div>
+                <div style="font-size:12px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px">${preview}</div>
+              </div>
+              ${unread ? `<span style="background:var(--accent);color:#fff;font-size:11px;font-weight:600;min-width:18px;height:18px;border-radius:99px;display:flex;align-items:center;justify-content:center;padding:0 5px;flex-shrink:0">${c.unread_count > 99 ? '99+' : c.unread_count}</span>` : ''}
+            </div>`;
+          }).join('');
+        }
+      } else if (recentEl) {
+        recentEl.innerHTML = `<div style="padding:1.5rem;text-align:center;color:var(--text-3);font-size:13px">Connect WhatsApp to see conversations</div>`;
+      }
     } catch(_) {}
   } catch(_) {}
 
@@ -4305,14 +4350,30 @@ async function showGroupMembers(gid) {
   try {
     const res = await Api.groups.participants(gid);
     const body = document.querySelector('#modal .modal-body') || document.querySelector('#modal-body');
+    let membersHtml;
+    if (!res.api_available) {
+      membersHtml = `<tr><td colspan="2" style="padding:1rem;text-align:center">
+        <div style="color:var(--text-3);font-size:13px;line-height:1.6">
+          <div style="font-size:20px;margin-bottom:.4rem">⚠️</div>
+          WAHA could not fetch members for this group.<br>
+          <span style="font-size:12px">This may require a WAHA Plus plan or the group may no longer be accessible.</span>
+        </div>
+      </td></tr>`;
+    } else if (!res.participants.length) {
+      membersHtml = `<tr><td colspan="2" class="text-muted" style="text-align:center;padding:1rem">No members found</td></tr>`;
+    } else {
+      membersHtml = res.participants.map(p => `<tr>
+        <td>+${esc(p.number)}</td>
+        <td>${p.is_admin ? '<span class="pill pill-resolved">Admin</span>' : 'Member'}</td>
+      </tr>`).join('');
+    }
     const html = `
-      <p style="font-size:13px;color:var(--text-2);margin-bottom:.75rem"><strong>${esc(res.group)}</strong> — ${res.count} members</p>
+      <p style="font-size:13px;color:var(--text-2);margin-bottom:.75rem">
+        <strong>${esc(res.group)}</strong>${res.count ? ` — ${res.count} members` : ''}
+      </p>
       <div class="table-wrap" style="max-height:320px;overflow-y:auto"><table class="data-table">
         <thead><tr><th>Number</th><th>Role</th></tr></thead>
-        <tbody>${res.participants.map(p => `<tr>
-          <td>+${esc(p.number)}</td>
-          <td>${p.is_admin ? '<span class="pill pill-resolved">Admin</span>' : 'Member'}</td>
-        </tr>`).join('') || '<tr><td colspan="2" class="text-muted">Participant list unavailable (session offline?)</td></tr>'}</tbody>
+        <tbody>${membersHtml}</tbody>
       </table></div>`;
     if (body) body.innerHTML = html; else showModal('Group Members', html);
   } catch(e) { toast(e.message, 'error'); closeModal(); }

@@ -63,9 +63,9 @@ async def group_participants(chat_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    participants = await waha.get_group_participants(chat.chat_wid)
+    raw, api_ok = await waha.get_group_participants_with_status(chat.chat_wid)
     result = []
-    for p in participants:
+    for p in raw:
         pid = p.get("id")
         if isinstance(pid, dict):
             pid = pid.get("_serialized") or pid.get("user", "")
@@ -74,7 +74,12 @@ async def group_participants(chat_id: int, db: Session = Depends(get_db)):
             "number": str(pid).split("@")[0],
             "is_admin": bool(p.get("isAdmin") or p.get("admin")),
         })
-    return {"group": chat.name, "count": len(result), "participants": result}
+    return {
+        "group": chat.name,
+        "count": len(result),
+        "participants": result,
+        "api_available": api_ok,
+    }
 
 
 class AddParticipantsRequest(BaseModel):

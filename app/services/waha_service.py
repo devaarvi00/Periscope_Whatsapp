@@ -126,16 +126,25 @@ class WAHAService:
     # ── Groups ────────────────────────────────────────────────────────────────
 
     async def get_group_participants(self, group_id: str) -> list[dict[str, Any]]:
+        raw, _ = await self.get_group_participants_with_status(group_id)
+        return raw
+
+    async def get_group_participants_with_status(self, group_id: str) -> tuple[list[dict[str, Any]], bool]:
+        """Returns (participants_list, api_available). api_available=False when WAHA returned an error."""
         from app.core.http_client import get_http_client
         url = f"{self.base}/api/{self.session}/groups/{group_id}/participants"
         try:
             resp = await get_http_client().get(url, headers=self._headers)
             if resp.is_success:
                 data = resp.json()
-                return data if isinstance(data, list) else data.get("participants", [])
+                participants = data if isinstance(data, list) else data.get("participants", [])
+                return participants, True
+            else:
+                logger.warning("WAHA get_group_participants returned %s for %s", resp.status_code, group_id)
+                return [], False
         except Exception as exc:
             logger.warning("WAHA get_group_participants error: %s", exc)
-        return []
+            return [], False
 
     async def add_group_participants(self, group_id: str, participants: list[str]) -> bool:
         """Add phone numbers (as WIDs) to a WhatsApp group."""

@@ -567,6 +567,9 @@ input,textarea,select{font:inherit;}
 .btn-full{width:100%;justify-content:center;padding:.7rem;height:auto;}
 .btn svg{width:15px;height:15px;}
 .btn-sm{padding:.28rem .75rem;font-size:12.5px;height:30px;}
+/* Icon-only delete button — square, just the trash icon */
+.btn.icon-btn{width:30px;padding:0;justify-content:center;}
+.btn.icon-btn svg{width:14px;height:14px;}
 .btn:disabled{opacity:.5;cursor:not-allowed;}
 
 /* ── Forms ────────────────────────────────────────────────────────── */
