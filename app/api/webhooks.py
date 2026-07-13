@@ -121,7 +121,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             chat.unread_count = (chat.unread_count or 0) + 1
             db.commit()
 
-        # Broadcast real-time update
+        # Broadcast real-time update — use int epoch so JSON serialises correctly
         from app.core.ws_manager import ws_manager
         await ws_manager.emit_new_message(
             chat_id=chat.id,
@@ -130,9 +130,11 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             from_me=from_me,
             sender_name=sender_name or "",
             sender_number=sender_number or "",
-            timestamp=ts,
+            timestamp=int(ts.timestamp()),
             message_type=msg_type,
             has_media=msg_type not in ("text", "chat", ""),
+            chat_name=chat.name or "",
+            unread_count=(chat.unread_count or 0),
         )
 
         # Notify outbound webhook subscribers
@@ -196,6 +198,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             if reply:
                 waha = WAHAService(session_name=session)
                 await waha.send_text(chat_wid, reply)
+                ai_ts = datetime.utcnow()
                 inbox.upsert_message({
                     "chat_id": chat.id,
                     "phone_id": phone.id,
@@ -205,8 +208,21 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                     "sender_number": phone.phone_number,
                     "body": reply,
                     "message_type": "text",
-                    "timestamp": datetime.utcnow(),
+                    "timestamp": ai_ts,
                 })
+                from app.core.ws_manager import ws_manager as _ws
+                await _ws.emit_new_message(
+                    chat_id=chat.id,
+                    chat_wid=chat_wid,
+                    body=reply,
+                    from_me=True,
+                    sender_name="AI Agent",
+                    sender_number=phone.phone_number,
+                    timestamp=int(ai_ts.timestamp()),
+                    message_type="text",
+                    chat_name=chat.name or "",
+                    unread_count=0,
+                )
 
     except Exception as exc:
         logger.exception("Webhook processing error: %s", exc)

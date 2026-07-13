@@ -407,6 +407,11 @@ function connectWS() {
     WS.alive = true;
     wsSetStatus('connected', 'Live');
     State.ws = ws;
+    // Reload messages for whichever chat is open so any messages missed during the
+    // disconnect gap appear immediately (pass true to skip the WAHA re-sync step).
+    if (State.currentView === 'inbox' && State.inbox.selectedChatId) {
+      loadMessages(State.inbox.selectedChatId, true);
+    }
   };
 
   ws.onmessage = e => {
@@ -448,14 +453,33 @@ function handleWSEvent(data) {
   const { event, data: d } = data;
 
   if (event === 'new_message') {
-    // Append to open thread if it matches
+    // Append to open thread if it matches (WS is the real-time source of truth for outbound too)
     if (State.currentView === 'inbox' && State.inbox.selectedChatId == d.chat_id) {
       appendMessage(d);
     }
-    // Always refresh the chat list for unread counts
-    if (State.currentView === 'inbox') refreshChatList();
 
-    // Show a subtle toast when user is on a different view
+    // Update chat entry in state and re-render list — no network round-trip
+    if (State.currentView === 'inbox') {
+      const chatEntry = State.inbox.chats?.find(c => c.id == d.chat_id);
+      if (chatEntry) {
+        chatEntry.last_message = d.body || '';
+        chatEntry.last_message_time = d.timestamp;
+        if (!d.from_me && State.inbox.selectedChatId != d.chat_id) {
+          chatEntry.unread_count = (chatEntry.unread_count || 0) + 1;
+        }
+        // Bubble this chat to the top
+        State.inbox.chats = [chatEntry, ...State.inbox.chats.filter(c => c.id !== d.chat_id)];
+        renderChatList(State.inbox.chats);
+        const total = State.inbox.chats.reduce((s, c) => s + (c.unread_count || 0), 0);
+        const badge = document.getElementById('unread-badge');
+        if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+      } else {
+        // New chat not yet in state — full refresh
+        refreshChatList();
+      }
+    }
+
+    // Show toast/notify when user is on another view
     if (State.currentView !== 'inbox' && !d.from_me) {
       const preview = (d.body || '').substring(0, 60);
       toast(`💬 New message: ${preview}`, 'default');
@@ -1337,7 +1361,9 @@ function renderThread(chat) {
         if (!phoneId) { btn.disabled = false; return toast('Select a phone', 'error'); }
         await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
         document.getElementById('reply-text').value = '';
-        await loadMessages(chat.id);
+        // WS new_message event from backend broadcasts the sent message to all agents in real time.
+        // Only fall back to a full reload when WS is disconnected.
+        if (!WS.alive) await loadMessages(chat.id);
       }
     } catch(e) { toast(e.message, 'error'); }
     btn.disabled = false;
@@ -1733,6 +1759,9 @@ function appendMessage(m) {
   const area = document.getElementById('messages-area');
   if (!area) return;
   const chat = State.inbox.chats?.find(c => c.id == State.inbox.selectedChatId);
+  // Keep state in sync so right-click context-menu actions work on real-time messages
+  if (!State.inbox.messages) State.inbox.messages = [];
+  State.inbox.messages.push(m);
   area.insertAdjacentHTML('beforeend', renderMessage(m, chat?.is_group || false));
   area.scrollTop = area.scrollHeight;
 }

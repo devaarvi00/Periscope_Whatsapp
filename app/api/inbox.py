@@ -216,7 +216,24 @@ async def send_message(
         chat.ai_snoozed_at = datetime.utcnow()
         db.commit()
 
-    return {"ok": True, "message_id": msg.id}
+    # Broadcast to all connected agents in real time
+    from app.core.ws_manager import ws_manager
+    sent_ts = msg.timestamp if msg else datetime.utcnow()
+    await ws_manager.emit_new_message(
+        chat_id=chat.id,
+        chat_wid=chat.chat_wid,
+        body=req.body,
+        from_me=True,
+        sender_name=agent.name or "Agent",
+        sender_number=phone.phone_number or "",
+        timestamp=int(sent_ts.timestamp()) if hasattr(sent_ts, 'timestamp') else int(sent_ts),
+        message_type=req.message_type if req.media_url else "text",
+        has_media=bool(req.media_url),
+        chat_name=chat.name or "",
+        unread_count=0,
+    )
+
+    return {"ok": True, "message_id": msg.id if msg else None}
 
 
 @router.post("/chats/{chat_id}/sync-messages")

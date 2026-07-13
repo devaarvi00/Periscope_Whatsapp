@@ -70,7 +70,8 @@ class ConnectionManager:
                                body: str, from_me: bool,
                                sender_name: str = "", timestamp: int = 0,
                                message_type: str = "text", has_media: bool = False,
-                               sender_number: str = "") -> None:
+                               sender_number: str = "", chat_name: str = "",
+                               unread_count: int = 0) -> None:
         await self.broadcast("new_message", {
             "chat_id": chat_id,
             "chat_wid": chat_wid,
@@ -81,6 +82,8 @@ class ConnectionManager:
             "timestamp": timestamp,
             "message_type": message_type,
             "has_media": has_media,
+            "chat_name": chat_name,
+            "unread_count": unread_count,
         })
 
     async def emit_chat_updated(self, chat_id: int, fields: dict) -> None:
