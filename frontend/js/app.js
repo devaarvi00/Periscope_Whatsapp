@@ -744,9 +744,33 @@ async function loadChats() {
       <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect WhatsApp</button>
     </div>`;
     const threadPanel = document.getElementById('thread-panel');
-    if (threadPanel) threadPanel.innerHTML = `<div class="empty-thread"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1.2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Select a conversation</p><span>Choose a chat from the list to start messaging</span></div>`;
+    if (threadPanel) {
+      threadPanel.innerHTML = `<div class="empty-state whatsapp-disconnected-thread" style="flex:1">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.25;color:var(--text-3)">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          <path d="M2 2l20 20"/>
+        </svg>
+        <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0 0 .25rem">WhatsApp Disconnected</p>
+        <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to start viewing conversations and sending messages.</span>
+        <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
+      </div>`;
+    }
     _updateUnreadBadge([]);
     return;
+  }
+
+  // Restore thread panel empty state if it was showing the disconnected message
+  const threadPanel = document.getElementById('thread-panel');
+  if (threadPanel && !State.inbox.selectedChatId) {
+    if (threadPanel.querySelector('.whatsapp-disconnected-thread') || threadPanel.innerHTML.includes('WhatsApp Disconnected')) {
+      threadPanel.innerHTML = `<div class="empty-state" style="flex:1">
+        <div class="empty-state-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </div>
+        <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
+        <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
+      </div>`;
+    }
   }
 
   const q = _buildChatQuery();
@@ -2165,6 +2189,26 @@ async function renderAnalytics() {
       </div>
     </div>`;
   try {
+    const phones = await Api.phones.list().catch(() => []);
+    State.phones = phones;
+    const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+
+    if (!phoneConnected) {
+      const body = document.getElementById('analytics-body');
+      if (body) {
+        body.innerHTML = `<div class="empty-state whatsapp-disconnected-thread" style="padding:4rem 2rem">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.25;color:var(--text-3)">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            <path d="M2 2l20 20"/>
+          </svg>
+          <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0.5rem 0 0.25rem">WhatsApp Disconnected</p>
+          <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to see analytics data.</span>
+          <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
+        </div>`;
+      }
+      return;
+    }
+
     const [dash, msg, tkt, agents] = await Promise.all([
       Api.analytics.dashboard(),
       Api.analytics.messages(30),
@@ -3899,6 +3943,23 @@ async function loadGroups(search) {
   const el = document.getElementById('groups-list');
   if (!el) return;
   try {
+    const phones = await Api.phones.list().catch(() => []);
+    State.phones = phones;
+    const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+
+    if (!phoneConnected) {
+      el.innerHTML = `<div class="empty-state whatsapp-disconnected-thread" style="padding:4rem 2rem">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.25;color:var(--text-3)">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          <path d="M2 2l20 20"/>
+        </svg>
+        <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0.5rem 0 0.25rem">WhatsApp Disconnected</p>
+        <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to view groups.</span>
+        <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
+      </div>`;
+      return;
+    }
+
     const groups = await Api.groups.list(search ? { search } : undefined);
     if (!groups.length) {
       el.innerHTML = `<div class="empty-state" style="padding:4rem 2rem">
@@ -4252,6 +4313,25 @@ async function renderChatListView() {
   async function loadTable(search) {
     const wrap = document.getElementById('cl-table-wrap');
     try {
+      const phones = await Api.phones.list().catch(() => []);
+      State.phones = phones;
+      const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+
+      if (!phoneConnected) {
+        if (wrap) {
+          wrap.innerHTML = `<div class="empty-state whatsapp-disconnected-thread" style="padding:4rem 2rem">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.25;color:var(--text-3)">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+              <path d="M2 2l20 20"/>
+            </svg>
+            <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0.5rem 0 0.25rem">WhatsApp Disconnected</p>
+            <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to view the chat list.</span>
+            <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
+          </div>`;
+        }
+        return;
+      }
+
       rows = await Api.inbox.chats({ limit: 200, ...(search ? { search } : {}) });
       const agentNames = {};
       try { (await Api.auth.agents()).forEach(a => agentNames[a.id] = a.name); } catch(_) {}
