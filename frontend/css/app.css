@@ -791,6 +791,7 @@ textarea{resize:vertical;min-height:80px;}
 .messages-area{
   flex:1;overflow-y:auto;padding:1rem 1.1rem;
   display:flex;flex-direction:column;gap:.35rem;
+  justify-content:flex-end;
   background:#f0f2f5;
   scrollbar-width:thin;scrollbar-color:#d1d5db transparent;
 }

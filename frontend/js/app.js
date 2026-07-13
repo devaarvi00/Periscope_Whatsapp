@@ -685,15 +685,14 @@ function debounceLoadChats() {
   _chatDebounce = setTimeout(loadChats, 300);
 }
 
+let _chatLoadOffset = 0;
+const CHAT_PAGE = 200;
+
 async function loadChats() {
-  const q = {};
-  const f = State.inbox.filter;
-  if (f === 'flagged') q.is_flagged = true;
-  if (f === 'archived') q.is_archived = true;
-  if (f === 'inbox') q.is_archived = false;
-  if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
-  if (State.inbox.labelFilter) q.label_id = State.inbox.labelFilter;
-  if (State.inbox.search) q.search = State.inbox.search;
+  _chatLoadOffset = 0;
+  const q = _buildChatQuery();
+  q.limit = CHAT_PAGE;
+  q.offset = 0;
 
   try {
     let chats = await Api.inbox.chats(q);
@@ -717,14 +716,10 @@ async function loadChats() {
       } catch(_) {}
     }
 
-    if (f === 'unread') chats = chats.filter(c => c.unread_count > 0);
-    if (f === 'inbox') chats = chats.filter(c => !c.is_archived);
-    if (f === 'awaiting') chats = chats.filter(c => c.last_message_from_me === false || (c.unread_count === 0 && !c.last_from_me));
+    chats = _filterChats(chats);
     State.inbox.chats = chats;
-    renderChatList(chats);
-    const total = chats.reduce((s, c) => s + (c.unread_count || 0), 0);
-    const badge = document.getElementById('unread-badge');
-    if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+    renderChatList(chats, chats.length === CHAT_PAGE);
+    _updateUnreadBadge(chats);
   } catch(err) {
     const chatList = document.getElementById('chat-list');
     if (chatList) chatList.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:.5rem">
@@ -736,7 +731,53 @@ async function loadChats() {
 
 function refreshChatList() { loadChats(); }
 
-function renderChatList(chats) {
+function _buildChatQuery() {
+  const f = State.inbox.filter;
+  const q = {};
+  if (f === 'flagged') q.is_flagged = true;
+  if (f === 'archived') q.is_archived = true;
+  if (f === 'inbox') q.is_archived = false;
+  if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
+  if (State.inbox.labelFilter) q.label_id = State.inbox.labelFilter;
+  if (State.inbox.search) q.search = State.inbox.search;
+  return q;
+}
+
+function _filterChats(chats) {
+  const f = State.inbox.filter;
+  if (f === 'unread') return chats.filter(c => c.unread_count > 0);
+  if (f === 'inbox') return chats.filter(c => !c.is_archived);
+  if (f === 'awaiting') return chats.filter(c => c.last_message_from_me === false || (c.unread_count === 0 && !c.last_from_me));
+  return chats;
+}
+
+function _updateUnreadBadge(chats) {
+  const total = chats.reduce((s, c) => s + (c.unread_count || 0), 0);
+  const badge = document.getElementById('unread-badge');
+  if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+}
+
+async function loadMoreChats() {
+  const btn = document.getElementById('load-more-chats-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  _chatLoadOffset += CHAT_PAGE;
+  const q = _buildChatQuery();
+  q.limit = CHAT_PAGE;
+  q.offset = _chatLoadOffset;
+  try {
+    let more = await Api.inbox.chats(q);
+    if (!Array.isArray(more)) more = [];
+    more = _filterChats(more);
+    State.inbox.chats = State.inbox.chats.concat(more);
+    // Re-render full list with "load more" button if we got a full page
+    renderChatList(State.inbox.chats, more.length === CHAT_PAGE);
+    _updateUnreadBadge(State.inbox.chats);
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Load more'; }
+  }
+}
+
+function renderChatList(chats, hasMore) {
   const el = document.getElementById('chat-list');
   if (!el) return;
   if (!chats.length) {
@@ -819,6 +860,15 @@ function renderChatList(chats) {
   el.querySelectorAll('.chat-item').forEach(el => {
     el.addEventListener('click', () => openChat(+el.dataset.cid));
   });
+
+  // "Load more chats" button when there's a full page (more may exist)
+  if (hasMore) {
+    const morBtn = document.createElement('div');
+    morBtn.style.cssText = 'text-align:center;padding:.75rem 1rem';
+    morBtn.innerHTML = `<button id="load-more-chats-btn" class="btn btn-secondary btn-sm" style="width:100%;font-size:12px">Load more conversations</button>`;
+    el.appendChild(morBtn);
+    document.getElementById('load-more-chats-btn').addEventListener('click', loadMoreChats);
+  }
 }
 
 async function openChat(chatId) {
@@ -828,6 +878,12 @@ async function openChat(chatId) {
   });
   const chat = State.inbox.chats.find(c => c.id === chatId);
   if (!chat) return;
+  // Immediately mark as read in state so unread badge clears without a re-fetch
+  if (chat.unread_count) {
+    chat.unread_count = 0;
+    _updateUnreadBadge(State.inbox.chats);
+    document.querySelectorAll(`.chat-item[data-cid="${chatId}"] .unread-dot`).forEach(d => d.remove());
+  }
   const wasDetailOpen = document.getElementById('detail-panel')?.style.display !== 'none';
   renderThread(chat);
   if (wasDetailOpen) renderContactDetail(chat);
@@ -1431,11 +1487,11 @@ async function loadMessages(chatId, _alreadySynced) {
   const chat = State.inbox.chats?.find(c => c.id == chatId);
   const isGroup = chat?.is_group || false;
   try {
-    let messages = await Api.inbox.messages(chatId, { limit: 50 });
-    // Auto-fetch from WAHA if DB has no messages for this chat yet
-    if (messages.length === 0 && !_alreadySynced) {
+    let messages = await Api.inbox.messages(chatId, { limit: 100 });
+    // Auto-fetch from WAHA when we have very few messages (first open or just synced)
+    if (messages.length < 5 && !_alreadySynced) {
       try { await Api.inbox.syncMessages(chatId, 100); } catch(_) {}
-      messages = await Api.inbox.messages(chatId, { limit: 50 });
+      messages = await Api.inbox.messages(chatId, { limit: 100 });
     }
     State.inbox.messages = messages;
 

@@ -97,7 +97,10 @@ class InboxService:
                 self.db.add(msg)
             self.db.commit()
             self.db.refresh(msg)
-            self._update_chat_last_message(data["chat_id"], data.get("body", ""), data.get("timestamp"))
+            self._update_chat_last_message(
+                data["chat_id"], data.get("body", ""),
+                data.get("timestamp"), data.get("message_type", "text"),
+            )
             return msg
         except IntegrityError:
             existing = self.db.query(Message).filter(
@@ -107,10 +110,22 @@ class InboxService:
                 return existing
             raise
 
-    def _update_chat_last_message(self, chat_id: int, body: str, ts: datetime | None) -> None:
+    def _update_chat_last_message(self, chat_id: int, body: str, ts: datetime | None,
+                                   message_type: str = "text") -> None:
         chat = self.get_chat(chat_id)
         if chat:
-            chat.last_message = body[:200]
+            if body:
+                chat.last_message = body[:200]
+            else:
+                _type_labels = {
+                    "image": "📷 Photo", "photo": "📷 Photo",
+                    "video": "🎬 Video",
+                    "audio": "🎤 Voice message", "voice": "🎤 Voice message", "ptt": "🎤 Voice message",
+                    "document": "📄 Document", "pdf": "📄 Document",
+                    "sticker": "🖼 Sticker", "location": "📍 Location",
+                    "contact": "👤 Contact", "vcard": "👤 Contact",
+                }
+                chat.last_message = _type_labels.get(message_type, "📎 Media")
             if ts:
                 chat.last_message_at = ts
             self.db.commit()

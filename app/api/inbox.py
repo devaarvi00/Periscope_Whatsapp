@@ -35,7 +35,7 @@ def list_chats(
     search: str | None = None,
     assigned_to: int | None = None,
     is_group: bool | None = None,
-    limit: int = 50,
+    limit: int = 200,
     offset: int = 0,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
@@ -383,13 +383,28 @@ def remove_label(chat_id: int, label_id: int, db: Session = Depends(get_db)):
 @router.post("/sync/{phone_id}")
 async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
     """Fetch latest chats from WAHA and upsert into DB."""
+    from datetime import timezone as _tz
+    from app.models.chat import Chat as _Chat
+    from app.models.message import Message as _Msg
+    from sqlalchemy import desc as _desc, or_ as _or
+
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    chats = await waha.get_chats(limit=200)
+    chats = await waha.get_chats(limit=500)
     svc = InboxService(db)
     synced = 0
+
+    _media_labels = {
+        "image": "📷 Photo", "photo": "📷 Photo",
+        "video": "🎬 Video",
+        "audio": "🎤 Voice message", "voice": "🎤 Voice message", "ptt": "🎤 Voice message",
+        "document": "📄 Document", "pdf": "📄 Document",
+        "sticker": "🖼 Sticker", "location": "📍 Location",
+        "contact": "👤 Contact", "vcard": "👤 Contact",
+    }
+
     for c in chats:
         cid = c.get("id") or c.get("chatId") or c.get("_serialized") or ""
         if isinstance(cid, dict):
@@ -408,11 +423,25 @@ async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
                 name = name or f"Group {str(cid).split('@')[0][-6:]}"
             else:
                 name = str(cid).split("@")[0]
-        svc.upsert_chat({"chat_wid": str(cid), "phone_id": phone_id, "name": name, "is_group": is_group})
+
+        # Extract last message preview from WAHA chat object
+        chat_data: dict = {"chat_wid": str(cid), "phone_id": phone_id, "name": name, "is_group": is_group}
+        last_msg_obj = c.get("lastMessage") or {}
+        if last_msg_obj:
+            lm_body = last_msg_obj.get("body") or last_msg_obj.get("caption") or ""
+            lm_type = str(last_msg_obj.get("type") or "text").lower()
+            if not lm_body:
+                lm_body = _media_labels.get(lm_type, "📎 Media")
+            lm_ts_raw = last_msg_obj.get("timestamp")
+            if lm_body:
+                chat_data["last_message"] = lm_body[:200]
+            if isinstance(lm_ts_raw, (int, float)):
+                chat_data["last_message_at"] = datetime.fromtimestamp(lm_ts_raw, tz=_tz.utc).replace(tzinfo=None)
+
+        svc.upsert_chat(chat_data)
         synced += 1
 
     # Repair previously synced chats that still have WID-looking names
-    from app.models.chat import Chat as _Chat
     stale = (
         db.query(_Chat)
         .filter(_Chat.phone_id == phone_id, _Chat.is_group == True, _Chat.name.like("%@g.us%"))
@@ -429,4 +458,24 @@ async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
             continue
     if stale:
         db.commit()
+
+    # Backfill last_message from DB for chats still missing it
+    missing = (
+        db.query(_Chat)
+        .filter(_Chat.phone_id == phone_id, _or(_Chat.last_message == None, _Chat.last_message == ""))
+        .all()
+    )
+    for chat in missing:
+        latest = db.query(_Msg).filter(_Msg.chat_id == chat.id).order_by(_desc(_Msg.timestamp)).first()
+        if latest:
+            body = latest.body or ""
+            mtype = latest.message_type or "text"
+            if not body:
+                body = _media_labels.get(mtype, "📎 Media")
+            chat.last_message = body[:200]
+            if latest.timestamp:
+                chat.last_message_at = latest.timestamp
+    if missing:
+        db.commit()
+
     return {"synced": synced}
