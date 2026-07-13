@@ -1620,6 +1620,7 @@ function renderThread(chat) {
 let _msgScrollObserver = null;
 let _msgLoadingOlder = false;
 let _msgNoMoreOlder = false;
+let _msgJustSynced = false; // true after loadMessages does a WAHA sync; skip re-sync in _fetchOlderMessages
 
 async function loadMessages(chatId, _alreadySynced) {
   const area = document.getElementById('messages-area');
@@ -1630,6 +1631,7 @@ async function loadMessages(chatId, _alreadySynced) {
   // Reset older-load sentinels for this chat
   _msgLoadingOlder = false;
   _msgNoMoreOlder  = false;
+  _msgJustSynced   = false;
   if (_msgScrollObserver) { _msgScrollObserver.disconnect(); _msgScrollObserver = null; }
 
   // Show a slim loading skeleton immediately
@@ -1640,7 +1642,7 @@ async function loadMessages(chatId, _alreadySynced) {
   try {
     // Always do a live WAHA sync first (200 msgs) unless WS just reconnected
     if (!_alreadySynced) {
-      try { await Api.inbox.syncMessages(chatId, 200); } catch(_) {}
+      try { await Api.inbox.syncMessages(chatId, 200); _msgJustSynced = true; } catch(_) {}
     }
 
     let messages = await Api.inbox.messages(chatId, { limit: 100 });
@@ -1703,7 +1705,9 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
     let older = oldestId ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId }) : [];
 
     // 2. DB exhausted → pull from WAHA
-    if (!older.length && !_msgNoMoreOlder) {
+    // Skip if loadMessages already did a full sync moments ago (avoids double-sync on short chats
+    // where the sentinel fires immediately because all messages fit on screen).
+    if (!older.length && !_msgNoMoreOlder && !_msgJustSynced) {
       try {
         await Api.inbox.syncMessages(chatId, Math.min((current.length || 0) + 150, 500));
         older = oldestId
@@ -1711,6 +1715,7 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
           : await Api.inbox.messages(chatId, { limit: 50 });
       } catch(_) {}
     }
+    _msgJustSynced = false; // consume the guard — subsequent scroll-ups can WAHA sync normally
 
     document.getElementById('older-spinner')?.remove();
 
