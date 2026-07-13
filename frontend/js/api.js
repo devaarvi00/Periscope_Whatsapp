@@ -118,15 +118,18 @@ const Api = (() => {
 
   // Phones
   const phones = {
-    list:      ()    => get('/phones'),
-    create:    (b)   => post('/phones', b),
-    status:    (id)  => get(`/phones/${id}/status`),
-    qr:        (id)  => get(`/phones/${id}/qr`),
-    start:     (id)  => post(`/phones/${id}/start`),
-    stop:      (id)  => post(`/phones/${id}/stop`),
-    restart:   (id)  => post(`/phones/${id}/restart`),
-    clearData: (id)  => post(`/phones/${id}/clear-data`),
-    del:       (id)  => del(`/phones/${id}`),
+    list:       ()   => get('/phones'),
+    create:     (b)  => post('/phones', b),
+    connect:    ()   => post('/phones/connect', {}),
+    syncNumber: (id) => post(`/phones/${id}/sync-number`, {}),
+    status:     (id) => get(`/phones/${id}/status`),
+    qr:         (id) => get(`/phones/${id}/qr`),
+    start:      (id) => post(`/phones/${id}/start`),
+    stop:       (id) => post(`/phones/${id}/stop`),
+    restart:    (id) => post(`/phones/${id}/restart`),
+    logout:     (id) => post(`/phones/${id}/logout`, {}),
+    clearData:  (id) => post(`/phones/${id}/clear-data`),
+    del:        (id) => del(`/phones/${id}`),
   };
 
   // Analytics

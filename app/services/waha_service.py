@@ -72,6 +72,17 @@ class WAHAService:
         resp = await get_http_client().post(url, headers=self._headers, json={})
         return resp.is_success
 
+    async def logout_session(self) -> bool:
+        """Logout from WhatsApp and clear saved auth — next start will require QR scan."""
+        from app.core.http_client import get_http_client
+        await self.stop_session()
+        url = f"{self.base}/api/sessions/{self.session}/logout"
+        try:
+            resp = await get_http_client().post(url, headers=self._headers, json={})
+            return resp.is_success
+        except Exception:
+            return False
+
     async def get_qr(self) -> str | None:
         """Return QR code as a base64 data URI for display."""
         from app.core.http_client import get_http_client

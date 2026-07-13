@@ -2806,7 +2806,7 @@ async function renderSettings() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header"><h2>Settings</h2></div>
       <div class="tab-bar" id="settings-tabs">
-        <div class="tab active" data-tab="phones">Phone Numbers</div>
+        <div class="tab active" data-tab="phones">WhatsApp</div>
         <div class="tab" data-tab="labels">Labels</div>
         <div class="tab" data-tab="quickreplies">Quick Replies</div>
         <div class="tab" data-tab="agents">Agents</div>
@@ -2836,55 +2836,107 @@ async function loadSettingsTab(tab) {
   if (tab === 'phones') {
     try {
       const phones = await Api.phones.list();
-      el.innerHTML = `
-        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
-          <button class="btn btn-primary btn-sm" id="add-phone-btn">+ Add Phone</button>
-        </div>
-        <div class="settings-grid" id="phones-grid">
-          ${phones.map(p => `
-            <div class="content-card">
-              <div class="card-header">
-                ${esc(p.name||p.phone_number)}
-                <div class="header-actions">
-                  <span class="pill ${p.waha_status==='WORKING'?'pill-resolved':'pill-in_progress'}">${p.waha_status||'unknown'}</span>
-                </div>
-              </div>
-              <div class="card-body" style="font-size:12px;color:var(--text-2)">
-                <div>Number: <strong>${esc(p.phone_number)}</strong></div>
-                <div>Session: ${esc(p.session_name)}</div>
-                <div style="margin-top:.5rem;display:flex;gap:.35rem;flex-wrap:wrap">
-                  <button class="btn btn-secondary btn-sm phone-qr" data-pid="${p.id}">Show QR</button>
-                  <button class="btn btn-secondary btn-sm phone-start" data-pid="${p.id}">Start Session</button>
-                  <button class="btn btn-danger btn-sm phone-del" data-pid="${p.id}">Remove</button>
-                </div>
-              </div>
-            </div>`).join('')}
-        </div>`;
-      if (!phones.length) document.getElementById('phones-grid').innerHTML = `<p class="text-muted">No phones added yet</p>`;
+      const p = phones[0];
+      const connected = p && p.waha_status === 'WORKING';
 
-      document.getElementById('add-phone-btn').addEventListener('click', () => showPhoneModal());
-      el.querySelectorAll('.phone-qr').forEach(btn => {
-        btn.addEventListener('click', async () => {
+      el.innerHTML = `
+        <div style="max-width:400px;margin:2rem auto;text-align:center">
+          <div class="content-card" style="padding:2rem 1.5rem">
+            <div style="margin-bottom:1.5rem">
+              <div style="width:64px;height:64px;border-radius:50%;background:${connected?'#dcfce7':'#f3f4f6'};display:flex;align-items:center;justify-content:center;margin:0 auto .75rem">
+                ${connected
+                  ? `<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#15803d" stroke-width="2.2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`
+                  : `<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`
+                }
+              </div>
+              <div style="font-weight:700;font-size:15px">${connected ? 'WhatsApp Connected' : 'WhatsApp Not Connected'}</div>
+              <div style="font-size:12px;color:var(--text-2);margin-top:.25rem">${connected ? 'Your WhatsApp session is active' : 'Scan QR code to connect your WhatsApp'}</div>
+            </div>
+            <div id="phone-qr-area" style="margin-bottom:1.25rem"></div>
+            <div style="display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center">
+              ${connected
+                ? `<button class="btn btn-secondary btn-sm" id="phone-btn-reconnect">Show QR / Reconnect</button>
+                   <button class="btn btn-danger btn-sm" id="phone-btn-disconnect">Disconnect</button>`
+                : `<button class="btn btn-primary" id="phone-btn-connect">Connect WhatsApp</button>`
+              }
+            </div>
+          </div>
+        </div>`;
+
+      async function startQrFlow(phoneId) {
+        const area = document.getElementById('phone-qr-area');
+        if (!area) return;
+        area.innerHTML = `<div class="spinner" style="margin:.5rem auto"></div>`;
+        let _syncTimer = null;
+        let _pollTimer = null;
+        let attempt = 0;
+        async function pollQr() {
+          if (!document.getElementById('phone-qr-area')) { clearInterval(_pollTimer); clearInterval(_syncTimer); return; }
           try {
-            const res = await Api.phones.qr(btn.dataset.pid);
-            showModal('Scan QR Code', `<div style="text-align:center"><img src="${res.qr||res}" style="max-width:260px;border-radius:4px"><p class="text-muted" style="margin-top:.5rem">Scan with WhatsApp to connect</p></div>`);
-          } catch(e) { toast(e.message, 'error'); }
-        });
+            const r = await Api.phones.qr(phoneId);
+            if (r && r.qr) {
+              area.innerHTML = `
+                <img src="${r.qr}" style="max-width:200px;border-radius:8px;border:1px solid var(--border);display:block;margin:0 auto">
+                <p style="font-size:11.5px;color:var(--text-2);margin:.6rem 0 0">Open WhatsApp → Linked Devices → Link a Device → Scan</p>`;
+              if (!_syncTimer) {
+                _syncTimer = setInterval(async () => {
+                  try {
+                    const s = await Api.phones.status(phoneId);
+                    if (s.status === 'WORKING') {
+                      clearInterval(_syncTimer); clearInterval(_pollTimer);
+                      await Api.phones.syncNumber(phoneId).catch(() => {});
+                      toast('WhatsApp connected!', 'success');
+                      loadSettingsTab('phones'); loadPhones();
+                    }
+                  } catch(_) {}
+                }, 4000);
+              }
+            } else {
+              area.innerHTML = `<p style="font-size:12px;color:var(--text-2)">Waiting for QR…</p>`;
+            }
+          } catch(e) { area.innerHTML = `<p style="font-size:12px;color:var(--danger)">${esc(e.message)}</p>`; }
+          attempt++;
+        }
+        _pollTimer = setInterval(pollQr, 7000);
+        await pollQr();
+      }
+
+      async function logoutAndShowQR(phoneId, btn, originalLabel) {
+        if (btn) { btn.disabled = true; btn.textContent = 'Clearing session…'; }
+        try {
+          await Api.phones.logout(phoneId).catch(() => {});
+          await new Promise(r => setTimeout(r, 1500)); // give WAHA time to clear
+          await Api.phones.start(phoneId).catch(() => {});
+          await new Promise(r => setTimeout(r, 1500)); // give WAHA time to enter QR state
+          if (btn) btn.textContent = 'Loading QR…';
+          await startQrFlow(phoneId);
+        } catch(err) {
+          toast(err.message, 'error');
+          if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+        }
+      }
+
+      document.getElementById('phone-btn-connect')?.addEventListener('click', async (e) => {
+        const res = await Api.phones.connect().catch(err => { toast(err.message, 'error'); return null; });
+        if (!res) return;
+        await logoutAndShowQR(res.phone_id, e.target, 'Connect WhatsApp');
       });
-      el.querySelectorAll('.phone-start').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          try { await Api.phones.start(btn.dataset.pid); toast('Session started', 'success'); loadSettingsTab('phones'); }
-          catch(e) { toast(e.message, 'error'); }
-        });
+
+      document.getElementById('phone-btn-reconnect')?.addEventListener('click', async (e) => {
+        if (!p) return;
+        await logoutAndShowQR(p.id, e.target, 'Show QR / Reconnect');
       });
-      el.querySelectorAll('.phone-del').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          if (!confirm('Remove phone?')) return;
-          try { await Api.phones.del(btn.dataset.pid); toast('Removed', 'success'); loadSettingsTab('phones'); loadPhones(); }
-          catch(e) { toast(e.message, 'error'); }
-        });
+
+      document.getElementById('phone-btn-disconnect')?.addEventListener('click', async () => {
+        if (!p || !confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
+        try {
+          await Api.phones.logout(p.id);
+          toast('Disconnected — scan QR to reconnect', 'success');
+          loadSettingsTab('phones'); loadPhones();
+        } catch(e) { toast(e.message, 'error'); }
       });
-    } catch(_) { el.innerHTML = '<div class="loading-center text-muted">Could not load phones</div>'; }
+
+    } catch(_) { el.innerHTML = '<div class="loading-center text-muted">Could not load WhatsApp status</div>'; }
   }
 
   else if (tab === 'labels') {
@@ -3275,25 +3327,6 @@ async function loadSettingsTab(tab) {
   }
 }
 
-function showPhoneModal() {
-  showModal('Add Phone Number', `
-    <div class="form-group"><label>Display Name</label><input type="text" id="ph-name" placeholder="e.g. Sales, Support"></div>
-    <div class="form-group"><label>Phone Number *</label><input type="text" id="ph-number" placeholder="+1234567890"></div>
-    <div class="form-group"><label>WAHA Session Name *</label><input type="text" id="ph-session" placeholder="e.g. sales-session"></div>
-    <div class="modal-footer">
-      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="ph-save">Add Phone</button>
-    </div>`);
-  document.getElementById('ph-save').addEventListener('click', async () => {
-    const number = document.getElementById('ph-number').value.trim();
-    const session = document.getElementById('ph-session').value.trim();
-    if (!number || !session) return toast('Number and session required', 'error');
-    try {
-      await Api.phones.create({ name: document.getElementById('ph-name').value, phone_number: number, session_name: session });
-      closeModal(); toast('Phone added', 'success'); loadSettingsTab('phones'); loadPhones();
-    } catch(e) { toast(e.message, 'error'); }
-  });
-}
 
 // ── DASHBOARD VIEW ──────────────────────────────────────────────── //
 function _stopDashWahaPoller() {
@@ -3323,9 +3356,9 @@ async function _updateDashWaha(phoneId) {
           </div>
           <span style="font-size:12px;font-weight:600;color:#15803d;background:#dcfce7;padding:.25rem .75rem;border-radius:20px">Connected</span>
         </div>`;
-        label.innerHTML = `<strong style="font-size:13px">Aarvi Technology</strong><br><span style="font-size:11px;color:var(--text-3)">+919510715498 · session: default</span>`;
+        label.innerHTML = `<strong style="font-size:13px">WhatsApp</strong><br><span style="font-size:11px;color:var(--text-3)">Session active</span>`;
         actions.innerHTML = `
-          <button class="btn btn-secondary btn-sm" id="dash-btn-stop">Stop</button>
+          <button class="btn btn-danger btn-sm" id="dash-btn-stop">Disconnect</button>
           <button class="btn btn-primary btn-sm" id="dash-btn-restart">Restart</button>`;
         _bindDashWahaButtons(phoneId);
       }
@@ -3368,7 +3401,7 @@ async function _updateDashWaha(phoneId) {
           <span style="font-size:12px;font-weight:600;color:#dc2626;background:#fee2e2;padding:.25rem .75rem;border-radius:20px">Disconnected</span>
         </div>`;
         label.innerHTML = `Session is stopped`;
-        actions.innerHTML = `<button class="btn btn-primary btn-sm" id="dash-btn-start">Start Session</button>`;
+        actions.innerHTML = `<button class="btn btn-primary btn-sm" id="dash-btn-start">Scan QR to Connect</button>`;
         _bindDashWahaButtons(phoneId);
       }
 
@@ -3391,14 +3424,67 @@ async function _updateDashWaha(phoneId) {
   }
 }
 
+async function _dashShowQR(phoneId) {
+  // Logout clears WAHA auth → next start forces fresh QR
+  const box = document.getElementById('dash-waha-box');
+  const lbl = document.getElementById('dash-waha-label');
+  const act = document.getElementById('dash-waha-actions');
+  if (box) box.innerHTML = `<div style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>`;
+  if (lbl) lbl.innerHTML = 'Clearing session…';
+  if (act) act.innerHTML = '';
+
+  await Api.phones.logout(phoneId).catch(() => {});
+  await new Promise(r => setTimeout(r, 1500));
+  await Api.phones.start(phoneId).catch(() => {});
+  await new Promise(r => setTimeout(r, 1500));
+
+  if (lbl) lbl.innerHTML = 'Loading QR…';
+
+  let attempts = 0;
+  async function pollDashQR() {
+    if (!document.getElementById('dash-waha-box')) return; // navigated away
+    try {
+      const s = await Api.phones.status(phoneId);
+      const status = (s.status || '').toUpperCase();
+      if (status === 'WORKING') {
+        await Api.phones.syncNumber(phoneId).catch(() => {});
+        toast('WhatsApp connected!', 'success');
+        _dashWahaPrevStatus = '';
+        _startDashWahaPoller(phoneId);
+        return;
+      }
+      const r = await Api.phones.qr(phoneId);
+      if (r && r.qr) {
+        const b = document.getElementById('dash-waha-box');
+        const l = document.getElementById('dash-waha-label');
+        const a = document.getElementById('dash-waha-actions');
+        if (b) b.innerHTML = `<img src="${r.qr}" style="width:100%;height:100%;object-fit:contain;display:block" alt="QR">`;
+        if (l) l.innerHTML = `Scan with WhatsApp<br><span style="font-size:11px;color:var(--text-3)">Settings → Linked Devices → Link a Device</span>`;
+        if (a) {
+          a.innerHTML = `<button class="btn btn-danger btn-sm" id="dash-btn-cancel-qr">Cancel</button>`;
+          document.getElementById('dash-btn-cancel-qr')?.addEventListener('click', () => {
+            Api.phones.stop(phoneId).catch(()=>{});
+            _dashWahaPrevStatus = '';
+            _startDashWahaPoller(phoneId);
+          });
+        }
+      } else if (attempts < 5) {
+        if (lbl) lbl.innerHTML = `Waiting for QR… (${attempts+1})`;
+      }
+    } catch(_) {}
+    attempts++;
+    if (attempts < 30) setTimeout(pollDashQR, 5000);
+  }
+  pollDashQR();
+}
+
 function _bindDashWahaButtons(phoneId) {
   document.getElementById('dash-btn-stop')?.addEventListener('click', async () => {
+    if (!confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
     _stopDashWahaPoller();
     const btn = document.getElementById('dash-btn-stop');
-    if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
-    // Stop session and clear all synced WhatsApp data
-    await Api.phones.stop(phoneId).catch(()=>{});
-    await Api.phones.clearData(phoneId).catch(()=>{});
+    if (btn) { btn.disabled = true; btn.textContent = 'Disconnecting…'; }
+    await Api.phones.logout(phoneId).catch(() => {});
     _dashWahaPrevStatus = '';
     setTimeout(() => _startDashWahaPoller(phoneId), 1500);
   });
@@ -3406,17 +3492,13 @@ function _bindDashWahaButtons(phoneId) {
     _stopDashWahaPoller();
     const btn = document.getElementById('dash-btn-restart');
     if (btn) { btn.disabled = true; btn.textContent = 'Restarting…'; }
-    await Api.phones.restart(phoneId).catch(()=>{});
+    await Api.phones.restart(phoneId).catch(() => {});
     _dashWahaPrevStatus = '';
     setTimeout(() => _startDashWahaPoller(phoneId), 2000);
   });
   document.getElementById('dash-btn-start')?.addEventListener('click', async () => {
     _stopDashWahaPoller();
-    const btn = document.getElementById('dash-btn-start');
-    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
-    await Api.phones.start(phoneId).catch(()=>{});
-    _dashWahaPrevStatus = '';
-    setTimeout(() => _startDashWahaPoller(phoneId), 2000);
+    await _dashShowQR(phoneId);
   });
 }
 
@@ -3437,7 +3519,7 @@ async function renderDashboard() {
   const cards = [
     { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`, title: 'Bulk Messages', desc: 'Send personalized broadcast messages to multiple contacts at once.', action: 'bulk', label: 'Send Now' },
     { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>`, title: 'Manage Team', desc: 'Invite agents and assign roles to manage customer conversations.', action: 'settings', label: 'Invite Agents' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>`, title: 'Add Phones', desc: 'Connect your WhatsApp numbers to start receiving messages.', action: 'settings', label: 'Add Phone' },
+    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`, title: 'WhatsApp', desc: 'Connect your WhatsApp via QR code to start receiving messages.', action: 'settings', label: 'Connect' },
     { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>`, title: 'Manage Tickets', desc: 'Track and resolve customer support tickets from your inbox.', action: 'tickets', label: 'View Tickets' },
     { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>`, title: 'AI Agent', desc: 'Set up your Gemini AI agent to auto-handle conversations.', action: 'ai-agent', label: 'Configure AI' },
     { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`, title: 'Automation Rules', desc: 'Create rules to auto-assign, label and respond to messages.', action: 'automation', label: 'Create Rule' },
@@ -3516,8 +3598,7 @@ async function renderDashboard() {
 
         <div class="dash-side">
           <div class="phone-status-head">
-            <h3>Phone status</h3>
-            <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Add phone</button>
+            <h3>WhatsApp</h3>
           </div>
           <div id="dash-phone-cards"></div>
           <div class="dash-panel" style="margin-top:.4rem">
@@ -3567,10 +3648,11 @@ async function renderDashboard() {
     if (cardsEl) cardsEl.innerHTML = phones.map(p => {
       const ok = p.waha_status === 'WORKING';
       return `<div class="phone-card">
-        <div class="pc-avatar">${initials(p.name || p.phone_number)}</div>
+        <div class="pc-avatar" style="background:${ok?'#dcfce7':'#f3f4f6'};color:${ok?'#15803d':'#6b7280'}">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+        </div>
         <div class="pc-meta">
-          <div class="pc-number">${esc(p.phone_number)}</div>
-          <div class="pc-name">${esc(p.name || '')}</div>
+          <div class="pc-number">WhatsApp</div>
         </div>
         <div class="pc-status ${ok ? 'connected' : 'offline'}"><span class="dot"></span>${ok ? 'Connected' : esc(p.waha_status || 'Offline')}</div>
         <button class="pc-menu-btn" title="Manage in Settings" onclick="switchView('settings')">⋯</button>
@@ -3584,8 +3666,8 @@ async function renderDashboard() {
       const lbl = document.getElementById('dash-waha-label');
       const act = document.getElementById('dash-waha-actions');
       if (box) box.innerHTML = `<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="7" y="7" width="3" height="3" fill="#d1d5db" stroke="none"/><rect x="14" y="14" width="3" height="3" fill="#d1d5db" stroke="none"/></svg>`;
-      if (lbl) lbl.innerHTML = `Add a phone number to<br>generate QR code`;
-      if (act) act.innerHTML = `<button class="btn btn-secondary btn-sm" onclick="switchView('settings')">Add Phone</button>`;
+      if (lbl) lbl.innerHTML = `Scan QR to connect WhatsApp`;
+      if (act) act.innerHTML = `<button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect WhatsApp</button>`;
     }
   } catch(_) {}
 }
