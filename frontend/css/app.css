@@ -789,11 +789,18 @@ textarea{resize:vertical;min-height:80px;}
 
 /* Messages area */
 .messages-area{
-  flex:1;overflow-y:auto;padding:1rem 1.1rem;
+  flex:1;overflow-y:auto;padding:0 1.1rem 1rem;
   display:flex;flex-direction:column;gap:.35rem;
-  justify-content:flex-end;
   background:#f0f2f5;
   scrollbar-width:thin;scrollbar-color:#d1d5db transparent;
+}
+/* Fills empty space so messages always sit at the bottom */
+.msg-spacer{flex:1;min-height:0;}
+/* "Load older" button pins to top of the scroll area */
+.load-older-wrap{
+  position:sticky;top:0;z-index:2;
+  text-align:center;padding:.5rem 0;
+  background:linear-gradient(to bottom,#f0f2f5 60%,transparent);
 }
 .msg{display:flex;flex-direction:column;max-width:65%;}
 .msg.me{align-self:flex-end;align-items:flex-end;}

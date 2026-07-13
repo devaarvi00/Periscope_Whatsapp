@@ -255,6 +255,18 @@ async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depend
     except Exception:
         messages = []
 
+    _MEDIA_TYPES = {"image", "photo", "video", "audio", "ptt", "voice",
+                    "document", "pdf", "sticker", "gif", "location", "contact", "vcard"}
+    _MEDIA_LABELS = {
+        "image": "📷 Photo", "photo": "📷 Photo",
+        "video": "🎬 Video",
+        "audio": "🎤 Voice message", "voice": "🎤 Voice message", "ptt": "🎤 Voice message",
+        "document": "📄 Document", "pdf": "📄 Document",
+        "sticker": "🖼 Sticker", "gif": "🎞 GIF",
+        "location": "📍 Location",
+        "contact": "👤 Contact", "vcard": "👤 Contact",
+    }
+
     synced = 0
     for m in messages:
         raw_id = m.get("id") or {}
@@ -274,7 +286,15 @@ async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depend
         else:
             ts = datetime.utcnow()
 
-        msg_type = m.get("type", "text")
+        msg_type = str(m.get("type") or "text").lower()
+        # WAHA sometimes returns type:"chat" for media msgs — use hasMedia field too
+        waha_has_media = bool(m.get("hasMedia") or m.get("has_media"))
+        has_media = msg_type in _MEDIA_TYPES or waha_has_media
+
+        # Store a human-readable label as body so the chat bubble is never blank
+        if not body and has_media:
+            body = _MEDIA_LABELS.get(msg_type, "📎 Media")
+
         sender_name = m.get("notifyName") or m.get("pushName") or ""
         from_raw = m.get("from") or m.get("author") or ""
         if isinstance(from_raw, dict):
@@ -293,7 +313,7 @@ async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depend
                 "sender_number": sender_number,
                 "body": body,
                 "message_type": msg_type,
-                "has_media": msg_type not in ("text", "chat", ""),
+                "has_media": has_media,
                 "timestamp": ts,
             })
             synced += 1

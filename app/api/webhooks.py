@@ -95,7 +95,24 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         else:
             ts = datetime.utcnow()
 
-        msg_type = msg_data.get("type", "text")
+        _WEBHOOK_MEDIA_TYPES = {"image", "photo", "video", "audio", "ptt", "voice",
+                                 "document", "pdf", "sticker", "gif", "location", "contact", "vcard"}
+        _WEBHOOK_MEDIA_LABELS = {
+            "image": "📷 Photo", "photo": "📷 Photo",
+            "video": "🎬 Video",
+            "audio": "🎤 Voice message", "voice": "🎤 Voice message", "ptt": "🎤 Voice message",
+            "document": "📄 Document", "pdf": "📄 Document",
+            "sticker": "🖼 Sticker", "gif": "🎞 GIF",
+            "location": "📍 Location",
+            "contact": "👤 Contact", "vcard": "👤 Contact",
+        }
+        msg_type = str(msg_data.get("type") or "text").lower()
+        waha_has_media = bool(msg_data.get("hasMedia") or msg_data.get("has_media"))
+        has_media = msg_type in _WEBHOOK_MEDIA_TYPES or waha_has_media
+        # Ensure media messages always have a displayable body
+        if not body and has_media:
+            body = _WEBHOOK_MEDIA_LABELS.get(msg_type, "📎 Media")
+
         sender_name = msg_data.get("notifyName") or msg_data.get("pushName") or ""
         sender_number = ""
         from_raw = msg_data.get("from") or msg_data.get("author") or ""
@@ -113,7 +130,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             "sender_number": sender_number,
             "body": body,
             "message_type": msg_type,
-            "has_media": msg_type not in ("text", "chat", ""),
+            "has_media": has_media,
             "timestamp": ts,
         })
 

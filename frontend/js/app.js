@@ -1524,8 +1524,8 @@ async function loadMessages(chatId, _alreadySynced) {
   try {
     let messages = await Api.inbox.messages(chatId, { limit: 100 });
     // Auto-fetch from WAHA when we have very few messages (first open or just synced)
-    if (messages.length < 5 && !_alreadySynced) {
-      try { await Api.inbox.syncMessages(chatId, 100); } catch(_) {}
+    if (messages.length < 10 && !_alreadySynced) {
+      try { await Api.inbox.syncMessages(chatId, 200); } catch(_) {}
       messages = await Api.inbox.messages(chatId, { limit: 100 });
     }
     State.inbox.messages = messages;
@@ -1537,12 +1537,13 @@ async function loadMessages(chatId, _alreadySynced) {
       .concat(notes.map(n => ({ kind: 'note', ts: n.created_at, item: n })))
       .sort((a, b) => new Date(a.ts) - new Date(b.ts));
 
+    const msgHtml = thread.map(t => t.kind === 'note' ? renderNoteBubble(t.item) : renderMessage(t.item, isGroup)).join('');
     area.innerHTML =
-      `<div style="text-align:center;padding:.35rem 0">
-        <button class="btn btn-secondary btn-sm" id="load-older-btn">↺ Load older messages</button>
-      </div>` +
-      (thread.map(t => t.kind === 'note' ? renderNoteBubble(t.item) : renderMessage(t.item, isGroup)).join('') ||
-        `<div class="empty-state" style="flex:none;padding:2rem"><p>No messages yet — try Load older messages</p></div>`);
+      `<div class="load-older-wrap">
+        <button class="btn btn-secondary btn-sm" id="load-older-btn" style="font-size:12px;padding:.3rem .75rem">↺ Load older messages</button>
+      </div>
+      <div class="msg-spacer"></div>` +
+      (msgHtml || `<div style="text-align:center;padding:1rem;font-size:13px;color:var(--text-3)">No messages yet</div>`);
     area.scrollTop = area.scrollHeight;
     document.getElementById('load-older-btn')?.addEventListener('click', () => loadOlderMessages(chatId, isGroup));
   } catch(e) {
@@ -1652,8 +1653,28 @@ function renderMessage(m, isGroup) {
       <span>${esc(m.body || 'Contact')}</span>
     </div>`;
   } else {
-    bubbleContent = m.body ? esc(m.body).replace(/\n/g, '<br>') : (m.has_media ? `<em style="opacity:.7">Media message</em>` : '');
+    // Covers text, chat, gif, and any unknown types from WAHA
+    if (m.body) {
+      bubbleContent = esc(m.body).replace(/\n/g, '<br>');
+    } else if (m.has_media) {
+      // Media message where type string wasn't specifically matched above
+      const _fallbackLabel = {
+        gif: '🎞 GIF', image: '📷 Photo', photo: '📷 Photo',
+        video: '🎬 Video', audio: '🎤 Voice', ptt: '🎤 Voice',
+        document: '📄 Document', sticker: '🖼 Sticker',
+      }[mtype] || '📎 Media';
+      bubbleContent = `<div class="msg-media-doc">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        <span>${_fallbackLabel}</span>
+      </div>`;
+    } else {
+      // Completely empty (deleted or system message) — show a dash so bubble is visible
+      bubbleContent = `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
+    }
   }
+
+  // Skip rendering if somehow bubbleContent is still blank (defensive)
+  if (!bubbleContent) bubbleContent = `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
 
   return `<div class="msg ${cls}" data-mid="${m.id || ''}">
     ${senderDisplay ? `<div class="msg-sender">${esc(senderDisplay)}</div>` : ''}
