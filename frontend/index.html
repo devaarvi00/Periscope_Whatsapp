@@ -256,6 +256,15 @@
 
 </div>
 
+<script>
+  (function() {
+    if (localStorage.getItem('token')) {
+      document.getElementById('login-screen').style.display = 'none';
+      document.getElementById('app-shell').style.display = 'flex';
+    }
+  })();
+</script>
+
 <!-- ASK AI FAB + PANEL -->
 <div class="ai-panel" id="ai-panel" style="display:none">
   <div class="ai-panel-head">
