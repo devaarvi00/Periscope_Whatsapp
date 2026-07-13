@@ -381,7 +381,7 @@ const VIEW_LABELS = {
   dashboard: 'Dashboard', inbox: 'Chats', tickets: 'Tickets',
   contacts: 'Contacts', 'chat-list': 'Chat List',
   analytics: 'Analytics', 'ai-agent': 'AI',
-  automation: 'Automation Rules', 'knowledge-base': 'Media',
+  automation: 'Automation Rules',
   bulk: 'Bulk Messages', settings: 'Settings',
   communities: 'Groups', logs: 'Logs', scheduled: 'Scheduled Messages',
 };
@@ -405,7 +405,7 @@ function navigateTo(view) {
     analytics:        renderAnalytics,
     'ai-agent':       renderAIAgent,
     automation:       renderAutomation,
-    'knowledge-base': renderKnowledgeBase,
+
     bulk:             renderBulk,
     settings:         renderSettings,
     communities:      renderCommunities,
@@ -2388,17 +2388,10 @@ async function renderAIAgent() {
           </div>
           <div class="card-body" id="ai-cfg-body"><div class="spinner"></div></div>
         </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+        <div style="margin-bottom:1rem">
           <div class="content-card">
             <div class="card-header">Active AI Chats</div>
             <div class="card-body" id="ai-chats-list"><div class="spinner"></div></div>
-          </div>
-          <div class="content-card">
-            <div class="card-header">
-              Knowledge Base
-              <div class="header-actions"><a href="#" id="goto-kb" style="font-size:12px;color:var(--accent)">Manage →</a></div>
-            </div>
-            <div class="card-body" id="ai-kb-preview"><div class="spinner"></div></div>
           </div>
         </div>
         <div class="content-card">
@@ -2416,8 +2409,6 @@ async function renderAIAgent() {
         </div>
       </div>
     </div>`;
-
-  document.getElementById('goto-kb').addEventListener('click', e => { e.preventDefault(); navigateTo('knowledge-base'); });
 
   // Agent Settings form (org-wide personalization + behavior)
   try {
@@ -2505,13 +2496,6 @@ async function renderAIAgent() {
         });
       });
     }
-  } catch(_) {}
-
-  try {
-    const items = await Api.kb.list({ limit: 5 });
-    const el = document.getElementById('ai-kb-preview');
-    if (!items.length) { el.innerHTML = `<p class="text-muted">No knowledge items yet</p>`; }
-    else { el.innerHTML = items.map(i => `<div style="font-size:13px;padding:.35rem 0;border-bottom:1px solid var(--border-light)">${esc(i.title)}</div>`).join(''); }
   } catch(_) {}
 
   document.getElementById('tl-btn').addEventListener('click', async () => {
@@ -2742,93 +2726,6 @@ async function showRuleModal() {
     try {
       await Api.automation.create({ name, trigger_type: document.getElementById('rl-trigger').value, criteria, actions });
       closeModal(); toast('Rule created', 'success'); loadRules();
-    } catch(e) { toast(e.message, 'error'); }
-  });
-}
-
-// ── KNOWLEDGE BASE ──────────────────────────────────────────────── //
-async function renderKnowledgeBase() {
-  const main = document.getElementById('main-content');
-  main.innerHTML = `
-    <div class="flex-col h-full" style="overflow-y:auto">
-      <div class="section-header">
-        <h2>Knowledge Base</h2>
-        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
-          <select id="kb-filter" style="font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:4px">
-            <option value="">All</option><option value="faq">FAQ</option><option value="document">Document</option>
-          </select>
-          <button class="btn btn-primary btn-sm" id="new-kb-btn">+ Add Item</button>
-        </div>
-      </div>
-      <div class="scroll-area" id="kb-list"><div class="loading-center"><div class="spinner"></div></div></div>
-    </div>`;
-  await loadKB();
-  document.getElementById('new-kb-btn').addEventListener('click', () => showKBModal());
-  document.getElementById('kb-filter').addEventListener('change', e => loadKB(e.target.value));
-}
-
-async function loadKB(type = '') {
-  const q = {};
-  if (type) q.item_type = type;
-  try {
-    const items = await Api.kb.list(q);
-    const el = document.getElementById('kb-list');
-    if (!el) return;
-    if (!items.length) { el.innerHTML = `<div class="loading-center text-muted">No knowledge items</div>`; return; }
-    el.innerHTML = items.map(i => `
-      <div class="kb-item">
-        <div class="kb-item-title">${esc(i.title)}</div>
-        <div class="kb-item-content">${esc((i.content||'').substring(0,200))}${i.content?.length > 200 ? '…' : ''}</div>
-        <div class="kb-item-footer">
-          <span class="pill ${i.status==='active'?'pill-resolved':'pill-in_progress'}">${i.status}</span>
-          <span class="text-muted">${i.item_type}</span>
-          ${i.is_self_learned ? '<span class="pill pill-open">AI Learned</span>' : ''}
-          <div style="margin-left:auto;display:flex;gap:.35rem">
-            ${i.status !== 'active' ? `<button class="btn btn-secondary btn-sm kb-approve" data-id="${i.id}">Approve</button>` : ''}
-            <button class="btn btn-ghost btn-sm kb-edit" data-id="${i.id}">Edit</button>
-            <button class="btn btn-danger btn-sm kb-del icon-btn" data-id="${i.id}" title="Delete"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button>
-          </div>
-        </div>
-      </div>`).join('');
-    el.querySelectorAll('.kb-approve').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        try { await Api.kb.approve(btn.dataset.id); toast('Approved', 'success'); loadKB(); }
-        catch(e) { toast(e.message, 'error'); }
-      });
-    });
-    el.querySelectorAll('.kb-del').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        if (!confirm('Delete?')) return;
-        try { await Api.kb.del(btn.dataset.id); toast('Deleted', 'success'); loadKB(); }
-        catch(e) { toast(e.message, 'error'); }
-      });
-    });
-    el.querySelectorAll('.kb-edit').forEach(btn => {
-      btn.addEventListener('click', () => showKBModal(items.find(i => i.id == btn.dataset.id)));
-    });
-  } catch(_) {}
-}
-
-function showKBModal(item = null) {
-  const i = item || {};
-  showModal(item ? 'Edit Knowledge Item' : 'New Knowledge Item', `
-    <div class="form-group"><label>Title *</label><input type="text" id="kb-title" value="${esc(i.title||'')}"></div>
-    <div class="form-group"><label>Type</label>
-      <select id="kb-type"><option ${i.item_type==='faq'?'selected':''} value="faq">FAQ</option><option ${i.item_type==='document'?'selected':''} value="document">Document</option></select>
-    </div>
-    <div class="form-group"><label>Content</label><textarea id="kb-content" style="min-height:120px">${esc(i.content||'')}</textarea></div>
-    <div class="modal-footer">
-      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="kb-save">Save</button>
-    </div>`);
-  document.getElementById('kb-save').addEventListener('click', async () => {
-    const title = document.getElementById('kb-title').value.trim();
-    if (!title) return toast('Title required', 'error');
-    try {
-      const body = { title, item_type: document.getElementById('kb-type').value, content: document.getElementById('kb-content').value };
-      if (item) await Api.kb.update(item.id, body);
-      else await Api.kb.create(body);
-      closeModal(); toast(item ? 'Updated' : 'Created', 'success'); loadKB();
     } catch(e) { toast(e.message, 'error'); }
   });
 }
@@ -3245,7 +3142,7 @@ async function showBulkModal() {
         name, message: msg,
         phone_id: parseInt(document.getElementById('bk-phone').value),
         recipient_chat_ids: [...selected].map(String),
-        scheduled_at: mode === 'now' ? null : schedule,
+        scheduled_at: mode === 'now' ? null : new Date(schedule).toISOString(),
         message_type: type,
         media_url: document.getElementById('bk-media').value.trim() || null,
         poll_options: type === 'poll'

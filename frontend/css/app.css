@@ -1045,17 +1045,6 @@ textarea{resize:vertical;min-height:80px;}
 .rule-actions-list{font-size:12.5px;color:var(--text-2);margin-top:.35rem;}
 .rule-controls{display:flex;gap:.3rem;flex-shrink:0;align-items:center;}
 
-/* ── Knowledge Items ───────────────────────────────────────────── */
-.kb-item{
-  background:var(--surface);border:1px solid var(--border);
-  border-left:3px solid var(--accent);border-radius:3px 9px 9px 3px;
-  padding:.9rem 1.1rem;margin-bottom:.5rem;
-  transition:box-shadow .15s;
-}
-.kb-item:hover{box-shadow:0 2px 8px rgba(0,0,0,.06);}
-.kb-item-title{font-size:13px;font-weight:600;color:var(--text);margin-bottom:.22rem;}
-.kb-item-content{font-size:12.5px;color:var(--text-2);line-height:1.55;}
-.kb-item-footer{display:flex;align-items:center;gap:.45rem;margin-top:.5rem;flex-wrap:wrap;}
 
 /* ── Contacts ─────────────────────────────────────────────────── */
 .contact-card{

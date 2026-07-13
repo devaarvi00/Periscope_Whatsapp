@@ -59,11 +59,11 @@ def _serialize(m: ScheduledMessage, chat_names: dict[int, str]) -> dict:
     return {
         "id": m.id, "chat_id": m.chat_id,
         "chat_name": chat_names.get(m.chat_id, ""),
-        "body": m.body, "send_at": m.send_at.isoformat(),
+        "body": m.body, "send_at": m.send_at.isoformat() + "Z",
         "repeat": m.repeat, "interval": m.interval or 1,
         "days_of_week": m.days_of_week or [],
         "day_of_month": m.day_of_month,
-        "end_date": m.end_date.isoformat() if m.end_date else None,
+        "end_date": (m.end_date.isoformat() + "Z") if m.end_date else None,
         "repeat_summary": _repeat_summary(m),
         "status": m.status,
         "sent_count": m.sent_count, "last_error": m.last_error,
