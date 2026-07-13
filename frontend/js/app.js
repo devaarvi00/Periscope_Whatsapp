@@ -778,8 +778,8 @@ async function loadChats() {
   // Refresh phone state from server so status is always current
   try { State.phones = await Api.phones.list(); } catch(_) {}
 
-  const phone = State.phones[0];
-  const phoneConnected = phone && phone.waha_status === 'WORKING';
+  const phoneConnected = State.phones.some(p => p.waha_status === 'WORKING');
+  const phone = State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
 
   // Hide all chats when WhatsApp is not connected — show a clear disconnected state
   if (!phoneConnected) {
@@ -879,7 +879,7 @@ function _filterChats(chats) {
   const f = State.inbox.filter;
   if (f === 'unread') return chats.filter(c => c.unread_count > 0);
   if (f === 'inbox') return chats.filter(c => !c.is_archived);
-  if (f === 'awaiting') return chats.filter(c => c.last_message_from_me === false || (c.unread_count === 0 && !c.last_from_me));
+  if (f === 'awaiting') return chats.filter(c => c.last_message_from_me === false);
   return chats;
 }
 
@@ -1620,7 +1620,7 @@ function renderThread(chat) {
 let _msgScrollObserver = null;
 let _msgLoadingOlder = false;
 let _msgNoMoreOlder = false;
-let _msgJustSynced = false; // true after loadMessages does a WAHA sync; skip re-sync in _fetchOlderMessages
+let _msgLastSyncedChatId = null; // chat ID that was most recently synced; prevents double-sync in _fetchOlderMessages
 
 async function loadMessages(chatId, _alreadySynced) {
   const area = document.getElementById('messages-area');
@@ -1631,7 +1631,7 @@ async function loadMessages(chatId, _alreadySynced) {
   // Reset older-load sentinels for this chat
   _msgLoadingOlder = false;
   _msgNoMoreOlder  = false;
-  _msgJustSynced   = false;
+  _msgLastSyncedChatId = null;
   if (_msgScrollObserver) { _msgScrollObserver.disconnect(); _msgScrollObserver = null; }
 
   // Show a slim loading skeleton immediately
@@ -1642,7 +1642,7 @@ async function loadMessages(chatId, _alreadySynced) {
   try {
     // Always do a live WAHA sync first (200 msgs) unless WS just reconnected
     if (!_alreadySynced) {
-      try { await Api.inbox.syncMessages(chatId, 200); _msgJustSynced = true; } catch(_) {}
+      try { await Api.inbox.syncMessages(chatId, 200); _msgLastSyncedChatId = chatId; } catch(_) {}
     }
 
     let messages = await Api.inbox.messages(chatId, { limit: 100 });
@@ -1698,24 +1698,25 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
 
   try {
     const current = State.inbox.messages || [];
-    const oldestId = current.length ? current[0].id : null;
+    const oldestTs = current.length ? current[0].timestamp : null;
     const prevScrollHeight = area.scrollHeight;
 
-    // 1. Try DB first
-    let older = oldestId ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId }) : [];
+    // 1. Try DB first using timestamp cursor (correct for historically-synced messages
+    //    that arrive with high IDs but early timestamps — id-based cursor misses them)
+    let older = oldestTs ? await Api.inbox.messages(chatId, { limit: 50, before_ts: oldestTs }) : [];
 
     // 2. DB exhausted → pull from WAHA
-    // Skip if loadMessages already did a full sync moments ago (avoids double-sync on short chats
-    // where the sentinel fires immediately because all messages fit on screen).
-    if (!older.length && !_msgNoMoreOlder && !_msgJustSynced) {
+    // Skip if loadMessages already synced this exact chat moments ago (avoids double-sync
+    // on short chats where the sentinel fires immediately because all msgs fit on screen).
+    if (!older.length && !_msgNoMoreOlder && _msgLastSyncedChatId !== chatId) {
       try {
         await Api.inbox.syncMessages(chatId, Math.min((current.length || 0) + 150, 500));
-        older = oldestId
-          ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId })
+        older = oldestTs
+          ? await Api.inbox.messages(chatId, { limit: 50, before_ts: oldestTs })
           : await Api.inbox.messages(chatId, { limit: 50 });
       } catch(_) {}
     }
-    _msgJustSynced = false; // consume the guard — subsequent scroll-ups can WAHA sync normally
+    _msgLastSyncedChatId = null; // consume the guard — subsequent scroll-ups can WAHA sync normally
 
     document.getElementById('older-spinner')?.remove();
 

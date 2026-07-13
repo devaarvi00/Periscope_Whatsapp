@@ -78,10 +78,25 @@ class InboxService:
         self.db.refresh(chat)
         return chat
 
-    def get_messages(self, chat_id: int, limit: int = 50, before_id: int | None = None) -> list[Message]:
+    def get_messages(self, chat_id: int, limit: int = 50,
+                     before_id: int | None = None,
+                     before_ts: str | None = None) -> list[Message]:
         q = self.db.query(Message).filter(Message.chat_id == chat_id)
-        if before_id:
-            q = q.filter(Message.id < before_id)
+        if before_ts:
+            # Timestamp cursor: correct even for historically-synced messages that
+            # arrive with new high IDs but old timestamps (id-based cursor misses them)
+            try:
+                ts = datetime.fromisoformat(before_ts.replace("Z", "").split(".")[0])
+                q = q.filter(Message.timestamp < ts)
+            except ValueError:
+                pass
+        elif before_id:
+            # Legacy fallback: find the pivot message and use its timestamp
+            pivot = self.db.query(Message.timestamp).filter(
+                Message.id == before_id, Message.chat_id == chat_id
+            ).scalar()
+            if pivot:
+                q = q.filter(Message.timestamp < pivot)
         return q.order_by(desc(Message.timestamp)).limit(limit).all()
 
     def upsert_message(self, data: dict[str, Any]) -> Message:

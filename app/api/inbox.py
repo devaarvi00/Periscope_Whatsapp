@@ -42,6 +42,8 @@ def list_chats(
     agent: Agent = Depends(get_current_agent),
 ):
     from app.core.permissions import allowed_phone_ids
+    from app.models.message import Message as _Msg
+    from sqlalchemy import func as _func
     svc = InboxService(db)
     chats = svc.list_chats(
         phone_id=phone_id,
@@ -55,6 +57,23 @@ def list_chats(
         offset=offset,
         phone_ids=allowed_phone_ids(db, agent),
     )
+    # Batch-fetch last message from_me for "awaiting reply" filter support
+    chat_ids = [c.id for c in chats]
+    last_from_me: dict[int, bool | None] = {}
+    if chat_ids:
+        id_subq = (
+            db.query(_Msg.chat_id, _func.max(_Msg.id).label("max_id"))
+            .filter(_Msg.chat_id.in_(chat_ids))
+            .group_by(_Msg.chat_id)
+            .subquery()
+        )
+        rows = (
+            db.query(_Msg.chat_id, _Msg.from_me)
+            .join(id_subq, _Msg.id == id_subq.c.max_id)
+            .all()
+        )
+        for cid, fm in rows:
+            last_from_me[cid] = fm
     result = []
     for c in chats:
         labels = svc.get_chat_label_ids(c.id)
@@ -74,6 +93,7 @@ def list_chats(
             "ai_state": c.ai_state,
             "assigned_to": c.assigned_to,
             "labels": labels,
+            "last_message_from_me": last_from_me.get(c.id),
         }
         result.append(d)
     return result
@@ -138,10 +158,11 @@ def get_messages(
     chat_id: int,
     limit: int = 50,
     before_id: int | None = None,
+    before_ts: str | None = None,
     db: Session = Depends(get_db),
 ):
     svc = InboxService(db)
-    msgs = svc.get_messages(chat_id, limit=limit, before_id=before_id)
+    msgs = svc.get_messages(chat_id, limit=limit, before_id=before_id, before_ts=before_ts)
     return [
         {
             "id": m.id, "chat_id": m.chat_id, "message_wid": m.message_wid,

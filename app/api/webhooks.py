@@ -52,6 +52,11 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             return
 
         inbox = InboxService(db)
+
+        # Dedup guard: if this message_wid is already in DB, a previous event (or
+        # another concurrent background task) already processed it — skip all side effects.
+        msg_already_exists = db.query(Message.id).filter(Message.message_wid == msg_wid).scalar() is not None
+
         chat = inbox.get_chat_by_wid(chat_wid)
         chat_is_new = chat is None
         notify_name = msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName") or ""
@@ -87,7 +92,6 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                 chat.name = str(notify_name)
                 db.commit()
 
-        from_me = bool(msg_data.get("fromMe", False))
         body = msg_data.get("body") or msg_data.get("caption") or ""
         ts_raw = msg_data.get("timestamp")
         if isinstance(ts_raw, (int, float)):
@@ -134,6 +138,10 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             "timestamp": ts,
         })
 
+        # Duplicate event (message.any fired twice, or race with another task) — stop here.
+        if msg_already_exists:
+            return
+
         if not from_me:
             chat.unread_count = (chat.unread_count or 0) + 1
             db.commit()
@@ -149,7 +157,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             sender_number=sender_number or "",
             timestamp=int(ts.timestamp()),
             message_type=msg_type,
-            has_media=msg_type not in ("text", "chat", ""),
+            has_media=has_media,
             chat_name=chat.name or "",
             unread_count=(chat.unread_count or 0),
         )
@@ -214,19 +222,25 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             reply = await ai.handle_incoming_message(chat, body, recent)
             if reply:
                 waha = WAHAService(session_name=session)
-                await waha.send_text(chat_wid, reply)
+                ai_result = await waha.send_text(chat_wid, reply)
                 ai_ts = datetime.utcnow()
-                inbox.upsert_message({
-                    "chat_id": chat.id,
-                    "phone_id": phone.id,
-                    "message_wid": f"ai_{msg_wid}",
-                    "from_me": True,
-                    "sender_name": "AI Agent",
-                    "sender_number": phone.phone_number,
-                    "body": reply,
-                    "message_type": "text",
-                    "timestamp": ai_ts,
-                })
+                # Use the real WAHA message_wid so the incoming message.any webhook
+                # deduplicates against this row instead of creating a second copy.
+                ai_wid = ai_result.message_id if ai_result.message_id else f"ai_{msg_wid}"
+                try:
+                    inbox.upsert_message({
+                        "chat_id": chat.id,
+                        "phone_id": phone.id,
+                        "message_wid": ai_wid,
+                        "from_me": True,
+                        "sender_name": "AI Agent",
+                        "sender_number": phone.phone_number,
+                        "body": reply,
+                        "message_type": "text",
+                        "timestamp": ai_ts,
+                    })
+                except Exception:
+                    pass  # Webhook may insert it first — not an error
                 from app.core.ws_manager import ws_manager as _ws
                 await _ws.emit_new_message(
                     chat_id=chat.id,
