@@ -178,6 +178,37 @@ function labelChip(label) {
   return `<span class="label-chip" style="background:${esc(label.color)}22;color:${esc(label.color)};border:1px solid ${esc(label.color)}55">${esc(label.name)}</span>`;
 }
 
+function formatTrigger(trigger) {
+  const map = {
+    message_received: '📩 Message Received',
+    message_keyword: '🔑 Keyword Match',
+    chat_created: '💬 Chat Created',
+    ticket_created: '🎫 Ticket Created',
+    ticket_updated: '🔄 Ticket Updated',
+    chat_assigned: '👤 Chat Assigned',
+    no_reply_timeout: '⏰ No Reply Timeout',
+    label_added: '🏷️ Label Added',
+  };
+  return map[trigger] || String(trigger).split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+function formatAction(action) {
+  const type = typeof action === 'object' ? action.type : action;
+  const map = {
+    send_message: '💬 Send Message',
+    assign_to_agent: '👤 Assign to Agent',
+    create_ticket: '🎫 Create Ticket',
+    add_label: '🏷️ Add Label',
+    remove_label: '🏷️ Remove Label',
+    flag_chat: '🚩 Flag Chat',
+    archive_chat: '📥 Archive Chat',
+    activate_ai: '🤖 Activate AI Agent',
+    send_note: '📝 Add Private Note',
+    escalate: '🚨 Escalate Alert',
+  };
+  return map[type] || String(type).split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
 // ── Auth ───────────────────────────────────────────────────────── //
 async function checkAuth() {
   if (!Api.getToken()) { showLogin(); return; }
@@ -553,10 +584,7 @@ function handleWSEvent(data) {
     // Update phone status in local state so loadChats() picks it up
     const ph = State.phones.find(p => p.id === d.phone_id);
     if (ph) ph.waha_status = d.status;
-    // Update topbar badge
-    const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
-    const numEl = document.getElementById('topbar-phone-num');
-    if (numEl) numEl.textContent = working;
+    updatePhoneBadge();
     // If phone became WORKING and we're on inbox, reload chats
     if (d.status === 'WORKING' && State.currentView === 'inbox') {
       _chatAutoSynced = false;
@@ -569,6 +597,7 @@ function handleWSEvent(data) {
     // WAHA session stopped — hide chats in UI (data stays in DB for when they reconnect)
     const ph = State.phones.find(p => p.id === d.phone_id);
     if (ph) ph.waha_status = 'STOPPED';
+    updatePhoneBadge();
     State.inbox.chats = [];
     State.inbox.selectedChatId = null;
     State.inbox.messages = [];
@@ -595,18 +624,41 @@ function handleWSEvent(data) {
 async function loadLabels() {
   try { State.labels = await Api.labels.list(); } catch(_) {}
 }
+function updatePhoneBadge() {
+  const badge = document.getElementById('topbar-phone-count');
+  const num = document.getElementById('topbar-phone-num');
+  const total = document.getElementById('topbar-phone-total');
+  const dot = badge ? badge.querySelector('.phone-dot') : null;
+  if (badge && num) {
+    const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
+    num.textContent = working;
+    if (total) total.textContent = State.phones.length;
+    badge.style.display = State.phones.length ? 'flex' : 'none';
+    if (dot) {
+      const totalCount = State.phones.length;
+      if (working === 0) {
+        dot.style.background = '#ef4444';
+        badge.style.background = '#fef2f2';
+        badge.style.borderColor = '#fecaca';
+        badge.style.color = '#991b1b';
+      } else if (working < totalCount) {
+        dot.style.background = '#f59e0b';
+        badge.style.background = '#fffbeb';
+        badge.style.borderColor = '#fde68a';
+        badge.style.color = '#92400e';
+      } else {
+        dot.style.background = '#10b981';
+        badge.style.background = '#f0fdf4';
+        badge.style.borderColor = '#bbf7d0';
+        badge.style.color = '#166534';
+      }
+    }
+  }
+}
 async function loadPhones() {
   try {
     State.phones = await Api.phones.list();
-    const badge = document.getElementById('topbar-phone-count');
-    const num = document.getElementById('topbar-phone-num');
-    const total = document.getElementById('topbar-phone-total');
-    if (badge && num) {
-      const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
-      num.textContent = working;
-      if (total) total.textContent = State.phones.length;
-      badge.style.display = State.phones.length ? 'flex' : 'none';
-    }
+    updatePhoneBadge();
   } catch(_) {}
 }
 
@@ -1564,21 +1616,37 @@ function renderThread(chat) {
   });
 }
 
+// Track per-chat scroll-fetch state
+let _msgScrollObserver = null;
+let _msgLoadingOlder = false;
+let _msgNoMoreOlder = false;
+
 async function loadMessages(chatId, _alreadySynced) {
   const area = document.getElementById('messages-area');
   if (!area) return;
   const chat = State.inbox.chats?.find(c => c.id == chatId);
   const isGroup = chat?.is_group || false;
+
+  // Reset older-load sentinels for this chat
+  _msgLoadingOlder = false;
+  _msgNoMoreOlder  = false;
+  if (_msgScrollObserver) { _msgScrollObserver.disconnect(); _msgScrollObserver = null; }
+
+  // Show a slim loading skeleton immediately
+  area.innerHTML = `<div id="msg-loading-bar" style="display:flex;align-items:center;justify-content:center;padding:2rem;gap:.5rem;opacity:.6;font-size:13px;color:var(--text-3)">
+    <div class="spinner" style="width:16px;height:16px"></div> Loading messages…
+  </div>`;
+
   try {
-    let messages = await Api.inbox.messages(chatId, { limit: 100 });
-    // Auto-fetch from WAHA when we have very few messages (first open or just synced)
-    if (messages.length < 10 && !_alreadySynced) {
+    // Always do a live WAHA sync first (200 msgs) unless WS just reconnected
+    if (!_alreadySynced) {
       try { await Api.inbox.syncMessages(chatId, 200); } catch(_) {}
-      messages = await Api.inbox.messages(chatId, { limit: 100 });
     }
+
+    let messages = await Api.inbox.messages(chatId, { limit: 100 });
     State.inbox.messages = messages;
 
-    // Interleave private team notes into the thread (visible to team only)
+    // Interleave private team notes into the thread
     let notes = [];
     try { notes = await Api.notes.list(chatId); } catch(_) {}
     const thread = messages.map(m => ({ kind: 'msg', ts: m.timestamp, item: m }))
@@ -1586,16 +1654,84 @@ async function loadMessages(chatId, _alreadySynced) {
       .sort((a, b) => new Date(a.ts) - new Date(b.ts));
 
     const msgHtml = thread.map(t => t.kind === 'note' ? renderNoteBubble(t.item) : renderMessage(t.item, isGroup)).join('');
+
+    // Invisible sentinel div at the very top — triggers loading older messages when scrolled into view
     area.innerHTML =
-      `<div class="load-older-wrap">
-        <button class="btn btn-secondary btn-sm" id="load-older-btn" style="font-size:12px;padding:.3rem .75rem">↺ Load older messages</button>
-      </div>
-      <div class="msg-spacer"></div>` +
-      (msgHtml || `<div style="text-align:center;padding:1rem;font-size:13px;color:var(--text-3)">No messages yet</div>`);
+      `<div id="scroll-top-sentinel" style="height:1px;width:100%"></div>
+       <div class="msg-spacer"></div>` +
+      (msgHtml || `<div style="text-align:center;padding:1rem;font-size:13px;color:var(--text-3)">No messages yet — send the first one!</div>`);
+
     area.scrollTop = area.scrollHeight;
-    document.getElementById('load-older-btn')?.addEventListener('click', () => loadOlderMessages(chatId, isGroup));
+
+    // Attach IntersectionObserver for seamless infinite scroll upward
+    _attachScrollSentinel(chatId, isGroup, area);
   } catch(e) {
-    area.innerHTML = `<div class="loading-center text-muted">Could not load messages</div>`;
+    area.innerHTML = `<div class="loading-center text-muted">Could not load messages. Check your connection.</div>`;
+  }
+}
+
+function _attachScrollSentinel(chatId, isGroup, area) {
+  const sentinel = document.getElementById('scroll-top-sentinel');
+  if (!sentinel) return;
+  _msgScrollObserver = new IntersectionObserver(async (entries) => {
+    if (!entries[0].isIntersecting) return;
+    if (_msgLoadingOlder || _msgNoMoreOlder) return;
+    _msgLoadingOlder = true;
+    await _fetchOlderMessages(chatId, isGroup, area);
+    _msgLoadingOlder = false;
+  }, { root: area, threshold: 0.1 });
+  _msgScrollObserver.observe(sentinel);
+}
+
+async function _fetchOlderMessages(chatId, isGroup, area) {
+  const sentinel = document.getElementById('scroll-top-sentinel');
+  if (!sentinel || !area) return;
+
+  // Show tiny spinner above sentinel
+  const spinnerEl = document.createElement('div');
+  spinnerEl.id = 'older-spinner';
+  spinnerEl.style.cssText = 'display:flex;align-items:center;justify-content:center;padding:.5rem;gap:.4rem;font-size:12px;color:var(--text-3);opacity:.6';
+  spinnerEl.innerHTML = '<div class="spinner" style="width:12px;height:12px"></div> Loading older messages…';
+  sentinel.insertAdjacentElement('afterend', spinnerEl);
+
+  try {
+    const current = State.inbox.messages || [];
+    const oldestId = current.length ? current[0].id : null;
+    const prevScrollHeight = area.scrollHeight;
+
+    // 1. Try DB first
+    let older = oldestId ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId }) : [];
+
+    // 2. DB exhausted → pull from WAHA
+    if (!older.length && !_msgNoMoreOlder) {
+      try {
+        await Api.inbox.syncMessages(chatId, Math.min((current.length || 0) + 150, 500));
+        older = oldestId
+          ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId })
+          : await Api.inbox.messages(chatId, { limit: 50 });
+      } catch(_) {}
+    }
+
+    document.getElementById('older-spinner')?.remove();
+
+    if (!older.length) {
+      _msgNoMoreOlder = true;
+      // Show a permanent "no more" tag at the top
+      sentinel.insertAdjacentHTML('afterend',
+        `<div style="text-align:center;padding:.75rem;font-size:11px;color:var(--text-4);letter-spacing:.03em;opacity:.6">— beginning of conversation —</div>`);
+      if (_msgScrollObserver) { _msgScrollObserver.disconnect(); _msgScrollObserver = null; }
+      return;
+    }
+
+    // Prepend older messages into state
+    State.inbox.messages = older.concat(current);
+    const html = older.map(m => renderMessage(m, isGroup)).join('');
+    sentinel.insertAdjacentHTML('afterend', html);
+
+    // Keep viewport anchored so content doesn't jump
+    area.scrollTop = area.scrollHeight - prevScrollHeight;
+  } catch(e) {
+    document.getElementById('older-spinner')?.remove();
   }
 }
 
@@ -1608,42 +1744,6 @@ function renderNoteBubble(n) {
     </div>
     <div class="msg-info">${fmt(n.created_at)} · team only</div>
   </div>`;
-}
-
-async function loadOlderMessages(chatId, isGroup) {
-  const btn = document.getElementById('load-older-btn');
-  const area = document.getElementById('messages-area');
-  if (!btn || !area) return;
-  btn.disabled = true; btn.textContent = 'Loading…';
-  try {
-    const current = State.inbox.messages || [];
-    const oldestId = current.length ? current[0].id : null;
-
-    // First try older rows already in the DB
-    let older = oldestId ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId }) : [];
-
-    // DB exhausted — pull deeper history from WhatsApp via WAHA
-    if (!older.length) {
-      await Api.inbox.syncMessages(chatId, Math.min(current.length + 150, 500));
-      older = oldestId
-        ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId })
-        : await Api.inbox.messages(chatId, { limit: 50 });
-    }
-
-    if (!older.length) {
-      btn.textContent = 'No older messages';
-      setTimeout(() => { btn.disabled = false; btn.textContent = '↺ Load older messages'; }, 1500);
-      return;
-    }
-    State.inbox.messages = older.concat(current);
-    const prevHeight = area.scrollHeight;
-    btn.insertAdjacentHTML('afterend', older.map(m => renderMessage(m, isGroup)).join(''));
-    area.scrollTop = area.scrollHeight - prevHeight;   // keep viewport anchored
-    btn.disabled = false; btn.textContent = '↺ Load older messages';
-  } catch(e) {
-    toast(e.message, 'error');
-    btn.disabled = false; btn.textContent = '↺ Load older messages';
-  }
 }
 
 function renderMessage(m, isGroup) {
@@ -1937,7 +2037,7 @@ async function renderTickets() {
       <div class="section-header">
         <h2>Tickets</h2>
         <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem;align-items:center">
-          <select id="ticket-filter" style="font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:4px">
+          <select id="ticket-filter" style="font-size:12.5px;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:#ffffff;color:var(--text-2);font-weight:500;outline:none;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.05);transition:border-color 0.15s, box-shadow 0.15s;">
             <option value="">All statuses</option>
             <option value="open">Open</option>
             <option value="in_progress">In Progress</option>
@@ -1952,7 +2052,7 @@ async function renderTickets() {
           <div class="table-wrap">
             <table class="data-table">
               <thead>
-                <tr><th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Assigned</th><th>Due</th><th>SLA</th><th style="width:130px;text-align:right">Actions</th></tr>
+                <tr><th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Assigned</th><th>Due</th><th>SLA (Service Level Agreement)</th><th style="width:130px;text-align:right">Actions</th></tr>
               </thead>
               <tbody id="tickets-tbody"><tr><td colspan="8" style="text-align:center;padding:2rem"><div class="spinner"></div></td></tr></tbody>
             </table>
@@ -2444,16 +2544,31 @@ async function loadRules() {
     if (!el) return;
     if (!rules.length) { el.innerHTML = `<div class="loading-center text-muted">No automation rules yet</div>`; return; }
     el.innerHTML = rules.map(r => `
-      <div class="rule-card" style="margin-bottom:.65rem">
-        <div class="rule-info">
-          <div class="rule-name">${esc(r.name)}</div>
-          <div class="rule-trigger">Trigger: ${esc(r.trigger_type)} · Runs: ${r.runs_count || 0}</div>
-          <div class="rule-actions-list">Actions: ${(r.actions||[]).map(a => a.type||a).join(', ')}</div>
+      <div class="rule-card" style="margin-bottom:.75rem;padding:1.25rem;display:flex;align-items:flex-start;justify-content:space-between">
+        <div class="rule-info" style="flex:1;min-width:0">
+          <div class="rule-name" style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:0.5rem">${esc(r.name)}</div>
+          
+          <div class="rule-trigger" style="font-size:12.5px;color:var(--text-3);margin-bottom:0.6rem;display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap">
+            <span style="font-weight:600;color:var(--text-2)">Trigger:</span>
+            <span>${esc(formatTrigger(r.trigger_type))}</span>
+            <span style="color:var(--border);padding:0 2px">|</span>
+            <span style="font-weight:600;color:var(--text-2)">Runs:</span>
+            <span class="pill pill-closed" style="padding:1px 6px;font-size:11px;font-weight:600">${r.runs_count || 0}</span>
+          </div>
+          
+          <div class="rule-actions-list" style="font-size:12.5px;display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap">
+            <span style="font-weight:600;color:var(--text-3)">Actions:</span>
+            ${(r.actions||[]).map(a => `<span class="pill pill-open" style="font-size:11px;font-weight:600">${esc(formatAction(a))}</span>`).join('') || '<span class="text-muted">—</span>'}
+          </div>
         </div>
-        <div class="rule-controls">
-          <span class="${pillClass(r.is_active ? 'active' : 'inactive')}">${r.is_active ? 'Active' : 'Paused'}</span>
-          <button class="btn btn-ghost btn-sm rule-toggle" data-rid="${r.id}" data-active="${r.is_active}">${r.is_active ? 'Pause' : 'Resume'}</button>
-          <button class="btn btn-danger btn-sm rule-del" data-rid="${r.id}">Del</button>
+        
+        <div class="rule-controls" style="display:flex;align-items:center;gap:0.5rem;flex-shrink:0;margin-left:1.5rem">
+          <span class="${pillClass(r.is_active ? 'active' : 'inactive')}" style="font-size:11.5px;font-weight:600">${r.is_active ? 'Active' : 'Paused'}</span>
+          <button class="btn btn-ghost btn-sm rule-toggle" data-rid="${r.id}" data-active="${r.is_active}" style="color:var(--accent);font-weight:600;font-size:12px;padding:4px 8px">${r.is_active ? 'Pause' : 'Resume'}</button>
+          <button class="btn btn-ghost btn-sm rule-del" data-rid="${r.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Rule">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+            Delete
+          </button>
         </div>
       </div>`).join('');
 
@@ -3173,6 +3288,60 @@ async function renderSettings() {
   loadSettingsTab('phones');
 }
 
+function showAddPhoneModal() {
+  showModal('Add WhatsApp Number', `
+    <div class="form-group">
+      <label>Display Name *</label>
+      <input type="text" id="add-ph-name" placeholder="e.g. Sales Support">
+    </div>
+    <div class="form-group">
+      <label>WAHA Session Name *</label>
+      <input type="text" id="add-ph-session" placeholder="e.g. sales_support (lowercase, alphanumeric, no spaces)" style="font-family:monospace">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="add-ph-save">Save & Connect</button>
+    </div>
+  `);
+
+  document.getElementById('add-ph-save').addEventListener('click', async () => {
+    const name = document.getElementById('add-ph-name').value.trim();
+    const session = document.getElementById('add-ph-session').value.trim();
+    if (!name || !session) return toast('All fields are required', 'error');
+    if (!/^[a-z0-9_-]+$/.test(session)) {
+      return toast('Session name must be lowercase alphanumeric and may contain dashes or underscores only.', 'error');
+    }
+    
+    try {
+      const res = await Api.phones.create({
+        name,
+        session_name: session,
+        phone_number: 'pending',
+        is_default: false
+      });
+      closeModal();
+      toast('WhatsApp session created! Initializing connection...', 'success');
+      loadSettingsTab('phones'); loadPhones();
+      
+      // Auto-connect after brief timeout so WAHA is ready
+      setTimeout(async () => {
+        try {
+          await Api.phones.start(res.id);
+          // Highlight/show QR immediately by opening the QR flow
+          loadSettingsTab('phones').then(() => {
+            const reconnectBtn = document.querySelector(`.phone-btn-reconnect[data-pid="${res.id}"]`) 
+                              || document.querySelector(`.phone-btn-connect[data-pid="${res.id}"]`);
+            if (reconnectBtn) reconnectBtn.click();
+          });
+        } catch(_) {}
+      }, 1000);
+      
+    } catch(e) {
+      toast(e.message, 'error');
+    }
+  });
+}
+
 async function loadSettingsTab(tab) {
   const el = document.getElementById('settings-content');
   if (!el) return;
@@ -3181,48 +3350,99 @@ async function loadSettingsTab(tab) {
   if (tab === 'phones') {
     try {
       const phones = await Api.phones.list();
-      const p = phones[0];
-      const connected = p && p.waha_status === 'WORKING';
-
-      el.innerHTML = `
-        <div style="max-width:400px;margin:2rem auto;text-align:center">
-          <div class="content-card" style="padding:2rem 1.5rem">
-            <div style="margin-bottom:1.5rem">
-              <div style="width:64px;height:64px;border-radius:50%;background:${connected?'#dcfce7':'#f3f4f6'};display:flex;align-items:center;justify-content:center;margin:0 auto .75rem">
-                ${connected
-                  ? `<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#15803d" stroke-width="2.2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`
-                  : `<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`
-                }
-              </div>
-              <div style="font-weight:700;font-size:15px">${connected ? 'WhatsApp Connected' : 'WhatsApp Not Connected'}</div>
-              <div style="font-size:12px;color:var(--text-2);margin-top:.25rem">${connected ? 'Your WhatsApp session is active' : 'Scan QR code to connect your WhatsApp'}</div>
+      
+      let html = `
+        <div class="flex-col gap-4">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid var(--border-light)">
+            <div>
+              <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">WhatsApp Sessions</h3>
+              <p style="margin:0;font-size:12.5px;color:var(--text-3)">Configure and connect multiple WhatsApp numbers to Hyperscope</p>
             </div>
-            <div id="phone-qr-area" style="margin-bottom:1.25rem"></div>
-            <div style="display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center">
-              ${connected
-                ? `<button class="btn btn-secondary btn-sm" id="phone-btn-reconnect">Show QR / Reconnect</button>
-                   <button class="btn btn-danger btn-sm" id="phone-btn-disconnect">Disconnect</button>`
-                : `<button class="btn btn-primary" id="phone-btn-connect">Connect WhatsApp</button>`
-              }
-            </div>
+            <button class="btn btn-primary btn-sm" id="btn-add-phone">+ Add WhatsApp Number</button>
           </div>
-        </div>`;
+          
+          <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:1rem">
+      `;
+      
+      if (!phones.length) {
+        html += `
+          <div class="content-card" style="grid-column:1/-1;padding:3rem 1.5rem;text-align:center;color:var(--text-3)">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin:0 auto 1rem;opacity:0.5"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+            <div style="font-weight:600;font-size:14px;color:var(--text-2)">No WhatsApp Sessions Configured</div>
+            <p style="font-size:12px;margin:0.25rem 0 1.25rem">Get started by adding your first WhatsApp number connection.</p>
+          </div>
+        `;
+      } else {
+        html += phones.map(p => {
+          const connected = p.waha_status === 'WORKING';
+          const statusText = p.waha_status || 'STOPPED';
+          let statusColor = '#ef4444'; // Red
+          let statusBg = '#fef2f2';
+          if (connected) {
+            statusColor = '#10b981'; // Green
+            statusBg = '#f0fdf4';
+          } else if (p.waha_status === 'SCAN_QR_CODE') {
+            statusColor = '#f59e0b'; // Orange
+            statusBg = '#fffbeb';
+          }
+          
+          return `
+            <div class="content-card" style="padding:1.25rem;display:flex;flex-direction:column;justify-content:space-between;border:1px solid ${connected ? '#bbf7d0' : 'var(--border)'}">
+              <div>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.75rem">
+                  <div>
+                    <h4 style="margin:0;font-size:14px;font-weight:600">${esc(p.name)}</h4>
+                    <span style="font-size:11px;color:var(--text-3);font-family:monospace">session: ${esc(p.session_name)}</span>
+                  </div>
+                  <span class="pill" style="background:${statusBg};color:${statusColor};border:1px solid ${statusColor}33;padding:1px 6px;font-size:10px">${statusText}</span>
+                </div>
+                
+                <div style="margin-bottom:1.25rem">
+                  <div style="font-size:12px;color:var(--text-3)">Phone Number:</div>
+                  <div style="font-size:14px;font-weight:500;color:var(--text)">
+                    ${p.phone_number && p.phone_number !== 'pending' ? '+' + p.phone_number : '<span style="color:#d97706;font-size:12px">⚠️ Pending connection</span>'}
+                  </div>
+                </div>
+                
+                <div id="phone-qr-area-${p.id}" style="margin-bottom:1rem"></div>
+              </div>
+              
+              <div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center">
+                ${connected
+                  ? `<button class="btn btn-secondary btn-sm phone-btn-reconnect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Reconnect / QR</button>
+                     <button class="btn btn-danger btn-sm phone-btn-disconnect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Disconnect</button>
+                     <button class="btn btn-ghost btn-sm phone-btn-clear" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px;color:#be123c" title="Delete all chats/messages for this phone from DB">Clear Data</button>`
+                  : `<button class="btn btn-primary btn-sm phone-btn-connect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Connect</button>`
+                }
+                <button class="btn btn-ghost btn-sm phone-btn-delete" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px;margin-left:auto;color:var(--danger)" title="Remove phone session from Hyperscope">Delete</button>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+      
+      html += `
+          </div>
+        </div>
+      `;
+      
+      el.innerHTML = html;
 
       async function startQrFlow(phoneId) {
-        const area = document.getElementById('phone-qr-area');
+        const area = document.getElementById(`phone-qr-area-${phoneId}`);
         if (!area) return;
         area.innerHTML = `<div class="spinner" style="margin:.5rem auto"></div>`;
         let _syncTimer = null;
         let _pollTimer = null;
         let attempt = 0;
         async function pollQr() {
-          if (!document.getElementById('phone-qr-area')) { clearInterval(_pollTimer); clearInterval(_syncTimer); return; }
+          if (!document.getElementById(`phone-qr-area-${phoneId}`)) { clearInterval(_pollTimer); clearInterval(_syncTimer); return; }
           try {
             const r = await Api.phones.qr(phoneId);
             if (r && r.qr) {
               area.innerHTML = `
                 <img src="${r.qr}" style="max-width:200px;border-radius:8px;border:1px solid var(--border);display:block;margin:0 auto">
-                <p style="font-size:11.5px;color:var(--text-2);margin:.6rem 0 0">Open WhatsApp → Linked Devices → Link a Device → Scan</p>`;
+                <p style="font-size:11px;color:var(--text-2);margin:.6rem 0 0;text-align:center">Open WhatsApp → Linked Devices → Link a Device → Scan</p>`;
               if (!_syncTimer) {
                 _syncTimer = setInterval(async () => {
                   try {
@@ -3232,7 +3452,6 @@ async function loadSettingsTab(tab) {
                       await Api.phones.syncNumber(phoneId).catch(() => {});
                       toast('WhatsApp connected! Syncing chats…', 'success');
                       loadSettingsTab('phones'); loadPhones();
-                      // Sync chats from WAHA then reload chat list
                       _chatAutoSynced = false;
                       try { await Api.inbox.sync(phoneId); } catch(_) {}
                       loadChats();
@@ -3241,9 +3460,9 @@ async function loadSettingsTab(tab) {
                 }, 4000);
               }
             } else {
-              area.innerHTML = `<p style="font-size:12px;color:var(--text-2)">Waiting for QR…</p>`;
+              area.innerHTML = `<p style="font-size:12px;color:var(--text-2);text-align:center">Waiting for QR…</p>`;
             }
-          } catch(e) { area.innerHTML = `<p style="font-size:12px;color:var(--danger)">${esc(e.message)}</p>`; }
+          } catch(e) { area.innerHTML = `<p style="font-size:12px;color:var(--danger);text-align:center">${esc(e.message)}</p>`; }
           attempt++;
         }
         _pollTimer = setInterval(pollQr, 7000);
@@ -3254,9 +3473,9 @@ async function loadSettingsTab(tab) {
         if (btn) { btn.disabled = true; btn.textContent = 'Clearing session…'; }
         try {
           await Api.phones.logout(phoneId).catch(() => {});
-          await new Promise(r => setTimeout(r, 1500)); // give WAHA time to clear
+          await new Promise(r => setTimeout(r, 1500));
           await Api.phones.start(phoneId).catch(() => {});
-          await new Promise(r => setTimeout(r, 1500)); // give WAHA time to enter QR state
+          await new Promise(r => setTimeout(r, 1500));
           if (btn) btn.textContent = 'Loading QR…';
           await startQrFlow(phoneId);
         } catch(err) {
@@ -3265,24 +3484,61 @@ async function loadSettingsTab(tab) {
         }
       }
 
-      document.getElementById('phone-btn-connect')?.addEventListener('click', async (e) => {
-        const res = await Api.phones.connect().catch(err => { toast(err.message, 'error'); return null; });
-        if (!res) return;
-        await logoutAndShowQR(res.phone_id, e.target, 'Connect WhatsApp');
+      document.getElementById('btn-add-phone')?.addEventListener('click', () => {
+        showAddPhoneModal();
       });
 
-      document.getElementById('phone-btn-reconnect')?.addEventListener('click', async (e) => {
-        if (!p) return;
-        await logoutAndShowQR(p.id, e.target, 'Show QR / Reconnect');
+      el.querySelectorAll('.phone-btn-connect').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const pid = parseInt(btn.dataset.pid);
+          await logoutAndShowQR(pid, btn, 'Connect');
+        });
       });
 
-      document.getElementById('phone-btn-disconnect')?.addEventListener('click', async () => {
-        if (!p || !confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
-        try {
-          await Api.phones.logout(p.id);
-          toast('Disconnected — scan QR to reconnect', 'success');
-          loadSettingsTab('phones'); loadPhones();
-        } catch(e) { toast(e.message, 'error'); }
+      el.querySelectorAll('.phone-btn-reconnect').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const pid = parseInt(btn.dataset.pid);
+          await logoutAndShowQR(pid, btn, 'Reconnect / QR');
+        });
+      });
+
+      el.querySelectorAll('.phone-btn-disconnect').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const pid = parseInt(btn.dataset.pid);
+          if (!confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
+          btn.disabled = true;
+          try {
+            await Api.phones.logout(pid);
+            toast('Disconnected — scan QR to reconnect', 'success');
+            loadSettingsTab('phones'); loadPhones();
+          } catch(e) { toast(e.message, 'error'); btn.disabled = false; }
+        });
+      });
+
+      el.querySelectorAll('.phone-btn-clear').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const pid = parseInt(btn.dataset.pid);
+          if (!confirm('WARNING: This will permanently delete all synced chats, messages, and associated tasks/tickets for this phone from the database. Proceed?')) return;
+          btn.disabled = true;
+          try {
+            await Api.phones.clearData(pid);
+            toast('Data cleared successfully!', 'success');
+            loadSettingsTab('phones'); loadPhones();
+          } catch(e) { toast(e.message, 'error'); btn.disabled = false; }
+        });
+      });
+
+      el.querySelectorAll('.phone-btn-delete').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const pid = parseInt(btn.dataset.pid);
+          if (!confirm('Remove this phone session from Hyperscope? This will deactivate the session.')) return;
+          btn.disabled = true;
+          try {
+            await Api.phones.del(pid);
+            toast('Phone session removed', 'success');
+            loadSettingsTab('phones'); loadPhones();
+          } catch(e) { toast(e.message, 'error'); btn.disabled = false; }
+        });
       });
 
     } catch(_) { el.innerHTML = '<div class="loading-center text-muted">Could not load WhatsApp status</div>'; }
@@ -3292,17 +3548,41 @@ async function loadSettingsTab(tab) {
     try {
       const lbls = await Api.labels.list();
       el.innerHTML = `
-        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+        <div style="margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center;padding-bottom:1rem;border-bottom:1px solid var(--border-light)">
+          <div>
+            <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">Labels</h3>
+            <p style="margin:0;font-size:12.5px;color:var(--text-3)">Manage labels to categorize chats and organize your inbox</p>
+          </div>
           <button class="btn btn-primary btn-sm" id="add-label-btn">+ New Label</button>
         </div>
-        ${lbls.map(l => `
-          <div style="display:flex;align-items:center;gap:.75rem;padding:.6rem .85rem;border-bottom:1px solid var(--border-light)">
-            <div style="width:14px;height:14px;border-radius:3px;background:${esc(l.color)};flex-shrink:0"></div>
-            <span style="font-weight:600;font-size:13px">${esc(l.name)}</span>
-            <div style="margin-left:auto;display:flex;gap:.35rem">
-              <button class="btn btn-danger btn-sm lbl-del" data-id="${l.id}">Del</button>
-            </div>
-          </div>`).join('') || '<p class="text-muted" style="padding:.5rem">No labels yet</p>'}`;
+        <div class="content-card">
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th style="width: 60px;">Color</th>
+                  <th>Label Name</th>
+                  <th style="text-align: right; width: 120px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${lbls.map(l => `
+                  <tr>
+                    <td>
+                      <div style="width:18px;height:18px;border-radius:4px;background:${esc(l.color)};border:1px solid rgba(0,0,0,0.15)"></div>
+                    </td>
+                    <td style="font-weight:600;font-size:13.5px;color:var(--text)">${esc(l.name)}</td>
+                    <td style="text-align: right;">
+                      <button class="btn btn-ghost btn-sm lbl-del" data-id="${l.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Label">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                        Delete
+                      </button>
+                    </td>
+                  </tr>`).join('') || `<tr><td colspan="3" class="text-muted" style="text-align:center;padding:2rem">No labels yet. Click "+ New Label" to create one.</td></tr>`}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
 
       document.getElementById('add-label-btn').addEventListener('click', () => {
         showModal('New Label', `
@@ -3333,17 +3613,39 @@ async function loadSettingsTab(tab) {
     try {
       const qrs = await Api.quickReplies.list();
       el.innerHTML = `
-        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+        <div style="margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center;padding-bottom:1rem;border-bottom:1px solid var(--border-light)">
+          <div>
+            <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">Quick Replies</h3>
+            <p style="margin:0;font-size:12.5px;color:var(--text-3)">Create shortcuts (starting with /) to quickly insert templates into the composer</p>
+          </div>
           <button class="btn btn-primary btn-sm" id="add-qr-btn">+ New Quick Reply</button>
         </div>
-        ${qrs.map(q => `
-          <div style="display:flex;align-items:flex-start;gap:.75rem;padding:.75rem .85rem;border-bottom:1px solid var(--border-light)">
-            <div style="flex:1">
-              <div style="font-weight:700;font-size:13px;color:var(--accent)">/${esc(q.command)}</div>
-              <div style="font-size:12px;color:var(--text-2);margin-top:.1rem">${esc(q.message)}</div>
-            </div>
-            <button class="btn btn-danger btn-sm qr-del" data-id="${q.id}">Del</button>
-          </div>`).join('') || '<p class="text-muted" style="padding:.5rem">No quick replies yet</p>'}`;
+        <div class="content-card">
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th style="width: 150px;">Shortcut</th>
+                  <th>Message Template</th>
+                  <th style="text-align: right; width: 120px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${qrs.map(q => `
+                  <tr>
+                    <td style="font-weight:700;font-size:13.5px;color:var(--accent);font-family:monospace">/${esc(q.command)}</td>
+                    <td style="font-size:13px;color:var(--text-2);word-break:break-all">${esc(q.message)}</td>
+                    <td style="text-align: right;">
+                      <button class="btn btn-ghost btn-sm qr-del" data-id="${q.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Quick Reply">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                        Delete
+                      </button>
+                    </td>
+                  </tr>`).join('') || `<tr><td colspan="3" class="text-muted" style="text-align:center;padding:2rem">No quick replies yet. Click "+ New Quick Reply" to create one.</td></tr>`}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
 
       document.getElementById('add-qr-btn').addEventListener('click', () => {
         showModal('New Quick Reply', `
@@ -3470,7 +3772,12 @@ async function loadSettingsTab(tab) {
                 <td><span class="pill pill-open" style="font-size:11px">${esc(d.prop_type)}</span></td>
                 <td style="font-size:12px;color:var(--text-3)">${(d.options || []).map(esc).join(', ') || '—'}</td>
                 <td>${d.required ? 'Yes' : 'No'}</td>
-                <td><button class="btn btn-danger btn-sm prop-del" data-pid="${d.id}">Delete</button></td>
+                <td>
+                  <button class="btn btn-ghost btn-sm prop-del" data-pid="${d.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Property">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                    Delete
+                  </button>
+                </td>
               </tr>`).join('')}</tbody>
             </table></div>
           </div>`).join('')
@@ -4189,9 +4496,17 @@ async function renderLogs() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
         <h2>Audit Logs</h2>
-        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
-          <select id="log-action-filter" style="max-width:220px"><option value="">All events</option></select>
-          <button class="btn btn-secondary btn-sm" id="log-export">Export CSV</button>
+        <div class="header-actions" style="margin-left:auto;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:.4rem">
+            <span style="font-size:12px;color:var(--text-3);font-weight:500">From:</span>
+            <input type="date" id="log-start-date" class="search-input" style="padding:4px 8px;font-size:12.5px;max-width:130px;height:30px">
+          </div>
+          <div style="display:flex;align-items:center;gap:.4rem">
+            <span style="font-size:12px;color:var(--text-3);font-weight:500">To:</span>
+            <input type="date" id="log-end-date" class="search-input" style="padding:4px 8px;font-size:12.5px;max-width:130px;height:30px">
+          </div>
+          <select id="log-action-filter" style="max-width:160px;height:30px;padding:4px 8px;font-size:12.5px;border-radius:6px;border:1px solid var(--border)"><option value="">All events</option></select>
+          <button class="btn btn-secondary btn-sm" id="log-export" style="height:30px;padding:4px 12px;font-size:12.5px">Export CSV</button>
         </div>
       </div>
       <div class="scroll-area">
@@ -4199,7 +4514,12 @@ async function renderLogs() {
           <div class="table-wrap">
             <table class="data-table">
               <thead>
-                <tr><th>Time</th><th>Event</th><th>Agent</th><th>Details</th></tr>
+                <tr>
+                  <th style="width: 170px;">Time</th>
+                  <th style="width: 150px;">Event</th>
+                  <th style="width: 150px;">Agent</th>
+                  <th>Details</th>
+                </tr>
               </thead>
               <tbody id="logs-tbody">
                 <tr><td colspan="4" style="text-align:center;padding:3rem"><div class="spinner"></div></td></tr>
@@ -4209,20 +4529,36 @@ async function renderLogs() {
         </div>
       </div>
     </div>`;
+
+  const startInput = document.getElementById('log-start-date');
+  const endInput = document.getElementById('log-end-date');
+  const actionSel = document.getElementById('log-action-filter');
+
+  function reloadWithFilters() {
+    let startVal = startInput.value;
+    let endVal = endInput.value;
+    let start_date = startVal ? `${startVal}T00:00:00.000Z` : undefined;
+    let end_date = endVal ? `${endVal}T23:59:59.999Z` : undefined;
+    loadLogsTable(actionSel.value, start_date, end_date);
+  }
+
+  startInput.addEventListener('change', reloadWithFilters);
+  endInput.addEventListener('change', reloadWithFilters);
+  actionSel.addEventListener('change', reloadWithFilters);
+
   document.getElementById('log-export').addEventListener('click', async () => {
     try { await Api.exports.logs(30); toast('Export downloaded', 'success'); }
     catch(e) { toast(e.message, 'error'); }
   });
+
   try {
     const actions = await Api.logs.actions();
-    const sel = document.getElementById('log-action-filter');
     actions.forEach(a => {
       const o = document.createElement('option');
       o.value = a;
       o.textContent = a.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-      sel.appendChild(o);
+      actionSel.appendChild(o);
     });
-    sel.addEventListener('change', () => loadLogsTable(sel.value));
   } catch(_) {}
   await loadLogsTable('');
 }
@@ -4253,22 +4589,36 @@ function formatLogEvent(action) {
   return `<span class="pill pill-open">${esc(titleText)}</span>`;
 }
 
-async function loadLogsTable(action) {
+async function loadLogsTable(action, start_date, end_date) {
   const tbody = document.getElementById('logs-tbody');
   if (!tbody) return;
   try {
-    const logs = await Api.logs.list(action ? { action } : undefined);
+    const params = {};
+    if (action) params.action = action;
+    if (start_date) params.start_date = start_date;
+    if (end_date) params.end_date = end_date;
+
+    const logs = await Api.logs.list(Object.keys(params).length ? params : undefined);
     if (!logs.length) {
       tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;padding:3rem;color:var(--text-3)">
-        No activity logs yet. Logs will appear here as your team uses the platform.</td></tr>`;
+        No activity logs match the filter criteria.</td></tr>`;
       return;
     }
-    tbody.innerHTML = logs.map(l => `<tr>
-      <td style="font-size:12px;color:var(--text-3);white-space:nowrap">${new Date(l.created_at).toLocaleString()}</td>
-      <td>${formatLogEvent(l.action)}</td>
-      <td>${esc(l.agent_name || 'System')}</td>
-      <td style="font-size:12.5px">${esc(l.description || '')}</td>
-    </tr>`).join('');
+    tbody.innerHTML = logs.map(l => {
+      let detailsHtml = esc(l.description || '');
+      if (l.metadata && Object.keys(l.metadata).length) {
+        detailsHtml += `
+          <div style="margin-top:0.35rem;font-size:11.5px;font-family:monospace;color:var(--text-3);background:var(--bg-light);padding:5px 8px;border-radius:4px;border:1px solid var(--border-light);max-width:650px;word-break:break-all">
+            ${esc(JSON.stringify(l.metadata))}
+          </div>`;
+      }
+      return `<tr>
+        <td style="font-size:12.5px;color:var(--text-3);white-space:nowrap;vertical-align:top;padding-top:10px">${new Date(l.created_at).toLocaleString()}</td>
+        <td style="vertical-align:top;padding-top:8px">${formatLogEvent(l.action)}</td>
+        <td style="font-size:13px;color:var(--text-2);vertical-align:top;padding-top:10px">${esc(l.agent_name || 'System')}</td>
+        <td style="font-size:13px;vertical-align:top;padding-top:10px">${detailsHtml}</td>
+      </tr>`;
+    }).join('');
   } catch(e) {
     tbody.innerHTML = `<tr><td colspan="4" class="text-muted" style="text-align:center;padding:2rem">${esc(e.message)}</td></tr>`;
   }
@@ -4551,7 +4901,6 @@ const NotifPrefs = {
     ['new_note', 'New Private Note'],
     ['ticket_assign', 'Ticket Assignment'],
     ['task_assign', 'Task Assignment'],
-    ['chat_assign', 'Chat Assignment'],
   ];
 
   function render() {

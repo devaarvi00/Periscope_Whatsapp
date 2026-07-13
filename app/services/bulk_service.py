@@ -108,14 +108,24 @@ class BulkService:
                 log_row.chat_id = chat.id
                 log_row.chat_name = chat.name or chat.chat_wid
                 text = self._render_variables(job.message, chat)
-                if job.message_type == "image" and job.media_url:
-                    await waha.send_image(chat.chat_wid, job.media_url, caption=text)
-                elif job.message_type == "file" and job.media_url:
-                    await waha.send_file(chat.chat_wid, job.media_url, caption=text)
-                elif job.message_type == "poll" and job.poll_options:
-                    await waha.send_poll(chat.chat_wid, text, [str(o) for o in job.poll_options])
+                if settings.environment == "development" and phone.waha_status != "WORKING":
+                    logger.warning("WAHA session %s status is %s (not WORKING) in development environment. Mocking bulk send to %s.", phone.session_name, phone.waha_status, chat.chat_wid)
+                    await asyncio.sleep(0.01)
                 else:
-                    await waha.send_text(chat.chat_wid, text)
+                    try:
+                        if job.message_type == "image" and job.media_url:
+                            await waha.send_image(chat.chat_wid, job.media_url, caption=text)
+                        elif job.message_type == "file" and job.media_url:
+                            await waha.send_file(chat.chat_wid, job.media_url, caption=text)
+                        elif job.message_type == "poll" and job.poll_options:
+                            await waha.send_poll(chat.chat_wid, text, [str(o) for o in job.poll_options])
+                        else:
+                            await waha.send_text(chat.chat_wid, text)
+                    except Exception as exc:
+                        if settings.environment == "development":
+                            logger.warning("WAHA bulk send failed in development, falling back to mock: %s", exc)
+                        else:
+                            raise exc
                 sent += 1
                 log_row.status = "sent"
                 self.db.add(log_row)

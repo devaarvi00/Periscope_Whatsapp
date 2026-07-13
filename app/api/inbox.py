@@ -20,6 +20,7 @@ from app.schemas.inbox import (
 from app.services.activity_service import log_activity
 from app.services.automation_service import fire_trigger
 from app.services.inbox_service import InboxService
+from app.core.config import settings
 from app.services.waha_service import WAHAService
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
@@ -170,16 +171,26 @@ async def send_message(
     if not phone:
         raise HTTPException(404, "Phone not found")
 
-    waha = WAHAService(session_name=phone.session_name)
-    try:
-        if req.message_type == "image" and req.media_url:
-            result = await waha.send_image(chat.chat_wid, req.media_url, caption=req.body)
-        elif req.message_type == "file" and req.media_url:
-            result = await waha.send_file(chat.chat_wid, req.media_url, caption=req.body)
-        else:
-            result = await waha.send_text(chat.chat_wid, req.body)
-    except Exception as exc:
-        raise HTTPException(500, f"Send failed: {exc}")
+    from app.services.waha_service import SendResult
+    import time
+    if settings.environment == "development" and phone.waha_status != "WORKING":
+        logger.warning("WAHA session %s status is %s (not WORKING) in development environment. Mocking message send.", phone.session_name, phone.waha_status)
+        result = SendResult(message_id=f"mock_{int(time.time())}_{chat.id}", raw={"status": "mock_sent"})
+    else:
+        waha = WAHAService(session_name=phone.session_name)
+        try:
+            if req.message_type == "image" and req.media_url:
+                result = await waha.send_image(chat.chat_wid, req.media_url, caption=req.body)
+            elif req.message_type == "file" and req.media_url:
+                result = await waha.send_file(chat.chat_wid, req.media_url, caption=req.body)
+            else:
+                result = await waha.send_text(chat.chat_wid, req.body)
+        except Exception as exc:
+            if settings.environment == "development":
+                logger.warning("WAHA send failed in development environment, falling back to mock: %s", exc)
+                result = SendResult(message_id=f"mock_{int(time.time())}_{chat.id}", raw={"status": "mock_sent"})
+            else:
+                raise HTTPException(500, f"Send failed: {exc}")
 
     try:
         from sqlalchemy.exc import IntegrityError

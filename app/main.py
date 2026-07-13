@@ -55,9 +55,17 @@ async def _configure_waha_webhook() -> None:
         phones = db.query(Phone).filter(Phone.is_active == True).all()
         for phone in phones:
             waha = WAHAService(session_name=phone.session_name)
+            status = await waha.get_session_status()
+            if status == "UNKNOWN":
+                logger.info("Session %s not running in WAHA. Starting it...", phone.session_name)
+                await waha.start_session()
+                await asyncio.sleep(1.0)  # Give WAHA a moment to initialize the session
+            
             ok = await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
             if ok:
                 logger.info("WAHA webhook configured for session %s", phone.session_name)
+            else:
+                logger.warning("Failed to configure WAHA webhook for session %s", phone.session_name)
     except Exception as exc:
         logger.warning("WAHA webhook config failed: %s", exc)
     finally:

@@ -45,17 +45,42 @@ def export_chats(
     agent: Agent = Depends(get_current_agent),
 ):
     chats = db.query(Chat).order_by(Chat.last_message_at.desc()).all()
-    rows = [
-        [c.id, c.chat_wid, c.name, "group" if c.is_group else "1:1", c.phone_id,
-         c.unread_count, c.is_flagged, c.is_archived, c.assigned_to,
-         c.last_message_at.isoformat() if c.last_message_at else ""]
-        for c in chats
-    ]
+    agents = {a.id: a.name for a in db.query(Agent).all()}
+    
+    from app.models.label import Label
+    from app.models.chat import ChatLabel
+    from app.models.property_definition import PropertyDefinition
+
+    chat_labels = db.query(ChatLabel.chat_id, Label.name).join(Label, ChatLabel.label_id == Label.id).all()
+    labels_by_chat = {}
+    for cid, lname in chat_labels:
+        labels_by_chat.setdefault(cid, []).append(lname)
+
+    prop_defs = {str(p.id): p.name for p in db.query(PropertyDefinition).filter(PropertyDefinition.entity == "chat").all()}
+
+    rows = []
+    for c in chats:
+        props_list = []
+        if c.custom_properties:
+            for pid, val in c.custom_properties.items():
+                pname = prop_defs.get(str(pid), f"Property {pid}")
+                props_list.append(f"{pname}: {val}")
+        props_str = "; ".join(props_list)
+
+        rows.append([
+            c.id, c.chat_wid, c.name, "group" if c.is_group else "1:1", c.phone_id,
+            c.unread_count, c.is_flagged, c.is_archived,
+            agents.get(c.assigned_to, "") if c.assigned_to else "",
+            ", ".join(labels_by_chat.get(c.id, [])),
+            props_str,
+            c.last_message_at.isoformat() if c.last_message_at else ""
+        ])
+
     _log_export(db, agent, "chats", len(rows))
     return _csv_response(
         "chats.csv",
         ["id", "chat_wid", "name", "type", "phone_id", "unread", "flagged",
-         "archived", "assigned_to", "last_message_at"],
+         "archived", "assigned_agent", "labels", "custom_properties", "last_message_at"],
         rows,
     )
 
@@ -73,7 +98,7 @@ def export_messages(
         q = q.filter(Message.chat_id == chat_id)
     msgs = q.order_by(Message.timestamp.asc()).limit(50000).all()
     rows = [
-        [m.id, m.chat_id, m.message_wid, "out" if m.from_me else "in",
+        [m.id, m.chat_id, m.phone_id, m.message_wid, "out" if m.from_me else "in",
          m.sender_name, m.sender_number, (m.body or "").replace("\n", " "),
          m.message_type, m.timestamp.isoformat()]
         for m in msgs
@@ -81,7 +106,7 @@ def export_messages(
     _log_export(db, agent, "messages", len(rows))
     return _csv_response(
         "messages.csv",
-        ["id", "chat_id", "message_wid", "direction", "sender_name",
+        ["id", "chat_id", "phone_id", "message_wid", "direction", "sender_name",
          "sender_number", "body", "type", "timestamp"],
         rows,
     )
@@ -93,19 +118,45 @@ def export_tickets(
     agent: Agent = Depends(get_current_agent),
 ):
     tickets = db.query(Ticket).order_by(Ticket.created_at.desc()).all()
-    rows = [
-        [t.id, t.chat_id, t.title, t.status.value, t.priority.value,
-         t.assigned_to, t.created_by, t.sla_breached,
-         t.due_date.isoformat() if t.due_date else "",
-         t.resolved_at.isoformat() if t.resolved_at else "",
-         t.created_at.isoformat() if t.created_at else ""]
-        for t in tickets
-    ]
+    agents = {a.id: a.name for a in db.query(Agent).all()}
+    
+    from app.models.label import Label
+    from app.models.ticket import TicketLabel
+    from app.models.property_definition import PropertyDefinition
+
+    ticket_labels = db.query(TicketLabel.ticket_id, Label.name).join(Label, TicketLabel.label_id == Label.id).all()
+    labels_by_ticket = {}
+    for tid, lname in ticket_labels:
+        labels_by_ticket.setdefault(tid, []).append(lname)
+
+    prop_defs = {str(p.id): p.name for p in db.query(PropertyDefinition).filter(PropertyDefinition.entity == "ticket").all()}
+
+    rows = []
+    for t in tickets:
+        props_list = []
+        if t.custom_properties:
+            for pid, val in t.custom_properties.items():
+                pname = prop_defs.get(str(pid), f"Property {pid}")
+                props_list.append(f"{pname}: {val}")
+        props_str = "; ".join(props_list)
+
+        rows.append([
+            t.id, t.chat_id, t.title, t.status.value, t.priority.value,
+            agents.get(t.assigned_to, "") if t.assigned_to else "",
+            agents.get(t.created_by, "") if t.created_by else "",
+            ", ".join(labels_by_ticket.get(t.id, [])),
+            t.sla_breached,
+            props_str,
+            t.due_date.isoformat() if t.due_date else "",
+            t.resolved_at.isoformat() if t.resolved_at else "",
+            t.created_at.isoformat() if t.created_at else ""
+        ])
+
     _log_export(db, agent, "tickets", len(rows))
     return _csv_response(
         "tickets.csv",
-        ["id", "chat_id", "title", "status", "priority", "assigned_to",
-         "created_by", "sla_breached", "due_date", "resolved_at", "created_at"],
+        ["id", "chat_id", "title", "status", "priority", "assigned_agent",
+         "created_by_agent", "labels", "sla_breached", "custom_properties", "due_date", "resolved_at", "created_at"],
         rows,
     )
 
@@ -116,16 +167,36 @@ def export_contacts(
     agent: Agent = Depends(get_current_agent),
 ):
     contacts = db.query(Contact).order_by(Contact.name.asc()).all()
+    
+    from app.models.label import Label
+    from app.models.contact import ContactLabel
+
+    contact_labels = db.query(ContactLabel.contact_id, Label.name).join(Label, ContactLabel.label_id == Label.id).all()
+    labels_by_contact = {}
+    for cid, lname in contact_labels:
+        labels_by_contact.setdefault(cid, []).append(lname)
+
     rows = []
     for c in contacts:
         number = c.phone_number
         if c.is_masked:
             number = number[:4] + "****" + number[-2:] if len(number) > 6 else "****"
-        rows.append([c.id, c.name, number, c.email or "", c.company or "", c.is_masked])
+            
+        props_list = []
+        if c.custom_properties:
+            for k, val in c.custom_properties.items():
+                props_list.append(f"{k}: {val}")
+        props_str = "; ".join(props_list)
+
+        rows.append([
+            c.id, c.name, number, c.email or "", c.company or "", c.is_masked,
+            ", ".join(labels_by_contact.get(c.id, [])), props_str
+        ])
+        
     _log_export(db, agent, "contacts", len(rows))
     return _csv_response(
         "contacts.csv",
-        ["id", "name", "phone_number", "email", "company", "masked"],
+        ["id", "name", "phone_number", "email", "company", "masked", "labels", "custom_properties"],
         rows,
     )
 

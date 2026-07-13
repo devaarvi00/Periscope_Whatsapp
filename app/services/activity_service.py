@@ -52,6 +52,8 @@ class ActivityService:
         entity_type: str | None = None,
         agent_id: int | None = None,
         search: str | None = None,
+        start_date: Any = None,
+        end_date: Any = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[ActivityLog]:
@@ -64,6 +66,10 @@ class ActivityService:
             q = q.filter(ActivityLog.agent_id == agent_id)
         if search:
             q = q.filter(ActivityLog.description.ilike(f"%{search}%"))
+        if start_date:
+            q = q.filter(ActivityLog.created_at >= start_date)
+        if end_date:
+            q = q.filter(ActivityLog.created_at <= end_date)
         return q.order_by(desc(ActivityLog.created_at)).offset(offset).limit(min(limit, 500)).all()
 
     def distinct_actions(self) -> list[str]:

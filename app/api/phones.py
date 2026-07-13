@@ -27,9 +27,13 @@ def list_phones(db: Session = Depends(get_db), agent=Depends(_current_agent)):
 
 @router.post("", response_model=PhoneOut, status_code=201)
 def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
-    existing = db.query(Phone).filter(Phone.phone_number == req.phone_number).first()
-    if existing:
-        raise HTTPException(400, "Phone number already registered")
+    existing_session = db.query(Phone).filter(Phone.session_name == req.session_name).first()
+    if existing_session:
+        raise HTTPException(400, "Session name already registered")
+    if req.phone_number and req.phone_number != "pending":
+        existing_num = db.query(Phone).filter(Phone.phone_number == req.phone_number).first()
+        if existing_num:
+            raise HTTPException(400, "Phone number already registered")
     phone = Phone(**req.model_dump())
     db.add(phone)
     db.commit()
@@ -43,7 +47,12 @@ async def get_status(phone_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    status = await waha.get_session_status()
+    try:
+        status = await waha.get_session_status()
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to query WAHA status for phone %s: %s", phone.session_name, exc)
+        status = "OFFLINE"
     phone.waha_status = status
     db.commit()
     return {"phone_id": phone_id, "status": status}
@@ -55,7 +64,12 @@ async def get_qr(phone_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    qr = await waha.get_qr()
+    try:
+        qr = await waha.get_qr()
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to query WAHA QR code for phone %s: %s", phone.session_name, exc)
+        qr = None
     return {"qr": qr}
 
 
@@ -65,7 +79,14 @@ async def start_session(phone_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    ok = await waha.start_session()
+    try:
+        ok = await waha.start_session()
+        if ok:
+            await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to start WAHA session %s: %s", phone.session_name, exc)
+        ok = False
     return {"ok": ok}
 
 
@@ -76,7 +97,12 @@ async def logout_session(phone_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    ok = await waha.logout_session()
+    try:
+        ok = await waha.logout_session()
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to logout WAHA session %s: %s", phone.session_name, exc)
+        ok = False
     phone.waha_status = "STOPPED"
     db.commit()
     # Notify all connected browser tabs immediately — don't wait for WAHA webhook
@@ -92,7 +118,12 @@ async def stop_session(phone_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    ok = await waha.stop_session()
+    try:
+        ok = await waha.stop_session()
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to stop WAHA session %s: %s", phone.session_name, exc)
+        ok = False
     return {"ok": ok}
 
 
@@ -102,7 +133,14 @@ async def restart_session(phone_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    ok = await waha.restart_session()
+    try:
+        ok = await waha.restart_session()
+        if ok:
+            await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to restart WAHA session %s: %s", phone.session_name, exc)
+        ok = False
     return {"ok": ok}
 
 
@@ -165,11 +203,25 @@ async def auto_connect(db: Session = Depends(get_db)):
         db.refresh(phone)
 
     waha = WAHAService(session_name=session_name)
-    status = await waha.get_session_status()
-    if status not in ("WORKING", "SCAN_QR_CODE"):
-        await waha.start_session()
+    try:
+        status = await waha.get_session_status()
+        if status not in ("WORKING", "SCAN_QR_CODE"):
+            await waha.start_session()
+            await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
+        else:
+            # Session is already started/working, make sure webhook is configured
+            await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to auto-connect session: %s", exc)
+        status = "OFFLINE"
 
-    qr = await waha.get_qr()
+    try:
+        qr = await waha.get_qr()
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to retrieve QR code for session %s: %s", session_name, exc)
+        qr = None
     return {"phone_id": phone.id, "qr": qr, "status": status}
 
 
@@ -180,12 +232,17 @@ async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
     if not phone:
         raise HTTPException(404, "Phone not found")
     waha = WAHAService(session_name=phone.session_name)
-    me = await waha.get_me()
-    number = me.get("id", "").split("@")[0] if me.get("id") else ""
-    if number:
-        phone.phone_number = number
-    status = await waha.get_session_status()
-    phone.waha_status = status
+    try:
+        me = await waha.get_me()
+        number = me.get("id", "").split("@")[0] if me.get("id") else ""
+        if number:
+            phone.phone_number = number
+        status = await waha.get_session_status()
+        phone.waha_status = status
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to sync phone number for phone %s: %s", phone.session_name, exc)
+        status = "OFFLINE"
     db.commit()
     db.refresh(phone)
     return {"phone_id": phone_id, "phone_number": phone.phone_number, "status": phone.waha_status}
