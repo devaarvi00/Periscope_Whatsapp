@@ -616,12 +616,17 @@ async function renderInbox() {
   });
 
   document.getElementById('sync-btn').addEventListener('click', async () => {
-    if (!State.phones[0]) return toast('No phones configured', 'error');
+    const phone = State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
+    if (!phone) return toast('No WhatsApp connected', 'error');
+    const btn = document.getElementById('sync-btn');
+    if (btn) btn.disabled = true;
     try {
-      await Api.inbox.sync(State.phones[0].id);
-      toast('Sync started', 'success');
-      setTimeout(loadChats, 2000);
-    } catch(e) { toast(e.message, 'error'); }
+      await Api.inbox.sync(phone.id);
+      _chatAutoSynced = false;
+      toast('Synced from WhatsApp', 'success');
+      await loadChats();
+    } catch(e) { toast(e.message || 'Sync failed — is WhatsApp connected?', 'error'); }
+    finally { if (btn) btn.disabled = false; }
   });
 
   // Label filter: show only chats carrying a chosen label
@@ -663,32 +668,46 @@ async function loadChats() {
   if (f === 'archived') q.is_archived = true;
   if (f === 'inbox') q.is_archived = false;
   if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
-  if (f === 'unread') {}
-  if (f === 'awaiting') {}
   if (State.inbox.labelFilter) q.label_id = State.inbox.labelFilter;
   if (State.inbox.search) q.search = State.inbox.search;
 
   try {
     let chats = await Api.inbox.chats(q);
-    // Auto-sync from WAHA once per session when inbox is empty
-    if (chats.length === 0 && !_chatAutoSynced && State.phones.length) {
+    if (!Array.isArray(chats)) chats = [];
+
+    const phone = State.phones[0];
+    const phoneConnected = phone && phone.waha_status === 'WORKING';
+
+    // Auto-sync from WAHA when inbox is empty and phone is connected
+    if (chats.length === 0 && !_chatAutoSynced && phone && phoneConnected) {
       _chatAutoSynced = true;
-      const phoneId = State.phones[0].id;
+      const chatList = document.getElementById('chat-list');
+      if (chatList) chatList.innerHTML = `<div class="loading-center" style="flex-direction:column;gap:.5rem">
+        <div class="spinner"></div>
+        <span style="font-size:12px;color:var(--text-3)">Syncing chats from WhatsApp…</span>
+      </div>`;
       try {
-        await Api.inbox.sync(phoneId);
+        await Api.inbox.sync(phone.id);
         chats = await Api.inbox.chats(q);
+        if (!Array.isArray(chats)) chats = [];
       } catch(_) {}
     }
+
     if (f === 'unread') chats = chats.filter(c => c.unread_count > 0);
-    if (f === 'inbox') chats = chats.filter(c => !c.is_archived && c.status !== 'closed');
-    // "awaiting reply" = chats where last message is from the customer (not from us)
+    if (f === 'inbox') chats = chats.filter(c => !c.is_archived);
     if (f === 'awaiting') chats = chats.filter(c => c.last_message_from_me === false || (c.unread_count === 0 && !c.last_from_me));
     State.inbox.chats = chats;
     renderChatList(chats);
     const total = chats.reduce((s, c) => s + (c.unread_count || 0), 0);
     const badge = document.getElementById('unread-badge');
     if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
-  } catch(_) {}
+  } catch(err) {
+    const chatList = document.getElementById('chat-list');
+    if (chatList) chatList.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:.5rem">
+      <span>Failed to load chats</span>
+      <button class="btn btn-secondary btn-sm" onclick="loadChats()">Retry</button>
+    </div>`;
+  }
 }
 
 function refreshChatList() { loadChats(); }
@@ -2885,8 +2904,12 @@ async function loadSettingsTab(tab) {
                     if (s.status === 'WORKING') {
                       clearInterval(_syncTimer); clearInterval(_pollTimer);
                       await Api.phones.syncNumber(phoneId).catch(() => {});
-                      toast('WhatsApp connected!', 'success');
+                      toast('WhatsApp connected! Syncing chats…', 'success');
                       loadSettingsTab('phones'); loadPhones();
+                      // Sync chats from WAHA then reload chat list
+                      _chatAutoSynced = false;
+                      try { await Api.inbox.sync(phoneId); } catch(_) {}
+                      loadChats();
                     }
                   } catch(_) {}
                 }, 4000);
@@ -3448,7 +3471,12 @@ async function _dashShowQR(phoneId) {
       const status = (s.status || '').toUpperCase();
       if (status === 'WORKING') {
         await Api.phones.syncNumber(phoneId).catch(() => {});
-        toast('WhatsApp connected!', 'success');
+        toast('WhatsApp connected! Syncing chats…', 'success');
+        // Sync chats from WAHA then refresh chat list
+        _chatAutoSynced = false;
+        try { await Api.inbox.sync(phoneId); } catch(_) {}
+        await loadPhones();
+        if (State.currentView === 'inbox') loadChats();
         _dashWahaPrevStatus = '';
         _startDashWahaPoller(phoneId);
         return;
