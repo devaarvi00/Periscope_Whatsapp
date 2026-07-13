@@ -528,33 +528,44 @@ function handleWSEvent(data) {
     return;
   }
 
+  if (event === 'phone_status_changed') {
+    // Update phone status in local state so loadChats() picks it up
+    const ph = State.phones.find(p => p.id === d.phone_id);
+    if (ph) ph.waha_status = d.status;
+    // Update topbar badge
+    const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
+    const numEl = document.getElementById('topbar-phone-num');
+    if (numEl) numEl.textContent = working;
+    // If phone became WORKING and we're on inbox, reload chats
+    if (d.status === 'WORKING' && State.currentView === 'inbox') {
+      _chatAutoSynced = false;
+      loadChats();
+    }
+    return;
+  }
+
   if (event === 'data_cleared') {
-    // WhatsApp session logged out — wipe stale data from UI immediately
+    // WAHA session stopped — hide chats in UI (data stays in DB for when they reconnect)
+    const ph = State.phones.find(p => p.id === d.phone_id);
+    if (ph) ph.waha_status = 'STOPPED';
     State.inbox.chats = [];
     State.inbox.selectedChatId = null;
     State.inbox.messages = [];
+    _chatAutoSynced = false;
 
     if (State.currentView === 'inbox') {
-      // Clear the chat list and close any open thread
-      const chatList = document.getElementById('chat-list');
-      if (chatList) chatList.innerHTML = `<div class="empty-state" style="padding:2rem;text-align:center">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5" style="margin:0 auto .75rem;display:block"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        <p style="font-size:13px;color:var(--text-3)">WhatsApp disconnected.<br>Reconnect to see chats.</p>
-      </div>`;
-      const threadPanel = document.getElementById('thread-panel');
-      if (threadPanel) threadPanel.innerHTML = `<div class="empty-thread"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1.2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Select a conversation</p><span>Choose a chat from the list to start messaging</span></div>`;
+      loadChats(); // will show the disconnected empty state since phone is now STOPPED
     }
-
     if (State.currentView === 'dashboard') {
-      // Reset stats to zero
       const dsTotal = document.getElementById('ds-total');
       const dsUnread = document.getElementById('ds-unread');
+      const dsFlagged = document.getElementById('ds-flagged');
       if (dsTotal) dsTotal.textContent = '0';
       if (dsUnread) dsUnread.textContent = '0';
+      if (dsFlagged) dsFlagged.textContent = '0';
     }
 
-    toast('WhatsApp session disconnected — chat data cleared', 'warning');
-    _chatAutoSynced = false;
+    toast('WhatsApp disconnected', 'warning');
     return;
   }
 }
@@ -690,6 +701,33 @@ const CHAT_PAGE = 200;
 
 async function loadChats() {
   _chatLoadOffset = 0;
+
+  // Refresh phone state from server so status is always current
+  try { State.phones = await Api.phones.list(); } catch(_) {}
+
+  const phone = State.phones[0];
+  const phoneConnected = phone && phone.waha_status === 'WORKING';
+
+  // Hide all chats when WhatsApp is not connected — show a clear disconnected state
+  if (!phoneConnected) {
+    State.inbox.chats = [];
+    State.inbox.messages = [];
+    State.inbox.selectedChatId = null;
+    const chatList = document.getElementById('chat-list');
+    if (chatList) chatList.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:1rem;padding:2rem;text-align:center">
+      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1.4"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <div>
+        <p style="font-weight:600;color:var(--text-2);margin:0 0 .35rem">WhatsApp disconnected</p>
+        <span style="font-size:12px;color:var(--text-3)">Connect your WhatsApp to see conversations</span>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect WhatsApp</button>
+    </div>`;
+    const threadPanel = document.getElementById('thread-panel');
+    if (threadPanel) threadPanel.innerHTML = `<div class="empty-thread"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1.2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Select a conversation</p><span>Choose a chat from the list to start messaging</span></div>`;
+    _updateUnreadBadge([]);
+    return;
+  }
+
   const q = _buildChatQuery();
   q.limit = CHAT_PAGE;
   q.offset = 0;
@@ -698,11 +736,8 @@ async function loadChats() {
     let chats = await Api.inbox.chats(q);
     if (!Array.isArray(chats)) chats = [];
 
-    const phone = State.phones[0];
-    const phoneConnected = phone && phone.waha_status === 'WORKING';
-
     // Auto-sync from WAHA when inbox is empty and phone is connected
-    if (chats.length === 0 && !_chatAutoSynced && phone && phoneConnected) {
+    if (chats.length === 0 && !_chatAutoSynced) {
       _chatAutoSynced = true;
       const chatList = document.getElementById('chat-list');
       if (chatList) chatList.innerHTML = `<div class="loading-center" style="flex-direction:column;gap:.5rem">
@@ -3731,15 +3766,19 @@ async function renderDashboard() {
 
   // Load quick stats asynchronously
   try {
+    const phones = State.phones.length ? State.phones : await Api.phones.list().catch(() => []);
+    const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+
     const [dash, tkt, agents] = await Promise.all([
       Api.analytics.dashboard(),
       Api.analytics.tickets(),
       Api.auth.agents().catch(() => []),
     ]);
     const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-    set('ds-total', dash.total_chats ?? 0);
-    set('ds-unread', dash.unread_chats ?? 0);
-    set('ds-flagged', dash.flagged_chats ?? 0);
+    // Only show real chat counts when WhatsApp is connected
+    set('ds-total', phoneConnected ? (dash.total_chats ?? 0) : 0);
+    set('ds-unread', phoneConnected ? (dash.unread_chats ?? 0) : 0);
+    set('ds-flagged', phoneConnected ? (dash.flagged_chats ?? 0) : 0);
     set('ds-tickets', tkt.open ?? 0);
     set('ds-tickets-prog', tkt.in_progress ?? 0);
     set('ds-tickets-mine', '-');

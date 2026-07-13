@@ -79,6 +79,10 @@ async def logout_session(phone_id: int, db: Session = Depends(get_db)):
     ok = await waha.logout_session()
     phone.waha_status = "STOPPED"
     db.commit()
+    # Notify all connected browser tabs immediately — don't wait for WAHA webhook
+    from app.core.ws_manager import ws_manager
+    await ws_manager.broadcast("phone_status_changed", {"phone_id": phone.id, "status": "STOPPED"})
+    await ws_manager.broadcast("data_cleared", {"phone_id": phone.id, "reason": "logout"})
     return {"ok": ok}
 
 

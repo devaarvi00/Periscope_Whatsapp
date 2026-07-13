@@ -297,53 +297,50 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
 
 
 async def _process_session_status(payload: dict[str, Any]) -> None:
-    """Clear all chat/message data when WAHA session logs out."""
+    """Update phone WAHA status in DB and notify the frontend when a session state changes."""
     db = SessionLocal()
     try:
         session_name = payload.get("session", "")
         status_payload = payload.get("payload") or {}
-        status = str(status_payload.get("status", "")).upper()
+        raw_status = str(status_payload.get("status", "")).upper()
 
-        # Only wipe on explicit logout/disconnect states
-        if status not in ("STOPPED", "FAILED"):
+        # Map WAHA statuses to our DB values
+        STATUS_MAP = {
+            "WORKING": "WORKING",
+            "CONNECTED": "WORKING",
+            "AUTHENTICATED": "WORKING",
+            "STOPPED": "STOPPED",
+            "FAILED": "FAILED",
+            "STARTING": "STARTING",
+            "SCAN_QR_CODE": "SCAN_QR_CODE",
+            "DISCONNECTED": "STOPPED",
+        }
+        db_status = STATUS_MAP.get(raw_status)
+        if not db_status:
             return
 
         phone = db.query(Phone).filter(Phone.session_name == session_name).first()
         if not phone:
             return
 
-        chat_ids = [r[0] for r in db.query(Chat.id).filter(Chat.phone_id == phone.id).all()]
-        if chat_ids:
-            from sqlalchemy import update
-
-            from app.models.note import Note
-            from app.models.ticket import Ticket, TicketLabel
-            from app.models.bulk_message_job import BulkMessageLog
-            from app.models.scheduled_message import ScheduledMessage
-            from app.models.task import Task
-
-            ticket_ids = [r[0] for r in db.query(Ticket.id).filter(Ticket.chat_id.in_(chat_ids)).all()]
-            if ticket_ids:
-                db.execute(delete(TicketLabel).where(TicketLabel.ticket_id.in_(ticket_ids)))
-            db.execute(delete(Note).where(Note.chat_id.in_(chat_ids)))
-            db.execute(delete(Ticket).where(Ticket.chat_id.in_(chat_ids)))
-            db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
-            db.execute(delete(ScheduledMessage).where(ScheduledMessage.chat_id.in_(chat_ids)))
-            db.execute(delete(Task).where(Task.chat_id.in_(chat_ids)))
-            msg_ids = db.query(Message.id).filter(Message.phone_id == phone.id).subquery()
-            db.execute(update(Task).where(Task.message_id.in_(msg_ids.select())).values(message_id=None))
-            db.execute(delete(ChatLabel).where(ChatLabel.chat_id.in_(chat_ids)))
-            db.execute(delete(Message).where(Message.phone_id == phone.id))
-            db.execute(delete(Chat).where(Chat.phone_id == phone.id))
-            db.commit()
-            logger.info("Cleared %d chats for phone %d (session %s → %s)",
-                        len(chat_ids), phone.id, session_name, status)
+        # Always keep chat/message data — hiding it is handled in the frontend by status check.
+        # Permanently deleting on every WAHA restart or network hiccup would be destructive.
+        phone.waha_status = db_status
+        db.commit()
+        logger.info("Session status: session=%s raw=%s db=%s phone_id=%d",
+                    session_name, raw_status, db_status, phone.id)
 
         from app.core.ws_manager import ws_manager
-        await ws_manager.broadcast("data_cleared", {"phone_id": phone.id, "reason": status})
+        # Notify frontend so it can update the UI immediately
+        await ws_manager.broadcast("phone_status_changed", {
+            "phone_id": phone.id, "status": db_status,
+        })
+        # When disconnected, broadcast data_cleared so frontend hides the chat list
+        if db_status in ("STOPPED", "FAILED"):
+            await ws_manager.broadcast("data_cleared", {"phone_id": phone.id, "reason": db_status})
 
     except Exception as exc:
-        logger.exception("session.status clear error: %s", exc)
+        logger.exception("session.status error: %s", exc)
     finally:
         db.close()
 
