@@ -218,6 +218,12 @@ function renderAgent() {
   const tn = document.getElementById('topbar-name');
   if (ta) { ta.textContent = initials(a.name); ta.style.background = avatarColor(a.name); }
   if (tn) tn.textContent = a.name.split(' ')[0];
+
+  // Topbar dropdown agent info
+  const dan = document.getElementById('dropdown-agent-name');
+  const dae = document.getElementById('dropdown-agent-email');
+  if (dan) dan.textContent = a.name;
+  if (dae) dae.textContent = a.email || '';
 }
 
 // ── Topbar: refresh current view ─────────────────────────────────
@@ -319,10 +325,25 @@ document.getElementById('login-form').addEventListener('submit', async e => {
   }
 });
 
-document.getElementById('logout-btn').addEventListener('click', () => {
+const logoutFn = () => {
   if (State.ws) State.ws.close();
   Api.clearToken(); State.agent = null; showLogin();
-});
+};
+document.getElementById('logout-btn')?.addEventListener('click', logoutFn);
+document.getElementById('topbar-logout-btn')?.addEventListener('click', logoutFn);
+
+// Topbar user menu dropdown toggle
+const taAgent = document.getElementById('topbar-agent');
+const taDropdown = document.getElementById('topbar-dropdown');
+if (taAgent && taDropdown) {
+  taAgent.addEventListener('click', (e) => {
+    e.stopPropagation();
+    taDropdown.style.display = taDropdown.style.display === 'none' ? 'block' : 'none';
+  });
+  document.addEventListener('click', () => {
+    taDropdown.style.display = 'none';
+  });
+}
 
 // ── Navigation ─────────────────────────────────────────────────── //
 const VIEW_LABELS = {
@@ -1907,7 +1928,7 @@ async function renderTickets() {
           <div class="table-wrap">
             <table class="data-table">
               <thead>
-                <tr><th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Assigned</th><th>Due</th><th>SLA</th><th></th></tr>
+                <tr><th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Assigned</th><th>Due</th><th>SLA</th><th style="width:130px;text-align:right">Actions</th></tr>
               </thead>
               <tbody id="tickets-tbody"><tr><td colspan="8" style="text-align:center;padding:2rem"><div class="spinner"></div></td></tr></tbody>
             </table>
@@ -1945,7 +1966,7 @@ async function loadTickets(status = '') {
         <td style="font-size:12px;color:var(--text-3)">${t.assigned_to ? 'Agent #'+t.assigned_to : '—'}</td>
         <td style="font-size:12px;color:var(--text-3)">${t.due_date ? new Date(t.due_date).toLocaleDateString() : '—'}</td>
         <td>${t.sla_breached ? '<span class="pill" style="background:#FEF2F2;color:#DC2626">Breached</span>' : '<span class="pill" style="background:var(--success-bg);color:var(--success)">OK</span>'}</td>
-        <td>
+        <td style="text-align:right">
           <button class="btn btn-ghost btn-sm ticket-edit" data-tid="${t.id}">Edit</button>
           <button class="btn btn-danger btn-sm ticket-del" data-tid="${t.id}">Del</button>
         </td>
@@ -2410,7 +2431,21 @@ async function loadRules() {
   } catch(_) {}
 }
 
-function showRuleModal() {
+async function showRuleModal() {
+  let agents = [];
+  let labels = [];
+  try {
+    const [agentList, labelList] = await Promise.all([
+      Api.auth.agents().catch(() => []),
+      Api.labels.list().catch(() => [])
+    ]);
+    agents = agentList;
+    labels = labelList;
+  } catch (_) {}
+
+  const agentOptions = agents.map(a => `<option value="${a.id}">${esc(a.name)} (${esc(a.role)})</option>`).join('');
+  const labelOptions = labels.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('');
+
   showModal('New Automation Rule', `
     <div class="form-group"><label>Rule Name *</label><input type="text" id="rl-name" placeholder="e.g. Auto-assign support"></div>
     <div class="form-group"><label>Trigger</label>
@@ -2422,21 +2457,128 @@ function showRuleModal() {
         <option value="no_reply_timeout">No Reply Timeout</option>
       </select>
     </div>
-    <div class="form-group"><label>Criteria (JSON)</label><textarea id="rl-criteria" style="font-family:monospace;font-size:12px">{}</textarea></div>
-    <div class="form-group"><label>Actions (JSON array)</label><textarea id="rl-actions" style="font-family:monospace;font-size:12px">[{"type":"send_message","message":"Hello!"}]</textarea></div>
+
+    <!-- Criteria selection -->
+    <div class="form-group"><label>Criteria Type</label>
+      <select id="rl-criteria-type">
+        <option value="always">Always run (no criteria)</option>
+        <option value="keyword">If message contains keyword</option>
+        <option value="json">Custom JSON Criteria</option>
+      </select>
+    </div>
+    <div class="form-group" id="rl-criteria-keyword-group" style="display:none">
+      <label>Keywords (comma-separated)</label>
+      <input type="text" id="rl-criteria-keywords" placeholder="e.g. refund, help, price">
+    </div>
+    <div class="form-group" id="rl-criteria-json-group" style="display:none">
+      <label>Criteria (JSON)</label>
+      <textarea id="rl-criteria" style="font-family:monospace;font-size:12px">{}</textarea>
+    </div>
+
+    <!-- Action selection -->
+    <div class="form-group"><label>Action Type</label>
+      <select id="rl-action-type">
+        <option value="send_message">Send WhatsApp reply</option>
+        <option value="flag_chat">Flag Chat</option>
+        <option value="activate_ai">Activate AI Auto-responder</option>
+        <option value="assign_to_agent">Assign to Agent</option>
+        <option value="add_label">Add Label</option>
+        <option value="json">Custom JSON Actions</option>
+      </select>
+    </div>
+
+    <div class="form-group" id="rl-action-message-group">
+      <label>Reply Message</label>
+      <textarea id="rl-action-message" placeholder="e.g. Hello! We received your message and will get back to you shortly."></textarea>
+    </div>
+    <div class="form-group" id="rl-action-agent-group" style="display:none">
+      <label>Select Agent</label>
+      <select id="rl-action-agent">
+        <option value="round_robin">Round Robin (Distribute evenly)</option>
+        ${agentOptions}
+      </select>
+    </div>
+    <div class="form-group" id="rl-action-label-group" style="display:none">
+      <label>Select Label</label>
+      <select id="rl-action-label">
+        <option value="">-- Choose Label --</option>
+        ${labelOptions}
+      </select>
+    </div>
+    <div class="form-group" id="rl-action-json-group" style="display:none">
+      <label>Actions (JSON array)</label>
+      <textarea id="rl-actions" style="font-family:monospace;font-size:12px">[{"type":"send_message","message":"Hello!"}]</textarea>
+    </div>
+
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="rl-save">Create Rule</button>
     </div>`);
+
+  const critSelect = document.getElementById('rl-criteria-type');
+  critSelect.addEventListener('change', () => {
+    const val = critSelect.value;
+    document.getElementById('rl-criteria-keyword-group').style.display = val === 'keyword' ? 'block' : 'none';
+    document.getElementById('rl-criteria-json-group').style.display = val === 'json' ? 'block' : 'none';
+  });
+
+  const actSelect = document.getElementById('rl-action-type');
+  actSelect.addEventListener('change', () => {
+    const val = actSelect.value;
+    document.getElementById('rl-action-message-group').style.display = val === 'send_message' ? 'block' : 'none';
+    document.getElementById('rl-action-agent-group').style.display = val === 'assign_to_agent' ? 'block' : 'none';
+    document.getElementById('rl-action-label-group').style.display = val === 'add_label' ? 'block' : 'none';
+    document.getElementById('rl-action-json-group').style.display = val === 'json' ? 'block' : 'none';
+  });
+
   document.getElementById('rl-save').addEventListener('click', async () => {
     const name = document.getElementById('rl-name').value.trim();
     if (!name) return toast('Name required', 'error');
+
+    let criteria = {};
+    const critVal = critSelect.value;
+    if (critVal === 'keyword') {
+      const keywordsRaw = document.getElementById('rl-criteria-keywords').value.trim();
+      if (!keywordsRaw) return toast('Keywords required', 'error');
+      const keywords = keywordsRaw.split(',').map(k => k.trim()).filter(Boolean);
+      criteria = { keywords };
+    } else if (critVal === 'json') {
+      try {
+        criteria = JSON.parse(document.getElementById('rl-criteria').value || '{}');
+      } catch (e) {
+        return toast('Invalid Criteria JSON: ' + e.message, 'error');
+      }
+    }
+
+    let actions = [];
+    const actVal = actSelect.value;
+    if (actVal === 'send_message') {
+      const message = document.getElementById('rl-action-message').value.trim();
+      if (!message) return toast('Reply message required', 'error');
+      actions = [{ type: 'send_message', message }];
+    } else if (actVal === 'flag_chat') {
+      actions = [{ type: 'flag_chat' }];
+    } else if (actVal === 'activate_ai') {
+      actions = [{ type: 'activate_ai' }];
+    } else if (actVal === 'assign_to_agent') {
+      const agentId = document.getElementById('rl-action-agent').value;
+      actions = [{ type: 'assign_to_agent', agent_id: agentId }];
+    } else if (actVal === 'add_label') {
+      const labelId = document.getElementById('rl-action-label').value;
+      if (!labelId) return toast('Please select a label', 'error');
+      actions = [{ type: 'add_label', label_id: parseInt(labelId) }];
+    } else if (actVal === 'json') {
+      try {
+        actions = JSON.parse(document.getElementById('rl-actions').value || '[]');
+      } catch (e) {
+        return toast('Invalid Actions JSON: ' + e.message, 'error');
+      }
+    }
+
     try {
-      const criteria = JSON.parse(document.getElementById('rl-criteria').value || '{}');
-      const actions = JSON.parse(document.getElementById('rl-actions').value || '[]');
       await Api.automation.create({ name, trigger_type: document.getElementById('rl-trigger').value, criteria, actions });
       closeModal(); toast('Rule created', 'success'); loadRules();
-    } catch(e) { toast(e.message || 'Invalid JSON', 'error'); }
+    } catch(e) { toast(e.message, 'error'); }
   });
 }
 
@@ -2535,7 +2677,6 @@ async function renderBulk() {
       <div class="section-header">
         <h2>Bulk Messaging</h2>
         <div class="header-actions" style="margin-left:auto;display:flex;gap:.6rem;align-items:center">
-          <span class="credits-chip" id="bulk-credits">credits: …</span>
           <button class="btn btn-primary btn-sm" id="new-bulk-btn">+ New Campaign</button>
         </div>
       </div>
@@ -2553,11 +2694,6 @@ async function renderBulk() {
   }));
   document.getElementById('new-bulk-btn').addEventListener('click', () => showBulkModal());
   await loadBulkTab('campaigns');
-  try {
-    const c = await Api.bulk.credits();
-    const chip = document.getElementById('bulk-credits');
-    if (chip) chip.textContent = `${c.remaining.toLocaleString()} / ${c.monthly_limit.toLocaleString()} credits left`;
-  } catch(_) {}
 }
 
 function _bulkRepeatSummary(j) {
@@ -2977,7 +3113,6 @@ async function renderSettings() {
         <div class="tab" data-tab="quickreplies">Quick Replies</div>
         <div class="tab" data-tab="agents">Agents</div>
         <div class="tab" data-tab="properties">Custom Properties</div>
-        <div class="tab" data-tab="developer">Developer API</div>
         <div class="tab" data-tab="exports">Data Exports</div>
       </div>
       <div class="scroll-area" id="settings-content"></div>
@@ -3358,119 +3493,7 @@ async function loadSettingsTab(tab) {
     } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
   }
 
-  else if (tab === 'developer') {
-    try {
-      const [keys, hooks, events] = await Promise.all([
-        Api.developer.apiKeys(), Api.developer.webhooks(), Api.developer.webhookEvents(),
-      ]);
-      el.innerHTML = `
-        <div class="content-card" style="margin-bottom:1rem">
-          <div class="card-header">API Keys
-            <div class="header-actions"><button class="btn btn-primary btn-sm" id="new-key-btn">+ New Key</button></div>
-          </div>
-          <div class="card-body">
-            <p class="text-muted" style="font-size:12.5px;margin-bottom:.6rem">
-              Use keys with the public API: <code>X-API-Key</code> header on <code>/api/v1/public/v1/*</code>
-              (send messages, list chats &amp; numbers, create tickets).
-            </p>
-            <div class="table-wrap"><table class="data-table">
-              <thead><tr><th>Name</th><th>Key</th><th>Status</th><th>Last Used</th><th></th></tr></thead>
-              <tbody>${keys.map(k => `<tr>
-                <td style="font-weight:600">${esc(k.name)}</td>
-                <td style="font-family:monospace;font-size:12px">${esc(k.key_prefix)}…</td>
-                <td><span class="pill ${k.is_active ? 'pill-resolved' : 'pill-closed'}">${k.is_active ? 'Active' : 'Revoked'}</span></td>
-                <td style="font-size:12px;color:var(--text-3)">${k.last_used_at ? timeAgo(k.last_used_at) : 'Never'}</td>
-                <td>${k.is_active ? `<button class="btn btn-danger btn-sm key-revoke" data-kid="${k.id}">Revoke</button>` : ''}</td>
-              </tr>`).join('') || '<tr><td colspan="5" class="text-muted">No API keys yet</td></tr>'}</tbody>
-            </table></div>
-          </div>
-        </div>
-        <div class="content-card">
-          <div class="card-header">Outbound Webhooks
-            <div class="header-actions"><button class="btn btn-primary btn-sm" id="new-hook-btn">+ Add Webhook</button></div>
-          </div>
-          <div class="card-body">
-            <p class="text-muted" style="font-size:12.5px;margin-bottom:.6rem">
-              We POST platform events (signed with HMAC-SHA256 when a secret is set) to your endpoints.
-            </p>
-            <div class="table-wrap"><table class="data-table">
-              <thead><tr><th>URL</th><th>Events</th><th>Failures</th><th></th></tr></thead>
-              <tbody>${hooks.map(h => `<tr>
-                <td style="font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(h.url)}</td>
-                <td style="font-size:11.5px">${(h.events && h.events.length) ? h.events.map(esc).join(', ') : 'All events'}</td>
-                <td>${h.failure_count || 0}</td>
-                <td style="white-space:nowrap">
-                  <button class="btn btn-secondary btn-sm hook-test" data-hid="${h.id}">Test</button>
-                  <button class="btn btn-danger btn-sm hook-del" data-hid="${h.id}">Delete</button>
-                </td>
-              </tr>`).join('') || '<tr><td colspan="4" class="text-muted">No webhooks configured</td></tr>'}</tbody>
-            </table></div>
-          </div>
-        </div>`;
 
-      document.getElementById('new-key-btn').addEventListener('click', () => {
-        showModal('New API Key', `
-          <div class="form-group"><label>Key Name *</label><input type="text" id="key-name" placeholder="e.g. Zapier integration"></div>
-          <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" id="key-save">Create</button>
-          </div>`);
-        document.getElementById('key-save').addEventListener('click', async () => {
-          const name = document.getElementById('key-name').value.trim();
-          if (!name) return toast('Name required', 'error');
-          try {
-            const res = await Api.developer.createApiKey({ name });
-            showModal('API Key Created', `
-              <p style="font-size:13px;margin-bottom:.6rem">Copy this key now — it will <strong>not</strong> be shown again:</p>
-              <div class="api-key-box">${esc(res.api_key)}</div>
-              <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal();loadSettingsTab('developer')">Done</button></div>`);
-          } catch(e) { toast(e.message, 'error'); }
-        });
-      });
-      el.querySelectorAll('.key-revoke').forEach(btn => btn.addEventListener('click', async () => {
-        if (!confirm('Revoke this API key?')) return;
-        try { await Api.developer.revokeApiKey(btn.dataset.kid); toast('Key revoked', 'success'); loadSettingsTab('developer'); }
-        catch(e) { toast(e.message, 'error'); }
-      }));
-
-      document.getElementById('new-hook-btn').addEventListener('click', () => {
-        showModal('Add Outbound Webhook', `
-          <div class="form-group"><label>Endpoint URL *</label><input type="text" id="wh-url" placeholder="https://your-server.com/webhook"></div>
-          <div class="form-group"><label>Signing Secret (optional)</label><input type="text" id="wh-secret"></div>
-          <div class="form-group"><label>Events (default: all)</label>
-            ${events.map(ev => `<label style="display:flex;gap:.5rem;font-size:12.5px;padding:.2rem 0">
-              <input type="checkbox" class="wh-event" value="${ev}"> ${ev}</label>`).join('')}
-          </div>
-          <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" id="wh-save">Add</button>
-          </div>`);
-        document.getElementById('wh-save').addEventListener('click', async () => {
-          const url = document.getElementById('wh-url').value.trim();
-          if (!url) return toast('URL required', 'error');
-          const evs = [...document.querySelectorAll('.wh-event:checked')].map(c => c.value);
-          try {
-            await Api.developer.createWebhook({
-              url, secret: document.getElementById('wh-secret').value.trim(),
-              events: evs.length ? evs : null,
-            });
-            closeModal(); toast('Webhook added', 'success'); loadSettingsTab('developer');
-          } catch(e) { toast(e.message, 'error'); }
-        });
-      });
-      el.querySelectorAll('.hook-test').forEach(btn => btn.addEventListener('click', async () => {
-        try { await Api.developer.testWebhook(btn.dataset.hid); toast('Test event queued', 'success'); }
-        catch(e) { toast(e.message, 'error'); }
-      }));
-      el.querySelectorAll('.hook-del').forEach(btn => btn.addEventListener('click', async () => {
-        if (!confirm('Delete webhook?')) return;
-        try { await Api.developer.delWebhook(btn.dataset.hid); toast('Deleted', 'success'); loadSettingsTab('developer'); }
-        catch(e) { toast(e.message, 'error'); }
-      }));
-    } catch(e) {
-      el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)} (admin only)</div>`;
-    }
-  }
 
   else if (tab === 'exports') {
     el.innerHTML = `
@@ -3969,7 +3992,7 @@ async function loadScheduled() {
     const items = await Api.scheduled.list();
     if (!items.length) { el.innerHTML = `<div class="loading-center text-muted">Nothing scheduled yet</div>`; return; }
     el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
-      <thead><tr><th>Chat</th><th>Message</th><th>Next Send</th><th>Repeat</th><th>Ends</th><th>Status</th><th>Sent</th><th></th></tr></thead>
+      <thead><tr><th>Chat</th><th>Message</th><th>Next Send</th><th>Repeat</th><th>Ends</th><th>Status</th><th>Sent</th><th style="width:140px;text-align:right">Actions</th></tr></thead>
       <tbody>${items.map(m => `<tr>
         <td style="font-weight:600">${esc(displayName(m.chat_name) || ('#' + m.chat_id))}</td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
@@ -3978,7 +4001,7 @@ async function loadScheduled() {
         <td style="font-size:12px;color:var(--text-3)">${m.end_date ? new Date(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
         <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${m.status}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
         <td>${m.sent_count}</td>
-        <td style="white-space:nowrap">${m.status === 'pending' ? `
+        <td style="white-space:nowrap;text-align:right">${m.status === 'pending' ? `
           <button class="btn btn-secondary btn-sm sched-edit" data-sid="${m.id}">Edit</button>
           <button class="btn btn-danger btn-sm sched-cancel" data-sid="${m.id}">Cancel</button>` : ''}</td>
       </tr>`).join('')}</tbody>
@@ -4132,10 +4155,41 @@ async function renderLogs() {
   try {
     const actions = await Api.logs.actions();
     const sel = document.getElementById('log-action-filter');
-    actions.forEach(a => { const o = document.createElement('option'); o.value = a; o.textContent = a; sel.appendChild(o); });
+    actions.forEach(a => {
+      const o = document.createElement('option');
+      o.value = a;
+      o.textContent = a.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+      sel.appendChild(o);
+    });
     sel.addEventListener('change', () => loadLogsTable(sel.value));
   } catch(_) {}
   await loadLogsTable('');
+}
+
+function formatLogEvent(action) {
+  const map = {
+    ticket_created: { text: 'Ticket Created', class: 'pill-open' },
+    ticket_updated: { text: 'Ticket Updated', class: 'pill-in_progress' },
+    task_created: { text: 'Task Created', class: 'pill-open' },
+    task_updated: { text: 'Task Updated', class: 'pill-in_progress' },
+    bulk_job_created: { text: 'Bulk Job Created', class: 'pill-open' },
+    bulk_job_completed: { text: 'Bulk Job Completed', class: 'pill-resolved' },
+    automation_rule_created: { text: 'Rule Created', class: 'pill-open' },
+    automation_rule_updated: { text: 'Rule Updated', class: 'pill-in_progress' },
+    automation_rule_deleted: { text: 'Rule Deleted', class: 'pill-urgent' },
+    automation_rule_executed: { text: 'Rule Executed', class: 'pill-resolved' },
+    sla_breached: { text: 'SLA Breached', class: 'pill-urgent' },
+    task_reminder_sent: { text: 'Reminder Sent', class: 'pill-resolved' },
+    private_note_added: { text: 'Note Added', class: 'pill-open' },
+    label_created: { text: 'Label Created', class: 'pill-open' },
+    label_deleted: { text: 'Label Deleted', class: 'pill-urgent' },
+  };
+  const item = map[action];
+  if (item) {
+    return `<span class="pill ${item.class}">${esc(item.text)}</span>`;
+  }
+  const titleText = action.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  return `<span class="pill pill-open">${esc(titleText)}</span>`;
 }
 
 async function loadLogsTable(action) {
@@ -4150,7 +4204,7 @@ async function loadLogsTable(action) {
     }
     tbody.innerHTML = logs.map(l => `<tr>
       <td style="font-size:12px;color:var(--text-3);white-space:nowrap">${new Date(l.created_at).toLocaleString()}</td>
-      <td><span class="pill pill-open" style="font-family:monospace;font-size:11px">${esc(l.action)}</span></td>
+      <td>${formatLogEvent(l.action)}</td>
       <td>${esc(l.agent_name || 'System')}</td>
       <td style="font-size:12.5px">${esc(l.description || '')}</td>
     </tr>`).join('');

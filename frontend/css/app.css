@@ -352,9 +352,7 @@ input,textarea,select{font:inherit;}
 }
 
 .sidebar-bottom{
-  border-top:1px solid var(--border-light);
-  padding:.6rem .8rem .4rem;
-  display:flex;flex-direction:column;gap:.2rem;
+  display:none !important;
 }
 .agent-info{display:flex;align-items:center;gap:.6rem;flex:1;min-width:0;}
 .agent-avatar{
@@ -397,7 +395,7 @@ input,textarea,select{font:inherit;}
   pointer-events:none;
 }
 .app-topbar-search input{
-  width:100%;padding:.42rem .8rem .42rem 2.1rem;
+  width:100%;padding:.42rem .8rem .42rem 2.1rem !important;
   font-size:13px;color:var(--text);
   background:#f9fafb;border:1px solid var(--border);
   border-radius:8px;outline:none;
@@ -412,8 +410,7 @@ input,textarea,select{font:inherit;}
   width:7px;height:7px;border-radius:50%;background:var(--accent);flex-shrink:0;
 }
 .app-breadcrumb{
-  font-size:13px;font-weight:500;color:var(--text-2);
-  display:flex;align-items:center;gap:.4rem;
+  display:none !important;
 }
 .app-breadcrumb strong{color:var(--text);font-weight:600;}
 .app-topbar-right{display:flex;align-items:center;gap:.5rem;}
@@ -446,6 +443,66 @@ input,textarea,select{font:inherit;}
   font-size:11px;font-weight:700;flex-shrink:0;
 }
 .topbar-agent span{font-size:12.5px;font-weight:500;color:var(--text-2);}
+
+/* Dropdown User Menu in Topbar */
+.topbar-agent-container{
+  position:relative;
+}
+.topbar-dropdown{
+  position:absolute;
+  top:100%;
+  right:0;
+  margin-top:8px;
+  background:#fff;
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  box-shadow:0 4px 12px rgba(0,0,0,0.08);
+  min-width:180px;
+  z-index:1000;
+  padding:8px 0;
+}
+.topbar-dropdown .dropdown-header{
+  padding:8px 12px;
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+}
+.topbar-dropdown .dropdown-header strong{
+  font-size:13px;
+  color:var(--text);
+}
+.topbar-dropdown .dropdown-header span{
+  font-size:11px;
+  color:var(--text-3);
+}
+.topbar-dropdown hr{
+  margin:6px 0;
+  border:none;
+  border-top:1px solid var(--border-light);
+}
+.topbar-dropdown .dropdown-item{
+  width:100%;
+  padding:8px 12px;
+  background:none;
+  border:none;
+  text-align:left;
+  font-size:13px;
+  color:var(--text-2);
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  transition:background 0.1s;
+}
+.topbar-dropdown .dropdown-item:hover{
+  background:var(--bg);
+  color:var(--danger, #dc2626);
+}
+.topbar-dropdown .dropdown-item svg{
+  width:14px;
+  height:14px;
+  color:inherit;
+}
 
 /* ── WebSocket status indicator ─────────────────────────────────── */
 .ws-status{

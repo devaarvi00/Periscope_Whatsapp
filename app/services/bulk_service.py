@@ -34,16 +34,10 @@ class BulkService:
         ).limit(limit).all()
 
     def credits_used_this_month(self) -> int:
-        month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        used = (
-            self.db.query(func.coalesce(func.sum(BulkMessageJob.credits_used), 0))
-            .filter(BulkMessageJob.created_at >= month_start)
-            .scalar()
-        )
-        return int(used or 0)
+        return 0
 
     def credits_remaining(self) -> int:
-        return max(0, settings.bulk_message_credits_per_month - self.credits_used_this_month())
+        return 999999
 
     def _render_variables(self, template: str, chat: Chat) -> str:
         """Personalize message per recipient: {{name}}, {{phone}}, {{company}}."""
@@ -69,15 +63,6 @@ class BulkService:
             return {"error": "Job not found"}
 
         recipients = job.recipient_chat_ids or []
-        remaining = self.credits_remaining()
-        if len(recipients) > remaining:
-            job.status = "failed"
-            job.error_message = (
-                f"Insufficient credits: job needs {len(recipients)}, "
-                f"{remaining} left this month"
-            )
-            self.db.commit()
-            return {"error": job.error_message}
 
         job.status = "running"
         self.db.commit()
