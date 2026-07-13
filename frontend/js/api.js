@@ -1,4 +1,4 @@
-/* ── Periskope API Client ──────────────────────────────────────── */
+/* ── Hyperscope API Client ──────────────────────────────────────── */
 const BASE = '/api/v1';
 
 const Api = (() => {
@@ -51,6 +51,8 @@ const Api = (() => {
     me:       ()                => get('/auth/me'),
     agents:   ()                => get('/auth/agents'),
     register: (data)            => post('/auth/register', data),
+    agentPhones:    (id)        => get(`/auth/agents/${id}/phones`),
+    setAgentPhones: (id, ids)   => req('PUT', `/auth/agents/${id}/phones`, ids),
   };
 
   // Inbox
@@ -64,7 +66,8 @@ const Api = (() => {
     addLabel:   (cid, lid)    => post(`/inbox/chats/${cid}/labels/${lid}`),
     removeLabel:(cid, lid)    => del(`/inbox/chats/${cid}/labels/${lid}`),
     sync:          (pid)  => post(`/inbox/sync/${pid}`),
-    syncMessages:  (cid)  => post(`/inbox/chats/${cid}/sync-messages`),
+    syncMessages:  (cid, limit) => post(`/inbox/chats/${cid}/sync-messages${limit ? '?limit=' + limit : ''}`),
+    bulkUpdate:    (b)    => post('/inbox/bulk-update', b),
   };
 
   // Tickets
@@ -74,6 +77,9 @@ const Api = (() => {
     create: (b)     => post('/tickets', b),
     update: (id, b) => patch(`/tickets/${id}`, b),
     del:    (id)    => del(`/tickets/${id}`),
+    labels:      (id)      => get(`/tickets/${id}/labels`),
+    addLabel:    (id, lid) => post(`/tickets/${id}/labels/${lid}`),
+    removeLabel: (id, lid) => del(`/tickets/${id}/labels/${lid}`),
   };
 
   // Contacts
@@ -83,6 +89,9 @@ const Api = (() => {
     create: (b)     => post('/contacts', b),
     update: (id, b) => patch(`/contacts/${id}`, b),
     del:    (id)    => del(`/contacts/${id}`),
+    labels:      (id)      => get(`/contacts/${id}/labels`),
+    addLabel:    (id, lid) => post(`/contacts/${id}/labels/${lid}`),
+    removeLabel: (id, lid) => del(`/contacts/${id}/labels/${lid}`),
   };
 
   // Labels
@@ -131,6 +140,7 @@ const Api = (() => {
   // Automation
   const automation = {
     triggers: ()      => get('/automation/trigger-types'),
+    actions:  ()      => get('/automation/action-types'),
     list:     ()      => get('/automation/rules'),
     create:   (b)     => post('/automation/rules', b),
     update:   (id, b) => patch(`/automation/rules/${id}`, b),
@@ -148,9 +158,20 @@ const Api = (() => {
 
   // Bulk
   const bulk = {
-    list:   ()      => get('/bulk/jobs'),
-    create: (b)     => post('/bulk/jobs', b),
-    send:   (id)    => post(`/bulk/jobs/${id}/send`),
+    list:    ()      => get('/bulk/jobs'),
+    create:  (b)     => post('/bulk/jobs', b),
+    send:    (id)    => post(`/bulk/jobs/${id}/send`),
+    stop:    (id)    => post(`/bulk/jobs/${id}/stop`),
+    logs:    (id)    => get(`/bulk/jobs/${id}/logs`),
+    credits: ()      => get('/bulk/credits'),
+    templates:      ()      => get('/bulk/templates'),
+    createTemplate: (b)     => post('/bulk/templates', b),
+    updateTemplate: (id, b) => patch(`/bulk/templates/${id}`, b),
+    delTemplate:    (id)    => del(`/bulk/templates/${id}`),
+    chatLists:      ()      => get('/bulk/chat-lists'),
+    createChatList: (b)     => post('/bulk/chat-lists', b),
+    updateChatList: (id, b) => patch(`/bulk/chat-lists/${id}`, b),
+    delChatList:    (id)    => del(`/bulk/chat-lists/${id}`),
   };
 
   // AI
@@ -161,6 +182,83 @@ const Api = (() => {
     summarize:     (chatId) => post(`/ai/chat/${chatId}/summarize`),
     suggestReply:  (chatId) => post(`/ai/chat/${chatId}/suggest-reply`),
     translate:     (text, lang) => post('/ai/translate', { text, target_language: lang }),
+    polish:        (text, tone) => post('/ai/polish', { text, tone: tone || 'professional' }),
+    settings:      ()   => get('/ai/settings'),
+    saveSettings:  (b)  => req('PUT', '/ai/settings', b),
+    assistant:     (b)  => post('/ai/assistant', b),
+  };
+
+  // Activity logs
+  const logs = {
+    list:    (q) => get('/logs', q),
+    actions: ()  => get('/logs/actions'),
+  };
+
+  // Groups
+  const groups = {
+    list:            (q)  => get('/groups', q),
+    participants:    (id) => get(`/groups/${id}/participants`),
+    analytics:       (id, days) => get(`/groups/${id}/analytics`, { days: days || 30 }),
+    addParticipants: (b)  => post('/groups/add-participants', b),
+  };
+
+  // Scheduled messages
+  const scheduled = {
+    list:   (q)     => get('/scheduled', q),
+    create: (b)     => post('/scheduled', b),
+    update: (id, b) => patch(`/scheduled/${id}`, b),
+    cancel: (id)    => del(`/scheduled/${id}`),
+  };
+
+  // Tasks
+  const tasks = {
+    list:   (q)     => get('/tasks', q),
+    create: (b)     => post('/tasks', b),
+    update: (id, b) => patch(`/tasks/${id}`, b),
+    del:    (id)    => del(`/tasks/${id}`),
+  };
+
+  // Custom properties
+  const properties = {
+    definitions:  (entity) => get('/properties/definitions', entity ? { entity } : undefined),
+    createDef:    (b)      => post('/properties/definitions', b),
+    updateDef:    (id, b)  => patch(`/properties/definitions/${id}`, b),
+    deleteDef:    (id)     => del(`/properties/definitions/${id}`),
+    chatValues:   (id)     => get(`/properties/chat/${id}`),
+    setChat:      (id, values)   => req('PUT', `/properties/chat/${id}`, { values }),
+    ticketValues: (id)     => get(`/properties/ticket/${id}`),
+    setTicket:    (id, values)   => req('PUT', `/properties/ticket/${id}`, { values }),
+  };
+
+  // Developer platform
+  const developer = {
+    apiKeys:       ()   => get('/developer/api-keys'),
+    createApiKey:  (b)  => post('/developer/api-keys', b),
+    revokeApiKey:  (id) => del(`/developer/api-keys/${id}`),
+    webhooks:      ()   => get('/developer/webhooks'),
+    webhookEvents: ()   => get('/developer/webhook-events'),
+    createWebhook: (b)  => post('/developer/webhooks', b),
+    testWebhook:   (id) => post(`/developer/webhooks/${id}/test`),
+    delWebhook:    (id) => del(`/developer/webhooks/${id}`),
+  };
+
+  // Exports: authenticated file downloads
+  async function download(path, filename) {
+    const r = await fetch(BASE + path, { headers: headers() });
+    if (!r.ok) throw new Error('Export failed');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }
+  const exportsApi = {
+    chats:    ()     => download('/exports/chats.csv', 'chats.csv'),
+    messages: (days) => download(`/exports/messages.csv?days=${days || 30}`, 'messages.csv'),
+    tickets:  ()     => download('/exports/tickets.csv', 'tickets.csv'),
+    contacts: ()     => download('/exports/contacts.csv', 'contacts.csv'),
+    logs:     (days) => download(`/exports/logs.csv?days=${days || 30}`, 'audit_logs.csv'),
   };
 
   // Search
@@ -170,5 +268,7 @@ const Api = (() => {
     setToken, clearToken, getToken,
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
     phones, analytics, automation, kb, bulk, ai, search,
+    logs, groups, scheduled, developer, exports: exportsApi,
+    tasks, properties,
   };
 })();

@@ -3,9 +3,12 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.auth import get_current_agent
 from app.db.session import get_db
+from app.models.agent import Agent
 from app.models.chat import ChatLabel
 from app.models.phone import Phone
 from app.schemas.inbox import (
@@ -14,6 +17,8 @@ from app.schemas.inbox import (
     MessageOut,
     SendMessageRequest,
 )
+from app.services.activity_service import log_activity
+from app.services.automation_service import fire_trigger
 from app.services.inbox_service import InboxService
 from app.services.waha_service import WAHAService
 
@@ -29,10 +34,13 @@ def list_chats(
     label_id: int | None = None,
     search: str | None = None,
     assigned_to: int | None = None,
+    is_group: bool | None = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
 ):
+    from app.core.permissions import allowed_phone_ids
     svc = InboxService(db)
     chats = svc.list_chats(
         phone_id=phone_id,
@@ -41,8 +49,10 @@ def list_chats(
         label_id=label_id,
         search=search,
         assigned_to=assigned_to,
+        is_group=is_group,
         limit=limit,
         offset=offset,
+        phone_ids=allowed_phone_ids(db, agent),
     )
     result = []
     for c in chats:
@@ -86,12 +96,33 @@ def get_chat(chat_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/chats/{chat_id}")
-def update_chat(chat_id: int, req: ChatUpdateRequest, db: Session = Depends(get_db)):
+def update_chat(
+    chat_id: int,
+    req: ChatUpdateRequest,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     svc = InboxService(db)
     updates = req.model_dump(exclude_none=True)
+    prev = svc.get_chat(chat_id)
+    prev_assigned = prev.assigned_to if prev else None
     chat = svc.update_chat(chat_id, **updates)
     if not chat:
         raise HTTPException(404, "Chat not found")
+    if "assigned_to" in updates and updates["assigned_to"] != prev_assigned:
+        log_activity(
+            db, "chat_assigned", entity_type="chat", entity_id=chat.id,
+            agent_id=agent.id,
+            description=f"Chat '{chat.name}' assigned to agent #{updates['assigned_to']}",
+        )
+        background.add_task(fire_trigger, "chat_assigned", {
+            "chat_id": chat.id,
+            "chat_wid": chat.chat_wid,
+            "chat_name": chat.name,
+            "assigned_to": updates["assigned_to"],
+            "is_group": chat.is_group,
+        })
     return {"ok": True}
 
 
@@ -125,7 +156,11 @@ def get_messages(
 
 
 @router.post("/send")
-async def send_message(req: SendMessageRequest, db: Session = Depends(get_db)):
+async def send_message(
+    req: SendMessageRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     svc = InboxService(db)
     chat = svc.get_chat(req.chat_id)
     if not chat:
@@ -137,7 +172,12 @@ async def send_message(req: SendMessageRequest, db: Session = Depends(get_db)):
 
     waha = WAHAService(session_name=phone.session_name)
     try:
-        result = await waha.send_text(chat.chat_wid, req.body)
+        if req.message_type == "image" and req.media_url:
+            result = await waha.send_image(chat.chat_wid, req.media_url, caption=req.body)
+        elif req.message_type == "file" and req.media_url:
+            result = await waha.send_file(chat.chat_wid, req.media_url, caption=req.body)
+        else:
+            result = await waha.send_text(chat.chat_wid, req.body)
     except Exception as exc:
         raise HTTPException(500, f"Send failed: {exc}")
 
@@ -148,10 +188,13 @@ async def send_message(req: SendMessageRequest, db: Session = Depends(get_db)):
             "phone_id": phone.id,
             "message_wid": result.message_id or f"sent_{datetime.utcnow().timestamp()}",
             "from_me": True,
-            "sender_name": "Agent",
+            "sender_name": agent.name or "Agent",
             "sender_number": phone.phone_number,
+            "sent_by_agent_id": agent.id,
             "body": req.body,
-            "message_type": "text",
+            "message_type": req.message_type if req.media_url else "text",
+            "has_media": bool(req.media_url),
+            "media_url": req.media_url,
             "timestamp": datetime.utcnow(),
         })
     except IntegrityError:
@@ -167,12 +210,20 @@ async def send_message(req: SendMessageRequest, db: Session = Depends(get_db)):
         logger.exception("upsert_message failed after successful WAHA send")
         raise HTTPException(500, f"DB save failed: {exc}")
 
+    # A human replied — snooze the AI for the configured quiet period
+    if chat.ai_active and chat.ai_state != "SNOOZED":
+        chat.ai_state = "SNOOZED"
+        chat.ai_snoozed_at = datetime.utcnow()
+        db.commit()
+
     return {"ok": True, "message_id": msg.id}
 
 
 @router.post("/chats/{chat_id}/sync-messages")
-async def sync_chat_messages(chat_id: int, db: Session = Depends(get_db)):
-    """Fetch recent messages from WAHA for a chat and save to DB."""
+async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depends(get_db)):
+    """Fetch recent messages from WAHA for a chat and save to DB.
+
+    Pass a larger `limit` to pull deeper history (capped at 500)."""
     svc = InboxService(db)
     chat = svc.get_chat(chat_id)
     if not chat:
@@ -183,7 +234,7 @@ async def sync_chat_messages(chat_id: int, db: Session = Depends(get_db)):
 
     waha = WAHAService(session_name=phone.session_name)
     try:
-        messages = await waha.get_messages(chat.chat_wid, limit=50)
+        messages = await waha.get_messages(chat.chat_wid, limit=min(max(limit, 1), 500))
     except Exception:
         messages = []
 
@@ -238,9 +289,71 @@ async def sync_chat_messages(chat_id: int, db: Session = Depends(get_db)):
     return {"synced": synced}
 
 
+class BulkChatUpdateRequest(BaseModel):
+    chat_ids: list[int]
+    updates: dict | None = None          # is_archived / is_pinned / ai_active / is_flagged
+    mark_read: bool | None = None        # True → read, False → unread
+    add_label_id: int | None = None
+    remove_label_id: int | None = None
+
+
+@router.post("/bulk-update")
+def bulk_update_chats(
+    req: BulkChatUpdateRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Apply changes to many chats at once (chat-list bulk actions)."""
+    if not req.chat_ids:
+        raise HTTPException(400, "No chats selected")
+    ids = req.chat_ids[:500]
+    svc = InboxService(db)
+
+    allowed = {"is_archived", "is_pinned", "ai_active", "is_flagged"}
+    updates = {k: v for k, v in (req.updates or {}).items() if k in allowed}
+    if "ai_active" in updates:
+        updates["ai_state"] = "ACTIVE" if updates["ai_active"] else "INACTIVE"
+    if updates:
+        svc.bulk_update_chats(ids, **updates)
+
+    if req.mark_read is True:
+        from app.models.chat import Chat as _Chat
+        db.query(_Chat).filter(_Chat.id.in_(ids)).update({"unread_count": 0})
+        db.commit()
+    elif req.mark_read is False:
+        from app.models.chat import Chat as _Chat
+        db.query(_Chat).filter(_Chat.id.in_(ids), _Chat.unread_count == 0).update({"unread_count": 1})
+        db.commit()
+
+    if req.add_label_id:
+        for cid in ids:
+            svc.add_label_to_chat(cid, req.add_label_id)
+    if req.remove_label_id:
+        for cid in ids:
+            svc.remove_label_from_chat(cid, req.remove_label_id)
+
+    log_activity(
+        db, "chats_bulk_updated", entity_type="chat", agent_id=agent.id,
+        description=f"Bulk update on {len(ids)} chats: "
+                    f"{', '.join(list(updates.keys()) + (['read' if req.mark_read else 'unread'] if req.mark_read is not None else []) + (['+label'] if req.add_label_id else []) + (['-label'] if req.remove_label_id else []))}",
+        metadata={"chat_ids": ids},
+    )
+    return {"updated": len(ids)}
+
+
 @router.post("/chats/{chat_id}/labels/{label_id}")
-def add_label(chat_id: int, label_id: int, db: Session = Depends(get_db)):
+def add_label(
+    chat_id: int,
+    label_id: int,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     InboxService(db).add_label_to_chat(chat_id, label_id)
+    background.add_task(fire_trigger, "label_added", {
+        "chat_id": chat_id,
+        "label_id": label_id,
+        "source": "manual",
+    })
     return {"ok": True}
 
 
@@ -266,8 +379,37 @@ async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
             cid = cid.get("_serialized") or cid.get("id", "")
         if not cid:
             continue
-        name = c.get("name") or c.get("subject") or str(cid).split("@")[0]
         is_group = str(cid).endswith("@g.us")
+        name = c.get("name") or c.get("subject") or ""
+        if not name or "@" in name:
+            if is_group:
+                try:
+                    info = await waha.get_group_info(str(cid))
+                    name = info.get("subject") or info.get("name") or ""
+                except Exception:
+                    name = ""
+                name = name or f"Group {str(cid).split('@')[0][-6:]}"
+            else:
+                name = str(cid).split("@")[0]
         svc.upsert_chat({"chat_wid": str(cid), "phone_id": phone_id, "name": name, "is_group": is_group})
         synced += 1
+
+    # Repair previously synced chats that still have WID-looking names
+    from app.models.chat import Chat as _Chat
+    stale = (
+        db.query(_Chat)
+        .filter(_Chat.phone_id == phone_id, _Chat.is_group == True, _Chat.name.like("%@g.us%"))
+        .limit(100)
+        .all()
+    )
+    for chat in stale:
+        try:
+            info = await waha.get_group_info(chat.chat_wid)
+            subject = info.get("subject") or info.get("name") or ""
+            if subject:
+                chat.name = subject
+        except Exception:
+            continue
+    if stale:
+        db.commit()
     return {"synced": synced}

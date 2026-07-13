@@ -86,3 +86,44 @@ def list_agents(
     _agent: Agent = Depends(get_current_agent),
 ):
     return db.query(Agent).filter(Agent.is_active == True).all()
+
+
+@router.get("/agents/{agent_id}/phones")
+def get_agent_phones(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_agent),
+):
+    """Number-level permissions for an agent. Empty list = access to all numbers."""
+    from app.models.agent_phone import AgentPhone
+    rows = db.query(AgentPhone.phone_id).filter(AgentPhone.agent_id == agent_id).all()
+    return {"agent_id": agent_id, "phone_ids": [r[0] for r in rows]}
+
+
+@router.put("/agents/{agent_id}/phones")
+def set_agent_phones(
+    agent_id: int,
+    phone_ids: list[int],
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_agent),
+):
+    """Restrict an agent to specific numbers (admin only). Empty list clears restrictions."""
+    from app.models.agent import AgentRole
+    from app.models.agent_phone import AgentPhone
+    from app.services.activity_service import log_activity
+
+    if current_agent.role != AgentRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only admins can set number permissions")
+    if not db.query(Agent).filter(Agent.id == agent_id).first():
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    db.query(AgentPhone).filter(AgentPhone.agent_id == agent_id).delete()
+    for pid in set(phone_ids):
+        db.add(AgentPhone(agent_id=agent_id, phone_id=pid))
+    db.commit()
+    log_activity(
+        db, "agent_phones_updated", entity_type="agent", entity_id=agent_id,
+        agent_id=current_agent.id,
+        description=f"Number permissions for agent #{agent_id} set to {sorted(set(phone_ids)) or 'all'}",
+    )
+    return {"agent_id": agent_id, "phone_ids": sorted(set(phone_ids))}

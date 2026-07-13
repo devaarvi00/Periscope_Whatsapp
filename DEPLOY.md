@@ -1,4 +1,4 @@
-# Periskope — Production Deployment Guide
+# Hyperscope — Production Deployment Guide
 
 ## Prerequisites
 - Ubuntu 22.04 server
@@ -11,8 +11,8 @@
 ## Step 1 — Clone & configure
 
 ```bash
-git clone <your-repo> /opt/periskope
-cd /opt/periskope
+git clone <your-repo> /opt/hyperscope
+cd /opt/hyperscope
 
 # Copy and fill in all values
 cp .env.production.example .env
@@ -41,12 +41,12 @@ apt install certbot -y
 certbot certonly --standalone -d yourdomain.com
 
 # Copy certs to nginx folder
-mkdir -p /opt/periskope/nginx/certs
-cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem /opt/periskope/nginx/certs/
-cp /etc/letsencrypt/live/yourdomain.com/privkey.pem /opt/periskope/nginx/certs/
+mkdir -p /opt/hyperscope/nginx/certs
+cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem /opt/hyperscope/nginx/certs/
+cp /etc/letsencrypt/live/yourdomain.com/privkey.pem /opt/hyperscope/nginx/certs/
 
 # Update nginx.conf with your domain
-sed -i 's/YOUR_DOMAIN.com/yourdomain.com/g' /opt/periskope/nginx/nginx.conf
+sed -i 's/YOUR_DOMAIN.com/yourdomain.com/g' /opt/hyperscope/nginx/nginx.conf
 ```
 
 ---
@@ -54,7 +54,7 @@ sed -i 's/YOUR_DOMAIN.com/yourdomain.com/g' /opt/periskope/nginx/nginx.conf
 ## Step 3 — Start the stack
 
 ```bash
-cd /opt/periskope
+cd /opt/hyperscope
 
 # Build and start everything
 docker compose up -d --build
@@ -90,7 +90,7 @@ Then log in and **immediately change the password** from Settings.
 
 ```bash
 # Add crontab for cert renewal
-(crontab -l; echo "0 3 * * * certbot renew --quiet && cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem /opt/periskope/nginx/certs/ && cp /etc/letsencrypt/live/yourdomain.com/privkey.pem /opt/periskope/nginx/certs/ && docker compose -f /opt/periskope/docker-compose.yml restart nginx") | crontab -
+(crontab -l; echo "0 3 * * * certbot renew --quiet && cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem /opt/hyperscope/nginx/certs/ && cp /etc/letsencrypt/live/yourdomain.com/privkey.pem /opt/hyperscope/nginx/certs/ && docker compose -f /opt/hyperscope/docker-compose.yml restart nginx") | crontab -
 ```
 
 ---

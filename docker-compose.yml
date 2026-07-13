@@ -5,7 +5,7 @@ services:
   # ── MySQL ──────────────────────────────────────────────────────────
   mysql:
     image: mysql:8.0
-    container_name: periskope_mysql
+    container_name: hyperscope_mysql
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -13,7 +13,7 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     networks:
-      - periskope
+      - hyperscope
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
@@ -23,7 +23,7 @@ services:
   # ── WAHA (WhatsApp HTTP API) ───────────────────────────────────────
   waha:
     image: devlikeapro/waha:latest
-    container_name: periskope_waha
+    container_name: hyperscope_waha
     restart: unless-stopped
     environment:
       WHATSAPP_DEFAULT_ENGINE: WEBJS
@@ -31,14 +31,14 @@ services:
     volumes:
       - waha_data:/app/.wwebjs_auth
     networks:
-      - periskope
+      - hyperscope
     ports:
       - "3000:3000"   # Remove in production if behind nginx
 
-  # ── Periskope App ──────────────────────────────────────────────────
+  # ── Hyperscope App ──────────────────────────────────────────────────
   app:
     build: .
-    container_name: periskope_app
+    container_name: hyperscope_app
     restart: unless-stopped
     env_file: .env
     environment:
@@ -53,14 +53,14 @@ services:
       waha:
         condition: service_started
     networks:
-      - periskope
+      - hyperscope
     expose:
       - "8000"
 
   # ── Nginx (reverse proxy + SSL termination) ─────────────────────────
   nginx:
     image: nginx:alpine
-    container_name: periskope_nginx
+    container_name: hyperscope_nginx
     restart: unless-stopped
     ports:
       - "80:80"
@@ -71,12 +71,12 @@ services:
     depends_on:
       - app
     networks:
-      - periskope
+      - hyperscope
 
 volumes:
   mysql_data:
   waha_data:
 
 networks:
-  periskope:
+  hyperscope:
     driver: bridge

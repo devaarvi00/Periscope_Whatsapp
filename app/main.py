@@ -19,7 +19,15 @@ from app.api.bulk_messaging import router as bulk_router
 from app.api.contacts import router as contacts_router
 from app.api.inbox import router as inbox_router
 from app.api.knowledge_base import router as kb_router
+from app.api.developer import router as developer_router
+from app.api.exports import router as exports_router
+from app.api.groups import router as groups_router
+from app.api.scheduled import router as scheduled_router
+from app.api.properties import router as properties_router
+from app.api.public_api import router as public_api_router
+from app.api.tasks import router as tasks_router
 from app.api.labels import router as labels_router
+from app.api.logs import router as logs_router
 from app.api.notes import router as notes_router
 from app.api.phones import router as phones_router
 from app.api.quick_replies import router as qr_router
@@ -64,13 +72,23 @@ async def lifespan(_: FastAPI):
     await _configure_waha_webhook()
 
     from app.workers.scheduler import build_scheduler
-    from app.workers.tasks import check_sla_breaches, run_scheduled_bulk_jobs, sync_phone_statuses
+    from app.workers.tasks import (
+        check_no_reply_timeouts,
+        check_sla_breaches,
+        check_task_reminders,
+        run_scheduled_bulk_jobs,
+        run_scheduled_messages,
+        sync_phone_statuses,
+    )
     from apscheduler.triggers.interval import IntervalTrigger
 
     scheduler = build_scheduler()
     scheduler.add_job(sync_phone_statuses, IntervalTrigger(minutes=5), id="sync-phone-statuses")
     scheduler.add_job(check_sla_breaches, IntervalTrigger(minutes=10), id="check-sla")
     scheduler.add_job(run_scheduled_bulk_jobs, IntervalTrigger(minutes=1), id="bulk-jobs")
+    scheduler.add_job(check_no_reply_timeouts, IntervalTrigger(minutes=5), id="no-reply-timeouts")
+    scheduler.add_job(run_scheduled_messages, IntervalTrigger(minutes=1), id="scheduled-messages")
+    scheduler.add_job(check_task_reminders, IntervalTrigger(minutes=1), id="task-reminders")
     scheduler.start()
 
     yield
@@ -101,9 +119,11 @@ from app.api.auth import get_current_agent  # noqa: E402
 
 _auth = [Depends(get_current_agent)]
 
-# Public routes: auth (login/register) and webhooks (WAHA posts here without a JWT)
+# Public routes: auth (login/register), WAHA webhooks, and the API-key-guarded
+# developer API (it authenticates via X-API-Key instead of a JWT)
 app.include_router(auth_router, prefix=PREFIX)
 app.include_router(webhooks_router, prefix=PREFIX)
+app.include_router(public_api_router, prefix=PREFIX)
 
 # All other routes require a valid JWT
 app.include_router(inbox_router, prefix=PREFIX, dependencies=_auth)
@@ -119,6 +139,13 @@ app.include_router(automation_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(ai_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(kb_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(search_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(logs_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(exports_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(developer_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(groups_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(scheduled_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(tasks_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(properties_router, prefix=PREFIX, dependencies=_auth)
 
 
 @app.websocket("/ws")
@@ -209,7 +236,7 @@ async def serve_frontend():
     index = _FRONTEND / "index.html"
     if index.exists():
         return FileResponse(str(index))
-    return {"message": "Periskope WhatsApp CRM API", "docs": "/docs"}
+    return {"message": "Hyperscope WhatsApp CRM API", "docs": "/docs"}
 
 
 @app.get("/{path:path}", include_in_schema=False)

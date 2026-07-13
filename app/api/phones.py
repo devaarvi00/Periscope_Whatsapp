@@ -10,12 +10,19 @@ from app.models.message import Message
 from app.schemas.inbox import PhoneCreate, PhoneOut
 from app.services.waha_service import WAHAService
 
+from app.api.auth import get_current_agent as _current_agent
+
 router = APIRouter(prefix="/phones", tags=["phones"])
 
 
 @router.get("", response_model=list[PhoneOut])
-def list_phones(db: Session = Depends(get_db)):
-    return db.query(Phone).filter(Phone.is_active == True).all()
+def list_phones(db: Session = Depends(get_db), agent=Depends(_current_agent)):
+    from app.core.permissions import allowed_phone_ids
+    q = db.query(Phone).filter(Phone.is_active == True)
+    allowed = allowed_phone_ids(db, agent)
+    if allowed is not None:
+        q = q.filter(Phone.id.in_(allowed or [0]))
+    return q.all()
 
 
 @router.post("", response_model=PhoneOut, status_code=201)
@@ -93,6 +100,25 @@ async def clear_phone_data(phone_id: int, db: Session = Depends(get_db)):
     chat_ids = [r[0] for r in db.query(Chat.id).filter(Chat.phone_id == phone_id).all()]
 
     if chat_ids:
+        from sqlalchemy import update
+
+        from app.models.note import Note
+        from app.models.ticket import Ticket, TicketLabel
+        from app.models.bulk_message_job import BulkMessageLog
+        from app.models.scheduled_message import ScheduledMessage
+        from app.models.task import Task
+
+        ticket_ids = [r[0] for r in db.query(Ticket.id).filter(Ticket.chat_id.in_(chat_ids)).all()]
+        if ticket_ids:
+            db.execute(delete(TicketLabel).where(TicketLabel.ticket_id.in_(ticket_ids)))
+        db.execute(delete(Note).where(Note.chat_id.in_(chat_ids)))
+        db.execute(delete(Ticket).where(Ticket.chat_id.in_(chat_ids)))
+        db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
+        db.execute(delete(ScheduledMessage).where(ScheduledMessage.chat_id.in_(chat_ids)))
+        db.execute(delete(Task).where(Task.chat_id.in_(chat_ids)))
+        # Unlink task->message references for this phone's messages so deletion can't hit FK errors
+        msg_ids = db.query(Message.id).filter(Message.phone_id == phone_id).subquery()
+        db.execute(update(Task).where(Task.message_id.in_(msg_ids.select())).values(message_id=None))
         db.execute(delete(ChatLabel).where(ChatLabel.chat_id.in_(chat_ids)))
         db.execute(delete(Message).where(Message.phone_id == phone_id))
         db.execute(delete(Chat).where(Chat.phone_id == phone_id))

@@ -112,6 +112,43 @@ class WAHAService:
             logger.warning("WAHA get_messages error: %s", exc)
         return []
 
+    # ── Groups ────────────────────────────────────────────────────────────────
+
+    async def get_group_participants(self, group_id: str) -> list[dict[str, Any]]:
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/groups/{group_id}/participants"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                data = resp.json()
+                return data if isinstance(data, list) else data.get("participants", [])
+        except Exception as exc:
+            logger.warning("WAHA get_group_participants error: %s", exc)
+        return []
+
+    async def add_group_participants(self, group_id: str, participants: list[str]) -> bool:
+        """Add phone numbers (as WIDs) to a WhatsApp group."""
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/groups/{group_id}/participants/add"
+        payload = {"participants": [{"id": p} for p in participants]}
+        try:
+            resp = await get_http_client().post(url, headers=self._headers, json=payload)
+            return resp.is_success
+        except Exception as exc:
+            logger.warning("WAHA add_group_participants error: %s", exc)
+            return False
+
+    async def get_group_info(self, group_id: str) -> dict[str, Any]:
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/groups/{group_id}"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                return resp.json()
+        except Exception as exc:
+            logger.warning("WAHA get_group_info error: %s", exc)
+        return {}
+
     # ── Sending ────────────────────────────────────────────────────────────────
 
     async def send_text(self, chat_id: str, text: str) -> SendResult:
@@ -133,6 +170,32 @@ class WAHAService:
         }
         return await self._post("/api/sendImage", payload)
 
+    async def send_file(self, chat_id: str, url: str, filename: str = "", caption: str = "") -> SendResult:
+        if not chat_id.endswith(("@c.us", "@g.us")):
+            chat_id = f"{chat_id}@c.us"
+        payload = {
+            "session": self.session,
+            "chatId": chat_id,
+            "file": {"url": url, "filename": filename or url.rsplit("/", 1)[-1]},
+            "caption": caption,
+        }
+        return await self._post("/api/sendFile", payload)
+
+    async def send_poll(self, chat_id: str, question: str, options: list[str],
+                        multiple_answers: bool = False) -> SendResult:
+        if not chat_id.endswith(("@c.us", "@g.us")):
+            chat_id = f"{chat_id}@c.us"
+        payload = {
+            "session": self.session,
+            "chatId": chat_id,
+            "poll": {
+                "name": question,
+                "options": options,
+                "multipleAnswers": multiple_answers,
+            },
+        }
+        return await self._post("/api/sendPoll", payload)
+
     async def send_seen(self, chat_id: str) -> None:
         try:
             await self._post("/api/sendSeen", {"session": self.session, "chatId": chat_id})
@@ -146,7 +209,7 @@ class WAHAService:
             "config": {
                 "webhooks": [{
                     "url": webhook_url,
-                    "events": ["message", "message.any", "session.status"],
+                    "events": ["message", "message.any", "message.reaction", "session.status"],
                     "customHeaders": [{"name": "X-Webhook-Secret", "value": secret}],
                 }]
             }

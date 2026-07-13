@@ -1,4 +1,4 @@
-/* ── Periskope SPA ─────────────────────────────────────────────── */
+/* ── Hyperscope SPA ─────────────────────────────────────────────── */
 
 // ── Global State ──────────────────────────────────────────────── //
 const State = {
@@ -42,11 +42,102 @@ function initials(name) {
   return name.split(' ').slice(0, 2).map(w => w[0]).join('').toUpperCase();
 }
 
+// Human-friendly chat name: hide raw WhatsApp IDs like 1203...@g.us / 987...@lid
+function displayName(nameOrChat) {
+  const raw = typeof nameOrChat === 'object'
+    ? (nameOrChat.name || nameOrChat.chat_wid || '')
+    : (nameOrChat || '');
+  if (!raw.includes('@')) return raw;
+  const [id, domain] = raw.split('@');
+  if (domain === 'g.us') return `Group ${id.slice(-6)}`;
+  if (domain === 'lid') return 'WhatsApp user';
+  if (/^\d{6,}$/.test(id)) return `+${id}`;
+  return id;
+}
+
+// Thread subtitle: never expose raw WhatsApp IDs (@lid/@c.us/@g.us)
+function chatSubtitle(chat) {
+  if (!chat) return '';
+  if (chat.is_group) return '👥 Group';
+  const wid = chat.chat_wid || '';
+  const [id, domain] = wid.split('@');
+  if (domain === 'lid') return 'WhatsApp';           // anonymised id — not a dialable number
+  if (/^\d{6,}$/.test(id)) return `+${id}`;
+  return '';
+}
+
 function avatarColor(name) {
   const colors = ['#0D8C7C','#2563EB','#7C3AED','#DB2777','#D97706','#059669'];
   let h = 0;
   for (let i = 0; i < (name||'').length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xfffffff;
   return colors[h % colors.length];
+}
+
+// ── Label picker popover (create-on-the-fly, per docs) ──────────
+let _labelPickerEl = null;
+function closeLabelPicker() { if (_labelPickerEl) { _labelPickerEl.remove(); _labelPickerEl = null; } }
+document.addEventListener('click', e => {
+  if (_labelPickerEl && !_labelPickerEl.contains(e.target)) closeLabelPicker();
+});
+
+/**
+ * openLabelPicker(anchorEl, { applied:Set<int>, onToggle(label, nowApplied) })
+ * Shows all org labels with checkmarks; typing a new name offers "Create".
+ */
+function openLabelPicker(anchorEl, opts) {
+  closeLabelPicker();
+  const rect = anchorEl.getBoundingClientRect();
+  const el = document.createElement('div');
+  el.className = 'label-picker';
+  el.style.left = Math.min(rect.left, window.innerWidth - 250) + 'px';
+  el.style.top = (rect.bottom + 6) + 'px';
+  el.style.position = 'fixed';
+  document.body.appendChild(el);
+  _labelPickerEl = el;
+
+  function renderRows(query) {
+    const q = (query || '').toLowerCase();
+    const matches = State.labels.filter(l => !q || l.name.toLowerCase().includes(q));
+    const exact = State.labels.some(l => l.name.toLowerCase() === q);
+    el.querySelector('.lp-list').innerHTML =
+      matches.map(l => `
+        <div class="lp-row" data-lid="${l.id}">
+          <span class="lp-dot" style="background:${l.color}"></span>
+          <span style="flex:1">${esc(l.name)}</span>
+          ${opts.applied.has(l.id) ? '<span style="color:var(--accent)">✓</span>' : ''}
+        </div>`).join('') +
+      (q && !exact ? `<div class="lp-row lp-create" data-create="${esc(query)}">+ Create "${esc(query)}"</div>` : '') +
+      (!matches.length && !q ? '<div class="lp-row" style="color:var(--text-3)">No labels yet — type to create</div>' : '');
+
+    el.querySelectorAll('.lp-row[data-lid]').forEach(row => row.addEventListener('click', async () => {
+      const label = State.labels.find(l => l.id == row.dataset.lid);
+      const nowApplied = !opts.applied.has(label.id);
+      try {
+        await opts.onToggle(label, nowApplied);
+        nowApplied ? opts.applied.add(label.id) : opts.applied.delete(label.id);
+        renderRows(el.querySelector('input').value.trim());
+      } catch(e) { toast(e.message, 'error'); }
+    }));
+    const createRow = el.querySelector('.lp-row[data-create]');
+    if (createRow) createRow.addEventListener('click', async () => {
+      try {
+        const label = await Api.labels.create({ name: createRow.dataset.create });
+        State.labels.push(label);
+        await opts.onToggle(label, true);
+        opts.applied.add(label.id);
+        renderRows('');
+        el.querySelector('input').value = '';
+        toast(`Label "${label.name}" created`, 'success');
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  }
+
+  el.innerHTML = `<input type="text" placeholder="Search or create label..."><div class="lp-list"></div>`;
+  const input = el.querySelector('input');
+  input.addEventListener('input', () => renderRows(input.value.trim()));
+  input.addEventListener('click', e => e.stopPropagation());
+  renderRows('');
+  setTimeout(() => input.focus(), 30);
 }
 
 function toast(msg, type = 'default') {
@@ -120,12 +211,68 @@ function renderAgent() {
   const av = document.getElementById('agent-avatar');
   av.textContent = initials(a.name);
   av.style.background = avatarColor(a.name);
+  const be = document.getElementById('brand-agent-email');
+  if (be) be.textContent = a.email || '';
   // Topbar
   const ta = document.getElementById('topbar-avatar');
   const tn = document.getElementById('topbar-name');
   if (ta) { ta.textContent = initials(a.name); ta.style.background = avatarColor(a.name); }
   if (tn) tn.textContent = a.name.split(' ')[0];
 }
+
+// ── Topbar: refresh current view ─────────────────────────────────
+document.getElementById('topbar-refresh')?.addEventListener('click', () => {
+  navigateTo(State.currentView || 'dashboard');
+});
+
+// ── Topbar: global search with dropdown results ──────────────────
+(() => {
+  const input = document.getElementById('global-search');
+  if (!input) return;
+  const wrap = input.parentElement;
+  let box = null, timer = null;
+
+  function closeResults() { if (box) { box.remove(); box = null; } }
+  document.addEventListener('click', e => { if (!wrap.contains(e.target)) closeResults(); });
+
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { closeResults(); return; }
+    timer = setTimeout(async () => {
+      try {
+        const res = await Api.search(q);
+        closeResults();
+        box = document.createElement('div');
+        box.className = 'gs-results';
+        const section = (title, rows) => rows && rows.length
+          ? `<div class="gs-group">${title}</div>` + rows.join('') : '';
+        const chatRows = (res.chats || []).slice(0, 5).map(c =>
+          `<div class="gs-row" data-go="chat" data-id="${c.id}">💬 ${esc(c.name)}<span class="gs-sub">${c.is_group ? 'group' : 'chat'}</span></div>`);
+        const msgRows = (res.messages || []).slice(0, 5).map(m =>
+          `<div class="gs-row" data-go="chat" data-id="${m.chat_id}">📩 ${esc((m.body || '').slice(0, 60))}<span class="gs-sub">message</span></div>`);
+        const tkRows = (res.tickets || []).slice(0, 5).map(t =>
+          `<div class="gs-row" data-go="tickets">🎫 ${esc(t.title)}<span class="gs-sub">${esc(t.status || '')}</span></div>`);
+        const ctRows = (res.contacts || []).slice(0, 5).map(c =>
+          `<div class="gs-row" data-go="contacts">👤 ${esc(c.name || c.phone_number)}<span class="gs-sub">contact</span></div>`);
+        const html = section('Chats', chatRows) + section('Messages', msgRows)
+                   + section('Tickets', tkRows) + section('Contacts', ctRows);
+        box.innerHTML = html || '<div class="gs-row" style="color:var(--text-3)">No results</div>';
+        wrap.appendChild(box);
+        box.querySelectorAll('.gs-row[data-go]').forEach(row => {
+          row.addEventListener('click', () => {
+            const go = row.dataset.go;
+            closeResults(); input.value = '';
+            if (go === 'chat' && row.dataset.id) {
+              navigateTo('inbox');
+              setTimeout(() => { const c = State.inbox.chats?.find(x => x.id == row.dataset.id); if (c) openChat(c); }, 600);
+            } else if (go) navigateTo(go);
+          });
+        });
+      } catch(_) {}
+    }, 300);
+  });
+})();
 
 // Password show/hide toggle
 document.getElementById('toggle-password')?.addEventListener('click', () => {
@@ -184,7 +331,7 @@ const VIEW_LABELS = {
   analytics: 'Analytics', 'ai-agent': 'AI',
   automation: 'Automation Rules', 'knowledge-base': 'Media',
   bulk: 'Bulk Messages', settings: 'Settings',
-  communities: 'Communities', logs: 'Logs',
+  communities: 'Groups', logs: 'Logs', scheduled: 'Scheduled Messages',
 };
 
 function navigateTo(view) {
@@ -202,7 +349,7 @@ function navigateTo(view) {
     inbox:            renderInbox,
     tickets:          renderTickets,
     contacts:         renderContacts,
-    'chat-list':      renderContacts,
+    'chat-list':      renderChatListView,
     analytics:        renderAnalytics,
     'ai-agent':       renderAIAgent,
     automation:       renderAutomation,
@@ -211,6 +358,7 @@ function navigateTo(view) {
     settings:         renderSettings,
     communities:      renderCommunities,
     logs:             renderLogs,
+    scheduled:        renderScheduled,
   }[view] || (() => { main.innerHTML = `<div class="loading-center">View not found</div>`; }))();
 }
 
@@ -312,6 +460,35 @@ function handleWSEvent(data) {
       const preview = (d.body || '').substring(0, 60);
       toast(`💬 New message: ${preview}`, 'default');
     }
+    if (!d.from_me && typeof notifyUser === 'function') {
+      notifyUser('new_messages', displayName(d.sender_name || d.chat_wid || 'New message'), d.body || 'Media message');
+    }
+    return;
+  }
+
+  if (event === 'note_mention') {
+    toast(`📝 ${esc(d.by)} mentioned you in ${esc(displayName(d.chat_name))}`, 'default');
+    if (typeof notifyUser === 'function') {
+      notifyUser('new_note', `${d.by} mentioned you`, d.content || '');
+    }
+    return;
+  }
+
+  if (event === 'ticket_assigned') {
+    toast(`🎫 ${esc(d.by)} assigned you ticket #${d.ticket_id}: ${esc(d.title)}`, 'default');
+    if (typeof notifyUser === 'function') notifyUser('ticket_assign', 'Ticket assigned to you', d.title || '');
+    return;
+  }
+
+  if (event === 'task_assigned') {
+    toast(`✅ ${esc(d.by)} assigned you a task: ${esc(d.title)}`, 'default');
+    if (typeof notifyUser === 'function') notifyUser('task_assign', 'Task assigned to you', d.title || '');
+    return;
+  }
+
+  if (event === 'task_reminder') {
+    toast(`⏰ Task reminder: ${esc(d.title)}`, 'default');
+    if (typeof notifyUser === 'function') notifyUser('task_assign', '⏰ Task reminder', d.title || '');
     return;
   }
 
@@ -363,7 +540,18 @@ async function loadLabels() {
   try { State.labels = await Api.labels.list(); } catch(_) {}
 }
 async function loadPhones() {
-  try { State.phones = await Api.phones.list(); } catch(_) {}
+  try {
+    State.phones = await Api.phones.list();
+    const badge = document.getElementById('topbar-phone-count');
+    const num = document.getElementById('topbar-phone-num');
+    const total = document.getElementById('topbar-phone-total');
+    if (badge && num) {
+      const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
+      num.textContent = working;
+      if (total) total.textContent = State.phones.length;
+      badge.style.display = State.phones.length ? 'flex' : 'none';
+    }
+  } catch(_) {}
 }
 
 // ── INBOX VIEW ─────────────────────────────────────────────────── //
@@ -387,6 +575,7 @@ async function renderInbox() {
           <span class="filter-chip" data-f="unread">Unread</span>
           <span class="filter-chip" data-f="flagged">Flagged</span>
           <span class="filter-chip" data-f="awaiting">Awaiting reply</span>
+          <span class="filter-chip" id="label-filter-chip">🏷 Label ▾</span>
         </div>
         <div class="chat-list" id="chat-list">
           <div class="loading-center"><div class="spinner"></div></div>
@@ -435,6 +624,22 @@ async function renderInbox() {
     } catch(e) { toast(e.message, 'error'); }
   });
 
+  // Label filter: show only chats carrying a chosen label
+  const lfChip = document.getElementById('label-filter-chip');
+  if (lfChip) lfChip.addEventListener('click', e => {
+    e.stopPropagation();
+    openLabelPicker(lfChip, {
+      applied: new Set(State.inbox.labelFilter ? [State.inbox.labelFilter] : []),
+      onToggle: async (label, nowApplied) => {
+        State.inbox.labelFilter = nowApplied ? label.id : null;
+        lfChip.textContent = nowApplied ? `🏷 ${label.name} ×` : '🏷 Label ▾';
+        lfChip.classList.toggle('active', nowApplied);
+        closeLabelPicker();
+        loadChats();
+      },
+    });
+  });
+
   document.getElementById('close-detail-btn').addEventListener('click', () => {
     document.getElementById('detail-panel').style.display = 'none';
     document.getElementById('inbox-layout').classList.remove('detail-open');
@@ -460,6 +665,7 @@ async function loadChats() {
   if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
   if (f === 'unread') {}
   if (f === 'awaiting') {}
+  if (State.inbox.labelFilter) q.label_id = State.inbox.labelFilter;
   if (State.inbox.search) q.search = State.inbox.search;
 
   try {
@@ -495,7 +701,7 @@ function renderChatList(chats) {
   }
   el.innerHTML = chats.map(c => {
     const active = c.id == State.inbox.selectedChatId ? ' active' : '';
-    const color = avatarColor(c.name || c.chat_wid);
+    const color = avatarColor(displayName(c));
     const isGroup = c.is_group;
     const unread = c.unread_count || 0;
 
@@ -528,10 +734,10 @@ function renderChatList(chats) {
     }
 
     return `<div class="chat-item${active}" data-cid="${c.id}">
-      <div class="chat-avatar${isGroup?' group':''}" style="background:${color}">${initials(c.name||c.chat_wid)}</div>
+      <div class="chat-avatar${isGroup?' group':''}" style="background:${color}">${initials(displayName(c))}</div>
       <div class="chat-meta">
         <div class="chat-meta-top">
-          <span class="chat-name">${esc(c.name||c.chat_wid)}</span>
+          <span class="chat-name">${esc(displayName(c))}</span>
           <span class="chat-time">${timeAgo(c.last_message_at)}</span>
         </div>
         <div class="chat-meta-bottom">
@@ -542,11 +748,30 @@ function renderChatList(chats) {
             ${unread ? `<span class="unread-dot">${unread > 99 ? '99+' : unread}</span>` : ''}
           </div>
         </div>
-        ${phoneTagHtml ? `<div style="display:flex;align-items:center;gap:.25rem;margin-top:2px">${phoneTagHtml}</div>` : ''}
+        ${phoneTagHtml ? `<div style="display:flex;align-items:center;gap:.25rem;margin-top:2px">${phoneTagHtml}${!labelsHtml ? `<span class="add-label-chip" data-addlabel="${c.id}">+ Label</span>` : ''}</div>` : (!labelsHtml ? `<div style="margin-top:2px"><span class="add-label-chip" data-addlabel="${c.id}">+ Label</span></div>` : '')}
         ${labelsHtml}
       </div>
     </div>`;
   }).join('');
+
+  // "+ Label" chips: inline label picker with create-on-the-fly
+  el.querySelectorAll('.add-label-chip').forEach(chip => {
+    chip.addEventListener('click', e => {
+      e.stopPropagation();
+      const chat = State.inbox.chats?.find(x => x.id == chip.dataset.addlabel);
+      if (!chat) return;
+      openLabelPicker(chip, {
+        applied: new Set(chat.labels || []),
+        onToggle: async (label, nowApplied) => {
+          if (nowApplied) await Api.inbox.addLabel(chat.id, label.id);
+          else await Api.inbox.removeLabel(chat.id, label.id);
+          chat.labels = nowApplied
+            ? [...(chat.labels || []), label.id]
+            : (chat.labels || []).filter(id => id !== label.id);
+        },
+      });
+    });
+  });
 
   el.querySelectorAll('.chat-item').forEach(el => {
     el.addEventListener('click', () => openChat(+el.dataset.cid));
@@ -607,9 +832,9 @@ async function renderContactDetail(chat) {
 
   body.innerHTML = `
     <div class="detail-contact-top">
-      <div class="detail-avatar" style="background:${color}">${initials(chat.name||chat.chat_wid)}</div>
-      <div class="detail-contact-name">${esc(chat.name||chat.chat_wid)}</div>
-      <div class="detail-contact-wid">${esc(chat.chat_wid||'')}</div>
+      <div class="detail-avatar" style="background:${color}">${initials(displayName(chat))}</div>
+      <div class="detail-contact-name">${esc(displayName(chat))}</div>
+      <div class="detail-contact-wid">${esc(chatSubtitle(chat))}</div>
     </div>
 
     <div class="detail-section">
@@ -636,9 +861,14 @@ async function renderContactDetail(chat) {
     </div>
 
     <div class="detail-section">
+      <div class="detail-section-label">Properties</div>
+      <div id="detail-properties"><span style="font-size:12px;color:var(--text-3)">Loading…</span></div>
+    </div>
+
+    <div class="detail-section">
       <div class="detail-section-label">Phone</div>
       <div style="font-size:12.5px;color:var(--text-2)">
-        ${chat.is_group ? 'Group chat' : (chat.chat_wid || '—')}
+        ${chat.is_group ? 'Group chat' : (chatSubtitle(chat) || '—')}
       </div>
       ${(() => {
         if (chat.phone_id && State.phones.length) {
@@ -690,6 +920,62 @@ async function renderContactDetail(chat) {
       renderChatList(State.inbox.chats);
     } catch(err) { toast(err.message, 'error'); }
   });
+
+  // Custom properties: render definitions with current values, save on change
+  (async () => {
+    const wrap = document.getElementById('detail-properties');
+    if (!wrap) return;
+    try {
+      const [defs, valRes] = await Promise.all([
+        Api.properties.definitions('chat'),
+        Api.properties.chatValues(chat.id),
+      ]);
+      const values = valRes.custom_properties || {};
+      if (!defs.length) {
+        wrap.innerHTML = `<div style="font-size:11.5px;color:var(--text-3)">
+          No custom properties defined.
+          <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent)">Create in Settings</a></div>`;
+        return;
+      }
+      const sections = {};
+      defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
+      wrap.innerHTML = Object.entries(sections).map(([sec, list]) => `
+        ${Object.keys(sections).length > 1 ? `<div class="prop-section-title">${esc(sec)}</div>` : ''}
+        ${list.map(d => {
+          const v = values[String(d.id)];
+          if (d.prop_type === 'single_select') {
+            return `<div class="prop-row"><label>${esc(d.name)}</label>
+              <select data-prop="${d.id}"><option value="">—</option>
+                ${(d.options || []).map(o => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}
+              </select></div>`;
+          }
+          if (d.prop_type === 'multi_select') {
+            const cur = Array.isArray(v) ? v : [];
+            return `<div class="prop-row"><label>${esc(d.name)}</label>
+              <div class="prop-multi" data-prop-multi="${d.id}">
+                ${(d.options || []).map(o => `<label><input type="checkbox" value="${esc(o)}" ${cur.includes(o) ? 'checked' : ''}>${esc(o)}</label>`).join('')}
+              </div></div>`;
+          }
+          const type = d.prop_type === 'date' ? 'date' : d.prop_type === 'number' ? 'number' : 'text';
+          return `<div class="prop-row"><label>${esc(d.name)}</label>
+            <input type="${type}" data-prop="${d.id}" value="${v != null ? esc(String(v)) : ''}"></div>`;
+        }).join('')}`).join('');
+
+      const save = async (id, value) => {
+        try { await Api.properties.setChat(chat.id, { [id]: value }); toast('Property saved', 'success'); }
+        catch(e) { toast(e.message, 'error'); }
+      };
+      wrap.querySelectorAll('[data-prop]').forEach(inp =>
+        inp.addEventListener('change', () => save(inp.dataset.prop, inp.value)));
+      wrap.querySelectorAll('[data-prop-multi]').forEach(group =>
+        group.querySelectorAll('input').forEach(cb => cb.addEventListener('change', () => {
+          const vals = [...group.querySelectorAll('input:checked')].map(c => c.value);
+          save(group.dataset.propMulti, vals);
+        })));
+    } catch(_) {
+      wrap.innerHTML = '<span style="font-size:11.5px;color:var(--text-3)">Could not load properties</span>';
+    }
+  })();
 
   // Add label handler
   const addLabelSel = document.getElementById('detail-add-label-select');
@@ -746,10 +1032,10 @@ function renderThread(chat) {
   panel.innerHTML = `
     <div class="thread-header">
       <div class="thread-contact-info">
-        <div class="chat-avatar" style="background:${avatarColor(chat.name||chat.chat_wid)};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(chat.name||chat.chat_wid)}</div>
+        <div class="chat-avatar" style="background:${avatarColor(displayName(chat))};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(displayName(chat))}</div>
         <div class="thread-contact-text">
-          <div class="thread-name">${esc(chat.name||chat.chat_wid)}</div>
-          <div class="thread-meta">${chat.is_group ? '👥 Group' : esc((chat.chat_wid||'').replace('@s.whatsapp.net','').replace('@g.us',''))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
+          <div class="thread-name">${esc(displayName(chat))}</div>
+          <div class="thread-meta">${esc(chatSubtitle(chat))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
         </div>
       </div>
       <div class="thread-actions">
@@ -796,9 +1082,16 @@ function renderThread(chat) {
     <div class="messages-area" id="messages-area">
       <div class="loading-center"><div class="spinner"></div></div>
     </div>
-    <div class="reply-area">
+    <div class="reply-area" id="reply-area">
+      <div class="composer-tabs">
+        <span class="composer-tab active" id="tab-whatsapp">WhatsApp</span>
+        <span class="composer-tab" id="tab-note">Private Note</span>
+      </div>
       <div class="reply-toolbar" id="reply-toolbar">
         <button class="btn btn-ghost btn-sm" id="btn-qr">/ Quick Reply</button>
+        <button class="btn btn-ghost btn-sm" id="btn-polish" title="AI polish: fix grammar and tone">✨ Polish</button>
+        <button class="btn btn-ghost btn-sm" id="btn-attach" title="Send image or file by URL">📎 Media</button>
+        <button class="btn btn-ghost btn-sm" id="btn-schedule" title="Schedule this message">🕐 Schedule</button>
         <select id="phone-select" class="btn btn-secondary btn-sm" style="border:1px solid var(--border);padding:3px 6px">
           ${State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('')}
         </select>
@@ -837,6 +1130,54 @@ function renderThread(chat) {
     } catch(e) { toast(e.message, 'error'); }
   });
 
+  // Polish draft reply
+  document.getElementById('btn-polish').addEventListener('click', async () => {
+    const ta = document.getElementById('reply-text');
+    const draft = ta.value.trim();
+    if (!draft) return toast('Type a draft first', 'error');
+    const btn = document.getElementById('btn-polish');
+    btn.disabled = true; btn.textContent = '✨ Polishing…';
+    try {
+      const res = await Api.ai.polish(draft);
+      ta.value = res.polished || draft;
+      toast('Reply polished', 'success');
+    } catch(e) { toast(e.message, 'error'); }
+    btn.disabled = false; btn.textContent = '✨ Polish';
+  });
+
+  // Send media by URL
+  document.getElementById('btn-attach').addEventListener('click', () => {
+    showModal('Send Media', `
+      <div class="form-group"><label>Type</label><select id="md-type">
+        <option value="image">Image</option><option value="file">File / PDF</option>
+      </select></div>
+      <div class="form-group"><label>Media URL *</label><input type="text" id="md-url" placeholder="https://example.com/photo.jpg"></div>
+      <div class="form-group"><label>Caption</label><input type="text" id="md-caption"></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="md-send">Send</button>
+      </div>`);
+    document.getElementById('md-send').addEventListener('click', async () => {
+      const url = document.getElementById('md-url').value.trim();
+      if (!url) return toast('Media URL required', 'error');
+      try {
+        await Api.inbox.send({
+          chat_id: chat.id,
+          body: document.getElementById('md-caption').value.trim(),
+          phone_id: parseInt(document.getElementById('phone-select').value) || null,
+          message_type: document.getElementById('md-type').value,
+          media_url: url,
+        });
+        closeModal(); toast('Media sent', 'success'); loadMessages(chat.id);
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  });
+
+  // Schedule current draft
+  document.getElementById('btn-schedule').addEventListener('click', () => {
+    showScheduleModal(chat.id, document.getElementById('reply-text').value.trim());
+  });
+
   // Summarize
   document.getElementById('btn-summarize').addEventListener('click', async () => {
     try {
@@ -847,28 +1188,7 @@ function renderThread(chat) {
 
   // Create ticket
   document.getElementById('btn-ticket').addEventListener('click', () => {
-    showModal('Create Ticket', `
-      <div class="form-group"><label>Title</label><input type="text" id="tk-title" placeholder="Issue title..."></div>
-      <div class="form-group"><label>Description</label><textarea id="tk-desc" placeholder="Describe the issue..."></textarea></div>
-      <div class="form-group"><label>Priority</label>
-        <select id="tk-priority"><option value="medium">Medium</option><option value="low">Low</option><option value="high">High</option><option value="urgent">Urgent</option></select>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" id="tk-save-btn">Create Ticket</button>
-      </div>`);
-    document.getElementById('tk-save-btn').addEventListener('click', async () => {
-      const title = document.getElementById('tk-title').value.trim();
-      if (!title) return toast('Title required', 'error');
-      try {
-        await Api.tickets.create({
-          chat_id: chat.id, title,
-          description: document.getElementById('tk-desc').value,
-          priority: document.getElementById('tk-priority').value,
-        });
-        closeModal(); toast('Ticket created', 'success');
-      } catch(e) { toast(e.message, 'error'); }
-    });
+    showTicketModal({ chatId: chat.id });
   });
 
   // Add note
@@ -962,24 +1282,100 @@ function renderThread(chat) {
     } catch(e) { toast(e.message, 'error'); }
   });
 
-  // Send message
+  // Composer mode: WhatsApp message vs. private team note
+  let composerMode = 'whatsapp';
+  const tabWA = document.getElementById('tab-whatsapp');
+  const tabNote = document.getElementById('tab-note');
+  const replyArea = document.getElementById('reply-area');
+  const setComposerMode = mode => {
+    composerMode = mode;
+    const note = mode === 'note';
+    tabWA.classList.toggle('active', !note);
+    tabNote.classList.toggle('active', false);
+    tabNote.classList.toggle('note-active', note);
+    replyArea.classList.toggle('note-mode', note);
+    document.getElementById('reply-text').placeholder = note
+      ? 'Write a private note — only your team can see this…'
+      : 'Type a message… (Enter to send, Shift+Enter for newline)';
+  };
+  tabWA.addEventListener('click', () => setComposerMode('whatsapp'));
+  tabNote.addEventListener('click', () => setComposerMode('note'));
+
+  // Send message (or save private note)
   const sendMsg = async () => {
     const text = document.getElementById('reply-text').value.trim();
     if (!text) return;
-    const phoneId = document.getElementById('phone-select')?.value;
-    if (!phoneId) return toast('Select a phone', 'error');
     const btn = document.getElementById('send-btn');
     btn.disabled = true;
     try {
-      await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
-      document.getElementById('reply-text').value = '';
-      await loadMessages(chat.id);
+      if (composerMode === 'note') {
+        await Api.notes.create({ chat_id: chat.id, content: text });
+        document.getElementById('reply-text').value = '';
+        toast('Private note added — team only', 'success');
+        await loadMessages(chat.id);   // show the note in the thread
+      } else {
+        const phoneId = document.getElementById('phone-select')?.value;
+        if (!phoneId) { btn.disabled = false; return toast('Select a phone', 'error'); }
+        await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
+        document.getElementById('reply-text').value = '';
+        await loadMessages(chat.id);
+      }
     } catch(e) { toast(e.message, 'error'); }
     btn.disabled = false;
   };
 
   document.getElementById('send-btn').addEventListener('click', sendMsg);
+
+  // Quick reply slash suggestions: type "/" and matching replies appear inline
+  const replyBar = document.querySelector('.reply-bar');
+  if (replyBar) replyBar.style.position = 'relative';
+  let qrCache = null, qrBox = null, qrSel = 0;
+  const closeQrSuggest = () => { if (qrBox) { qrBox.remove(); qrBox = null; } };
+
+  async function updateQrSuggest() {
+    const ta = document.getElementById('reply-text');
+    const text = ta.value;
+    if (!text.startsWith('/') || text.includes(' ') || composerMode === 'note') { closeQrSuggest(); return; }
+    if (!qrCache) {
+      try { qrCache = await Api.quickReplies.list(); } catch(_) { qrCache = []; }
+    }
+    const q = text.slice(1).toLowerCase();
+    const matches = qrCache.filter(r => r.command.toLowerCase().includes(q)).slice(0, 6);
+    if (!matches.length) { closeQrSuggest(); return; }
+    if (!qrBox) {
+      qrBox = document.createElement('div');
+      qrBox.className = 'qr-suggest';
+      replyBar.appendChild(qrBox);
+    }
+    qrSel = Math.min(qrSel, matches.length - 1);
+    qrBox.innerHTML = matches.map((r, i) => `
+      <div class="qr-row ${i === qrSel ? 'sel' : ''}" data-i="${i}">
+        <span class="qr-cmd">/${esc(r.command)}</span>
+        <span class="qr-msg">${esc(r.message)}</span>
+      </div>`).join('');
+    qrBox.querySelectorAll('.qr-row').forEach(row => row.addEventListener('mousedown', e => {
+      e.preventDefault();
+      ta.value = matches[+row.dataset.i].message;
+      closeQrSuggest();
+      ta.focus();
+    }));
+    qrBox._matches = matches;
+  }
+
+  document.getElementById('reply-text').addEventListener('input', updateQrSuggest);
+  document.getElementById('reply-text').addEventListener('blur', () => setTimeout(closeQrSuggest, 150));
   document.getElementById('reply-text').addEventListener('keydown', e => {
+    if (qrBox && qrBox._matches?.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); qrSel = (qrSel + 1) % qrBox._matches.length; updateQrSuggest(); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); qrSel = (qrSel - 1 + qrBox._matches.length) % qrBox._matches.length; updateQrSuggest(); return; }
+      if (e.key === 'Tab' || e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('reply-text').value = qrBox._matches[qrSel].message;
+        closeQrSuggest();
+        return;
+      }
+      if (e.key === 'Escape') { closeQrSuggest(); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
   });
 }
@@ -993,15 +1389,75 @@ async function loadMessages(chatId, _alreadySynced) {
     let messages = await Api.inbox.messages(chatId, { limit: 50 });
     // Auto-fetch from WAHA if DB has no messages for this chat yet
     if (messages.length === 0 && !_alreadySynced) {
-      try { await Api.inbox.syncMessages(chatId); } catch(_) {}
+      try { await Api.inbox.syncMessages(chatId, 100); } catch(_) {}
       messages = await Api.inbox.messages(chatId, { limit: 50 });
     }
     State.inbox.messages = messages;
-    area.innerHTML = messages.map(m => renderMessage(m, isGroup)).join('') ||
-      `<div class="empty-state" style="flex:none;padding:2rem"><p>No messages yet</p></div>`;
+
+    // Interleave private team notes into the thread (visible to team only)
+    let notes = [];
+    try { notes = await Api.notes.list(chatId); } catch(_) {}
+    const thread = messages.map(m => ({ kind: 'msg', ts: m.timestamp, item: m }))
+      .concat(notes.map(n => ({ kind: 'note', ts: n.created_at, item: n })))
+      .sort((a, b) => new Date(a.ts) - new Date(b.ts));
+
+    area.innerHTML =
+      `<div style="text-align:center;padding:.35rem 0">
+        <button class="btn btn-secondary btn-sm" id="load-older-btn">↺ Load older messages</button>
+      </div>` +
+      (thread.map(t => t.kind === 'note' ? renderNoteBubble(t.item) : renderMessage(t.item, isGroup)).join('') ||
+        `<div class="empty-state" style="flex:none;padding:2rem"><p>No messages yet — try Load older messages</p></div>`);
     area.scrollTop = area.scrollHeight;
+    document.getElementById('load-older-btn')?.addEventListener('click', () => loadOlderMessages(chatId, isGroup));
   } catch(e) {
     area.innerHTML = `<div class="loading-center text-muted">Could not load messages</div>`;
+  }
+}
+
+function renderNoteBubble(n) {
+  const content = esc(n.content || '').replace(/@([\w.]+)/g, '<strong style="color:#a16207">@$1</strong>');
+  return `<div class="msg me note-inline">
+    <div class="msg-bubble">
+      <div class="note-author">📝 Private note · ${esc(n.agent_name || 'Team')}</div>
+      ${content}
+    </div>
+    <div class="msg-info">${fmt(n.created_at)} · team only</div>
+  </div>`;
+}
+
+async function loadOlderMessages(chatId, isGroup) {
+  const btn = document.getElementById('load-older-btn');
+  const area = document.getElementById('messages-area');
+  if (!btn || !area) return;
+  btn.disabled = true; btn.textContent = 'Loading…';
+  try {
+    const current = State.inbox.messages || [];
+    const oldestId = current.length ? current[0].id : null;
+
+    // First try older rows already in the DB
+    let older = oldestId ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId }) : [];
+
+    // DB exhausted — pull deeper history from WhatsApp via WAHA
+    if (!older.length) {
+      await Api.inbox.syncMessages(chatId, Math.min(current.length + 150, 500));
+      older = oldestId
+        ? await Api.inbox.messages(chatId, { limit: 50, before_id: oldestId })
+        : await Api.inbox.messages(chatId, { limit: 50 });
+    }
+
+    if (!older.length) {
+      btn.textContent = 'No older messages';
+      setTimeout(() => { btn.disabled = false; btn.textContent = '↺ Load older messages'; }, 1500);
+      return;
+    }
+    State.inbox.messages = older.concat(current);
+    const prevHeight = area.scrollHeight;
+    btn.insertAdjacentHTML('afterend', older.map(m => renderMessage(m, isGroup)).join(''));
+    area.scrollTop = area.scrollHeight - prevHeight;   // keep viewport anchored
+    btn.disabled = false; btn.textContent = '↺ Load older messages';
+  } catch(e) {
+    toast(e.message, 'error');
+    btn.disabled = false; btn.textContent = '↺ Load older messages';
   }
 }
 
@@ -1014,9 +1470,14 @@ function renderMessage(m, isGroup) {
     </div>`;
   }
   const cls = m.from_me ? 'me' : 'them';
-  const senderDisplay = !m.from_me && (isGroup || m.sender_name)
-    ? (m.sender_name || m.sender_number || '').trim()
-    : '';
+  let senderDisplay = '';
+  if (!m.from_me && (isGroup || m.sender_name)) {
+    senderDisplay = (m.sender_name || '').trim();
+    if (!senderDisplay && m.sender_number) {
+      // never show raw @lid ids as sender
+      senderDisplay = /^\d{6,}$/.test(m.sender_number) ? `+${m.sender_number}` : '';
+    }
+  }
 
   let bubbleContent = '';
   const mtype = (m.message_type || 'text').toLowerCase();
@@ -1058,11 +1519,195 @@ function renderMessage(m, isGroup) {
     bubbleContent = m.body ? esc(m.body).replace(/\n/g, '<br>') : (m.has_media ? `<em style="opacity:.7">Media message</em>` : '');
   }
 
-  return `<div class="msg ${cls}">
+  return `<div class="msg ${cls}" data-mid="${m.id || ''}">
     ${senderDisplay ? `<div class="msg-sender">${esc(senderDisplay)}</div>` : ''}
     <div class="msg-bubble">${bubbleContent}</div>
     <div class="msg-info">${fmt(m.timestamp)} ${m.from_me ? (m.is_read ? '<span style="color:#53bdeb">✓✓</span>' : '✓') : ''}</div>
   </div>`;
+}
+
+// ── Right-click a message → Create Ticket / Create Task ──────────
+let _msgMenuEl = null;
+function closeMsgMenu() { if (_msgMenuEl) { _msgMenuEl.remove(); _msgMenuEl = null; } }
+document.addEventListener('click', () => closeMsgMenu());
+document.addEventListener('contextmenu', e => {
+  const msgEl = e.target.closest('.msg[data-mid]');
+  if (!msgEl || !msgEl.dataset.mid) return;
+  const area = document.getElementById('messages-area');
+  if (!area || !area.contains(msgEl)) return;
+  e.preventDefault();
+  closeMsgMenu();
+  const msg = (State.inbox.messages || []).find(m => m.id == msgEl.dataset.mid);
+  if (!msg) return;
+  const menu = document.createElement('div');
+  menu.className = 'msg-context-menu';
+  menu.style.left = Math.min(e.clientX, window.innerWidth - 190) + 'px';
+  menu.style.top = Math.min(e.clientY, window.innerHeight - 110) + 'px';
+  menu.innerHTML = `
+    <button data-act="ticket">🎫 Create Ticket</button>
+    <button data-act="task">✅ Create Task</button>
+    <button data-act="copy">📋 Copy text</button>`;
+  document.body.appendChild(menu);
+  _msgMenuEl = menu;
+  menu.querySelector('[data-act="ticket"]').addEventListener('click', () => {
+    closeMsgMenu();
+    showTicketModal({ chatId: State.inbox.selectedChatId, message: msg });
+  });
+  menu.querySelector('[data-act="task"]').addEventListener('click', () => {
+    closeMsgMenu();
+    showTaskModal({ chatId: State.inbox.selectedChatId, message: msg });
+  });
+  menu.querySelector('[data-act="copy"]').addEventListener('click', () => {
+    closeMsgMenu();
+    navigator.clipboard?.writeText(msg.body || '').then(() => toast('Copied', 'success'));
+  });
+});
+
+// ── Full ticket modal: status, assignee, priority presets, labels,
+//    ticket custom properties (required enforced) ─────────────────
+async function showTicketModal(opts) {
+  const { chatId, message } = opts || {};
+  let agents = [], defs = [];
+  try { agents = await Api.auth.agents(); } catch(_) {}
+  try { defs = await Api.properties.definitions('ticket'); } catch(_) {}
+  const labelOpts = State.labels.map(l =>
+    `<label style="display:flex;align-items:center;gap:.35rem;font-size:12.5px;font-weight:400;padding:.12rem 0">
+      <input type="checkbox" class="tk-label" value="${l.id}">
+      <span class="lp-dot" style="width:9px;height:9px;border-radius:3px;background:${l.color};display:inline-block"></span>${esc(l.name)}
+    </label>`).join('');
+
+  const propFields = defs.map(d => {
+    if (d.prop_type === 'single_select') {
+      return `<div class="prop-row"><label>${esc(d.name)}${d.required ? ' *' : ''}</label>
+        <select class="tk-prop" data-pid="${d.id}" data-required="${d.required}"><option value="">—</option>
+          ${(d.options || []).map(o => `<option>${esc(o)}</option>`).join('')}</select></div>`;
+    }
+    if (d.prop_type === 'multi_select') {
+      return `<div class="prop-row"><label>${esc(d.name)}${d.required ? ' *' : ''}</label>
+        <div class="prop-multi tk-prop-multi" data-pid="${d.id}" data-required="${d.required}">
+          ${(d.options || []).map(o => `<label><input type="checkbox" value="${esc(o)}">${esc(o)}</label>`).join('')}</div></div>`;
+    }
+    const type = d.prop_type === 'date' ? 'date' : d.prop_type === 'number' ? 'number' : 'text';
+    return `<div class="prop-row"><label>${esc(d.name)}${d.required ? ' *' : ''}</label>
+      <input type="${type}" class="tk-prop" data-pid="${d.id}" data-required="${d.required}"></div>`;
+  }).join('');
+
+  showModal('Create Ticket', `
+    ${message ? `<div style="font-size:12px;background:var(--border-light);border-radius:7px;padding:.5rem .7rem;margin-bottom:.8rem;color:var(--text-2)">
+      💬 From message: "${esc((message.body || '').slice(0, 120))}"</div>` : ''}
+    <div class="form-group"><label>Title *</label><input type="text" id="tkm-title" placeholder="e.g. Billing inquiry — customer overcharged"></div>
+    <div class="form-group"><label>Description</label><textarea id="tkm-desc" style="min-height:60px">${esc(message?.body || '')}</textarea></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.7rem">
+      <div class="form-group"><label>Status</label><select id="tkm-status">
+        <option value="open">Open</option><option value="in_progress">In Progress</option><option value="closed">Closed</option>
+      </select></div>
+      <div class="form-group"><label>Assignee</label><select id="tkm-assignee">
+        <option value="">Unassigned (queue)</option>
+        ${agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}
+      </select></div>
+      <div class="form-group"><label>Priority</label><select id="tkm-priority">
+        <option value="low">Low</option><option value="medium" selected>Medium</option>
+        <option value="high">High</option><option value="urgent">Urgent</option>
+      </select></div>
+      <div class="form-group"><label>Due Date</label><input type="datetime-local" id="tkm-due"></div>
+    </div>
+    ${labelOpts ? `<div class="form-group"><label>Labels</label><div style="max-height:110px;overflow-y:auto">${labelOpts}</div></div>` : ''}
+    ${propFields ? `<div class="form-group"><label style="font-weight:700">Custom Properties</label>${propFields}</div>` : ''}
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="tkm-save">Create Ticket</button>
+    </div>`);
+
+  // Priority → suggested due date (urgent 1h, high 4h, medium 24h, low 3d)
+  const prioSel = document.getElementById('tkm-priority');
+  const dueInp = document.getElementById('tkm-due');
+  const suggestDue = () => {
+    const hours = { urgent: 1, high: 4, medium: 24, low: 72 }[prioSel.value] || 24;
+    const d = new Date(Date.now() + hours * 3600 * 1000);
+    d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+    dueInp.value = d.toISOString().slice(0, 16);
+  };
+  prioSel.addEventListener('change', suggestDue);
+  suggestDue();
+
+  document.getElementById('tkm-save').addEventListener('click', async () => {
+    const title = document.getElementById('tkm-title').value.trim();
+    if (!title) return toast('Title required', 'error');
+    // enforce required custom properties
+    for (const el of document.querySelectorAll('.tk-prop[data-required="true"]')) {
+      if (!el.value) return toast('Fill all required properties', 'error');
+    }
+    for (const grp of document.querySelectorAll('.tk-prop-multi[data-required="true"]')) {
+      if (![...grp.querySelectorAll('input:checked')].length) return toast('Fill all required properties', 'error');
+    }
+    try {
+      const ticket = await Api.tickets.create({
+        chat_id: chatId,
+        message_id: message?.id || null,
+        title,
+        description: document.getElementById('tkm-desc').value,
+        status: document.getElementById('tkm-status').value,
+        priority: document.getElementById('tkm-priority').value,
+        assigned_to: parseInt(document.getElementById('tkm-assignee').value) || null,
+        due_date: dueInp.value || null,
+      });
+      const labelIds = [...document.querySelectorAll('.tk-label:checked')].map(c => +c.value);
+      for (const lid of labelIds) await Api.tickets.addLabel(ticket.id, lid).catch(() => {});
+      const values = {};
+      document.querySelectorAll('.tk-prop').forEach(el => { if (el.value) values[el.dataset.pid] = el.value; });
+      document.querySelectorAll('.tk-prop-multi').forEach(grp => {
+        const vals = [...grp.querySelectorAll('input:checked')].map(c => c.value);
+        if (vals.length) values[grp.dataset.pid] = vals;
+      });
+      if (Object.keys(values).length) await Api.properties.setTicket(ticket.id, values).catch(() => {});
+      closeModal();
+      toast(`Ticket #${ticket.id} created — linked to this chat`, 'success');
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── Full task modal (also used from message right-click) ─────────
+async function showTaskModal(opts) {
+  const { chatId, message } = opts || {};
+  let agents = [];
+  try { agents = await Api.auth.agents(); } catch(_) {}
+  showModal('Create Task', `
+    ${message ? `<div style="font-size:12px;background:var(--border-light);border-radius:7px;padding:.5rem .7rem;margin-bottom:.8rem;color:var(--text-2)">
+      💬 From message: "${esc((message.body || '').slice(0, 120))}"</div>` : ''}
+    <div class="form-group"><label>Task *</label><input type="text" id="tkt-title" placeholder="Enter your task..."></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.7rem">
+      <div class="form-group"><label>Due Date</label><input type="datetime-local" id="tkt-due"></div>
+      <div class="form-group"><label>Reminder</label><input type="datetime-local" id="tkt-reminder"></div>
+      <div class="form-group"><label>Assignee</label><select id="tkt-assignee">
+        <option value="">Unassigned</option>
+        ${agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}
+      </select></div>
+      <div class="form-group"><label>Priority</label><select id="tkt-prio">
+        <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
+      </select></div>
+    </div>
+    <div class="form-group"><label>Notes</label><textarea id="tkt-notes" style="min-height:60px">${esc(message?.body || '')}</textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="tkt-save">Save Task</button>
+    </div>`);
+  document.getElementById('tkt-save').addEventListener('click', async () => {
+    const title = document.getElementById('tkt-title').value.trim();
+    if (!title) return toast('Task title required', 'error');
+    try {
+      await Api.tasks.create({
+        title,
+        chat_id: chatId || null,
+        message_id: message?.id || null,
+        due_date: document.getElementById('tkt-due').value || null,
+        reminder_at: document.getElementById('tkt-reminder').value || null,
+        assigned_to: parseInt(document.getElementById('tkt-assignee').value) || null,
+        priority: document.getElementById('tkt-prio').value,
+        notes: document.getElementById('tkt-notes').value.trim() || null,
+      });
+      closeModal(); toast('Task created', 'success');
+    } catch(e) { toast(e.message, 'error'); }
+  });
 }
 
 function appendMessage(m) {
@@ -1153,8 +1798,18 @@ async function loadTickets(status = '') {
   } catch(e) { toast('Failed to load tickets', 'error'); }
 }
 
-function showCreateTicketModal() {
+async function showCreateTicketModal() {
+  let chats = [];
+  try {
+    chats = await Api.inbox.chats({ limit: 200 }).catch(() => []);
+  } catch (_) {}
+
+  const chatOpts = chats.map(c => `<option value="${c.id}">${esc(displayName(c))}</option>`).join('');
+
   showModal('New Ticket', `
+    <div class="form-group"><label>Customer Chat *</label>
+      <select id="ntk-chat">${chatOpts || '<option value="">— No active chats —</option>'}</select>
+    </div>
     <div class="form-group"><label>Title *</label><input type="text" id="ntk-title"></div>
     <div class="form-group"><label>Description</label><textarea id="ntk-desc"></textarea></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
@@ -1167,13 +1822,27 @@ function showCreateTicketModal() {
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="ntk-save">Create</button>
     </div>`);
+
   document.getElementById('ntk-save').addEventListener('click', async () => {
+    const chatSelect = document.getElementById('ntk-chat');
+    const chat_id = chatSelect ? parseInt(chatSelect.value) : null;
+    if (!chat_id) return toast('Chat selection required', 'error');
     const title = document.getElementById('ntk-title').value.trim();
     if (!title) return toast('Title required', 'error');
     try {
-      await Api.tickets.create({ title, description: document.getElementById('ntk-desc').value, priority: document.getElementById('ntk-priority').value, due_date: document.getElementById('ntk-due').value || null });
-      closeModal(); toast('Ticket created', 'success'); loadTickets();
-    } catch(e) { toast(e.message, 'error'); }
+      await Api.tickets.create({
+        chat_id,
+        title,
+        description: document.getElementById('ntk-desc').value,
+        priority: document.getElementById('ntk-priority').value,
+        due_date: document.getElementById('ntk-due').value || null
+      });
+      closeModal();
+      toast('Ticket created', 'success');
+      loadTickets();
+    } catch(e) {
+      toast(e.message, 'error');
+    }
   });
 }
 
@@ -1377,6 +2046,12 @@ async function renderAIAgent() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header"><h2>AI Agent</h2></div>
       <div class="scroll-area">
+        <div class="content-card" style="margin-bottom:1rem">
+          <div class="card-header">Agent Settings
+            <div class="header-actions"><button class="btn btn-primary btn-sm" id="ai-cfg-save">Save Settings</button></div>
+          </div>
+          <div class="card-body" id="ai-cfg-body"><div class="spinner"></div></div>
+        </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
           <div class="content-card">
             <div class="card-header">Active AI Chats</div>
@@ -1408,6 +2083,74 @@ async function renderAIAgent() {
 
   document.getElementById('goto-kb').addEventListener('click', e => { e.preventDefault(); navigateTo('knowledge-base'); });
 
+  // Agent Settings form (org-wide personalization + behavior)
+  try {
+    const cfg = await Api.ai.settings();
+    const el = document.getElementById('ai-cfg-body');
+    el.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.8rem 1.2rem">
+        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+          <input type="checkbox" id="cfg-enabled" ${cfg.enabled ? 'checked' : ''} style="width:15px;height:15px">
+          <strong>AI agent enabled</strong> (master switch)</label></div>
+        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+          <input type="checkbox" id="cfg-autoact" ${cfg.auto_activate_new_chats ? 'checked' : ''} style="width:15px;height:15px">
+          Auto-activate on new chats</label></div>
+        <div class="form-group"><label>Agent name (shown to customers)</label>
+          <input type="text" id="cfg-name" value="${esc(cfg.agent_name)}"></div>
+        <div class="form-group"><label>Personality</label><select id="cfg-personality">
+          <option value="friendly" ${cfg.personality === 'friendly' ? 'selected' : ''}>Friendly — warm, moderate detail</option>
+          <option value="grounded" ${cfg.personality === 'grounded' ? 'selected' : ''}>Grounded — strictly factual</option>
+          <option value="spartan" ${cfg.personality === 'spartan' ? 'selected' : ''}>Spartan — ultra-brief</option>
+          <option value="sales" ${cfg.personality === 'sales' ? 'selected' : ''}>Sales — benefit-oriented</option>
+        </select></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Role & business context</label>
+          <textarea id="cfg-role" style="min-height:50px" placeholder="e.g. Support agent for Acme Store — we sell electronics, ship India-wide in 3-5 days...">${esc(cfg.role_description)}</textarea></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Operational instructions</label>
+          <textarea id="cfg-instructions" style="min-height:50px" placeholder="e.g. Technical bugs → say the engineering team will call back. Pricing → share the plans page...">${esc(cfg.custom_instructions)}</textarea></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Hard restrictions (the agent must never do these)</label>
+          <textarea id="cfg-restrictions" style="min-height:40px" placeholder="e.g. Never promise refunds, never share internal phone numbers, never schedule calls...">${esc(cfg.restrictions)}</textarea></div>
+        <div class="form-group" style="grid-column:1/-1"><label>Activation rules (when to reply / ignore)</label>
+          <textarea id="cfg-rules" style="min-height:40px" placeholder="e.g. Do not reply to plain greetings or thank-you messages. Only reply to actual questions.">${esc(cfg.activation_rules)}</textarea></div>
+        <div class="form-group"><label>Response delay (seconds, lets humans answer first)</label>
+          <input type="number" id="cfg-delay" min="0" max="6000" value="${cfg.response_delay_seconds}"></div>
+        <div class="form-group"><label>Snooze after human reply (seconds)</label>
+          <input type="number" id="cfg-snooze" min="0" max="6000" value="${cfg.snooze_after_human_seconds}"></div>
+        <div class="form-group"><label>Operating hours start (HH:MM, empty = always)</label>
+          <input type="text" id="cfg-hstart" value="${esc(cfg.hours_start)}" placeholder="09:00"></div>
+        <div class="form-group"><label>Operating hours end</label>
+          <input type="text" id="cfg-hend" value="${esc(cfg.hours_end)}" placeholder="18:00"></div>
+        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+          <input type="checkbox" id="cfg-flag" ${cfg.flag_enabled ? 'checked' : ''} style="width:15px;height:15px">
+          AI auto-flag important messages</label></div>
+        <div class="form-group"><label>Flag criteria</label>
+          <input type="text" id="cfg-flagcrit" value="${esc(cfg.flag_criteria)}" placeholder="urgent requests, complaints, refunds..."></div>
+      </div>`;
+    document.getElementById('ai-cfg-save').addEventListener('click', async () => {
+      try {
+        await Api.ai.saveSettings({
+          enabled: document.getElementById('cfg-enabled').checked,
+          auto_activate_new_chats: document.getElementById('cfg-autoact').checked,
+          agent_name: document.getElementById('cfg-name').value.trim() || 'AI Assistant',
+          personality: document.getElementById('cfg-personality').value,
+          role_description: document.getElementById('cfg-role').value.trim(),
+          custom_instructions: document.getElementById('cfg-instructions').value.trim(),
+          restrictions: document.getElementById('cfg-restrictions').value.trim(),
+          activation_rules: document.getElementById('cfg-rules').value.trim(),
+          response_delay_seconds: parseInt(document.getElementById('cfg-delay').value) || 0,
+          snooze_after_human_seconds: parseInt(document.getElementById('cfg-snooze').value) || 0,
+          hours_start: document.getElementById('cfg-hstart').value.trim(),
+          hours_end: document.getElementById('cfg-hend').value.trim(),
+          flag_enabled: document.getElementById('cfg-flag').checked,
+          flag_criteria: document.getElementById('cfg-flagcrit').value.trim(),
+        });
+        toast('AI agent settings saved', 'success');
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  } catch(e) {
+    const el = document.getElementById('ai-cfg-body');
+    if (el) el.innerHTML = `<p class="text-muted" style="font-size:12.5px">${esc(e.message)}</p>`;
+  }
+
   try {
     const chats = await Api.inbox.chats({ ai_active: true });
     const el = document.getElementById('ai-chats-list');
@@ -1415,7 +2158,7 @@ async function renderAIAgent() {
     else {
       el.innerHTML = chats.map(c => `
         <div style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;border-bottom:1px solid var(--border-light)">
-          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(c.name||c.chat_wid)}</div>
+          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(displayName(c))}</div>
           <span class="${pillClass(c.ai_state||'ACTIVE')}">${c.ai_state||'ACTIVE'}</span></div>
           <button class="btn btn-ghost btn-sm ai-takeover" data-cid="${c.id}">Takeover</button>
         </div>`).join('');
@@ -1625,70 +2368,433 @@ async function renderBulk() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
         <h2>Bulk Messaging</h2>
-        <div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-bulk-btn">+ New Campaign</button></div>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.6rem;align-items:center">
+          <span class="credits-chip" id="bulk-credits">credits: …</span>
+          <button class="btn btn-primary btn-sm" id="new-bulk-btn">+ New Campaign</button>
+        </div>
+      </div>
+      <div class="tab-bar" id="bulk-tabs">
+        <div class="tab active" data-btab="campaigns">Campaigns</div>
+        <div class="tab" data-btab="templates">Message Templates</div>
+        <div class="tab" data-btab="chatlists">Saved Chat Lists</div>
       </div>
       <div class="scroll-area" id="bulk-list"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>`;
-  await loadBulkJobs();
+  document.querySelectorAll('#bulk-tabs .tab').forEach(t => t.addEventListener('click', () => {
+    document.querySelectorAll('#bulk-tabs .tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    loadBulkTab(t.dataset.btab);
+  }));
   document.getElementById('new-bulk-btn').addEventListener('click', () => showBulkModal());
-}
-
-async function loadBulkJobs() {
+  await loadBulkTab('campaigns');
   try {
-    const jobs = await Api.bulk.list();
-    const el = document.getElementById('bulk-list');
-    if (!el) return;
-    if (!jobs.length) { el.innerHTML = `<div class="loading-center text-muted">No bulk jobs yet</div>`; return; }
-    el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
-      <thead><tr><th>Name</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Credits</th><th>Scheduled</th><th></th></tr></thead>
-      <tbody>${jobs.map(j => `<tr>
-        <td style="font-weight:600">${esc(j.name)}</td>
-        <td><span class="${pillClass(j.status==='completed'?'resolved':j.status==='running'?'in_progress':'open')}">${j.status}</span></td>
-        <td>${(j.recipient_chat_ids||[]).length}</td>
-        <td>${j.sent_count||0}</td>
-        <td>${j.failed_count||0}</td>
-        <td>${j.credits_used||0}</td>
-        <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? new Date(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
-        <td>${j.status==='pending' ? `<button class="btn btn-primary btn-sm bulk-send" data-jid="${j.id}">Send Now</button>` : ''}</td>
-      </tr>`).join('')}</tbody>
-    </table></div></div>`;
-    el.querySelectorAll('.bulk-send').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        if (!confirm('Send now?')) return;
-        try { await Api.bulk.send(btn.dataset.jid); toast('Sending...', 'success'); setTimeout(loadBulkJobs, 1500); }
-        catch(e) { toast(e.message, 'error'); }
-      });
-    });
+    const c = await Api.bulk.credits();
+    const chip = document.getElementById('bulk-credits');
+    if (chip) chip.textContent = `${c.remaining.toLocaleString()} / ${c.monthly_limit.toLocaleString()} credits left`;
   } catch(_) {}
 }
 
-function showBulkModal() {
+function _bulkRepeatSummary(j) {
+  if (!j.repeat || j.repeat === 'none') return j.scheduled_at ? 'Once' : 'Immediate';
+  const every = (j.interval || 1) > 1 ? `every ${j.interval} ` : '';
+  const names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  if (j.repeat === 'daily') {
+    const days = (j.days_of_week || []).map(d => names[d]).join(', ');
+    return 'Daily' + (days ? ` (${days})` : '') + (every ? ` · ${every}days` : '');
+  }
+  if (j.repeat === 'weekly') return every ? `Every ${j.interval} weeks` : 'Weekly';
+  if (j.repeat === 'monthly') return (every ? `Every ${j.interval} months` : 'Monthly') + (j.day_of_month ? ` on day ${j.day_of_month}` : '');
+  return j.repeat;
+}
+
+async function loadBulkTab(tab) {
+  const el = document.getElementById('bulk-list');
+  if (!el) return;
+  el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+
+  if (tab === 'campaigns') {
+    try {
+      const jobs = await Api.bulk.list();
+      if (!jobs.length) { el.innerHTML = `<div class="loading-center text-muted">No campaigns yet — create one to get started</div>`; return; }
+      el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
+        <thead><tr><th>Name</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Repeat</th><th>Runs</th><th>Next / Scheduled</th><th></th></tr></thead>
+        <tbody>${jobs.map(j => `<tr>
+          <td style="font-weight:600">${esc(j.name)}</td>
+          <td><span class="${pillClass(j.status==='done'?'resolved':j.status==='running'?'in_progress':j.status==='failed'||j.status==='cancelled'?'urgent':'open')}">${j.status}</span>${j.error_message ? ` <span title="${esc(j.error_message)}">⚠️</span>` : ''}</td>
+          <td>${(j.recipient_chat_ids||[]).length}</td>
+          <td>${j.sent_count||0}</td>
+          <td>${j.failed_count||0}</td>
+          <td style="font-size:12px">${esc(_bulkRepeatSummary(j))}${j.end_date ? `<div style="color:var(--text-3);font-size:11px">until ${new Date(j.end_date).toLocaleDateString()}</div>` : ''}</td>
+          <td>${j.runs_count||0}</td>
+          <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? new Date(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
+          <td style="white-space:nowrap">
+            <button class="btn btn-secondary btn-sm bulk-logs" data-jid="${j.id}">Logs</button>
+            ${j.status==='pending' ? `<button class="btn btn-primary btn-sm bulk-send" data-jid="${j.id}">Send Now</button>
+            <button class="btn btn-danger btn-sm bulk-stop" data-jid="${j.id}">Stop</button>` : ''}
+          </td>
+        </tr>`).join('')}</tbody>
+      </table></div></div>`;
+      el.querySelectorAll('.bulk-send').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Send this campaign now?')) return;
+        try { await Api.bulk.send(btn.dataset.jid); toast('Sending…', 'success'); setTimeout(() => loadBulkTab('campaigns'), 1500); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      el.querySelectorAll('.bulk-stop').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Stop this campaign (and any repeats)?')) return;
+        try { await Api.bulk.stop(btn.dataset.jid); toast('Stopped', 'success'); loadBulkTab('campaigns'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      el.querySelectorAll('.bulk-logs').forEach(btn => btn.addEventListener('click', () => showBulkLogs(btn.dataset.jid)));
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  else if (tab === 'templates') {
+    try {
+      const templates = await Api.bulk.templates();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="new-tpl-btn">+ New Template</button>
+        </div>
+        ${templates.length ? `<div class="content-card"><div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Name</th><th>Message</th><th></th></tr></thead>
+          <tbody>${templates.map(t => `<tr>
+            <td style="font-weight:600;white-space:nowrap">${esc(t.name)}</td>
+            <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;color:var(--text-2)">${esc(t.body)}</td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-secondary btn-sm tpl-edit" data-tid="${t.id}">Edit</button>
+              <button class="btn btn-danger btn-sm tpl-del" data-tid="${t.id}">Delete</button>
+            </td></tr>`).join('')}</tbody>
+        </table></div></div>`
+        : `<div class="empty-state" style="padding:3rem;text-align:center"><p class="text-muted" style="font-size:13px">
+            No templates yet. Save frequently used broadcasts once and reuse them —<br>{{name}}, {{phone}} and {{company}} personalize per recipient.</p></div>`}`;
+      const openTplModal = (tpl) => {
+        showModal(tpl ? 'Edit Template' : 'New Template', `
+          <div class="form-group"><label>Template Name *</label><input type="text" id="tpl-name" value="${tpl ? esc(tpl.name) : ''}"></div>
+          <div class="form-group"><label>Message *</label>
+            <textarea id="tpl-body" style="min-height:110px" placeholder="Hi {{name}}, ...">${tpl ? esc(tpl.body) : ''}</textarea>
+            <small class="text-muted">Variables: {{name}}, {{phone}}, {{company}}</small></div>
+          <div class="form-group"><label>Preview</label>
+            <div id="tpl-preview" style="background:#efeae2;border-radius:8px;padding:.8rem">
+              <div style="background:var(--bubble-out);border-radius:8px;padding:.5rem .7rem;font-size:13px;max-width:85%;margin-left:auto;white-space:pre-wrap"></div>
+            </div></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="tpl-save">${tpl ? 'Update Template' : 'Save Template'}</button>
+          </div>`);
+        const bodyTa = document.getElementById('tpl-body');
+        const prevBubble = document.querySelector('#tpl-preview > div');
+        const updPrev = () => prevBubble.textContent =
+          (bodyTa.value || 'Your message preview…').replace(/{{\s*name\s*}}/g, 'Ravi').replace(/{{\s*phone\s*}}/g, '9198…').replace(/{{\s*company\s*}}/g, 'Acme');
+        bodyTa.addEventListener('input', updPrev); updPrev();
+        document.getElementById('tpl-save').addEventListener('click', async () => {
+          const name = document.getElementById('tpl-name').value.trim();
+          const body = bodyTa.value.trim();
+          if (!name || !body) return toast('Name and message required', 'error');
+          try {
+            if (tpl) await Api.bulk.updateTemplate(tpl.id, { name, body });
+            else await Api.bulk.createTemplate({ name, body });
+            closeModal(); toast('Template saved', 'success'); loadBulkTab('templates');
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      };
+      document.getElementById('new-tpl-btn').addEventListener('click', () => openTplModal(null));
+      el.querySelectorAll('.tpl-edit').forEach(btn => btn.addEventListener('click', () =>
+        openTplModal(templates.find(t => t.id == btn.dataset.tid))));
+      el.querySelectorAll('.tpl-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete template?')) return;
+        try { await Api.bulk.delTemplate(btn.dataset.tid); toast('Deleted', 'success'); loadBulkTab('templates'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  else if (tab === 'chatlists') {
+    try {
+      const lists = await Api.bulk.chatLists();
+      el.innerHTML = `
+        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="new-cl-btn">+ New Chat List</button>
+        </div>
+        ${lists.length ? `<div class="content-card"><div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Name</th><th>Chats</th><th></th></tr></thead>
+          <tbody>${lists.map(l => `<tr>
+            <td style="font-weight:600">${esc(l.name)}</td>
+            <td>${l.count}</td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-secondary btn-sm cl-edit" data-lid="${l.id}">Edit</button>
+              <button class="btn btn-danger btn-sm cl-del" data-lid="${l.id}">Delete</button>
+            </td></tr>`).join('')}</tbody>
+        </table></div></div>`
+        : `<div class="empty-state" style="padding:3rem;text-align:center"><p class="text-muted" style="font-size:13px">
+            No saved chat lists yet. Save a recipient selection once and reuse it in every campaign.</p></div>`}`;
+      document.getElementById('new-cl-btn').addEventListener('click', () => showChatListModal(null));
+      el.querySelectorAll('.cl-edit').forEach(btn => btn.addEventListener('click', () =>
+        showChatListModal(lists.find(l => l.id == btn.dataset.lid))));
+      el.querySelectorAll('.cl-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete chat list?')) return;
+        try { await Api.bulk.delChatList(btn.dataset.lid); toast('Deleted', 'success'); loadBulkTab('chatlists'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+}
+
+async function showBulkLogs(jobId) {
+  showModal('Campaign Logs', '<div class="loading-center"><div class="spinner"></div></div>');
+  try {
+    const res = await Api.bulk.logs(jobId);
+    const html = `
+      <div style="display:flex;gap:1rem;margin-bottom:.8rem">
+        <div class="stat-mini"><div class="stat-mini-num">${res.job.sent}</div><div class="stat-mini-label">Sent</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${res.job.failed}</div><div class="stat-mini-label">Failed</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${res.job.runs}</div><div class="stat-mini-label">Runs</div></div>
+      </div>
+      <div class="table-wrap" style="max-height:320px;overflow-y:auto"><table class="data-table">
+        <thead><tr><th>Chat</th><th>Status</th><th>Run</th><th>Time</th><th>Remarks</th></tr></thead>
+        <tbody>${res.logs.map(r => `<tr>
+          <td>${esc(displayName(r.chat_name) || ('#' + (r.chat_id || '?')))}</td>
+          <td><span class="${pillClass(r.status === 'sent' ? 'resolved' : 'urgent')}">${r.status}</span></td>
+          <td>${r.run}</td>
+          <td style="font-size:11.5px;color:var(--text-3)">${r.at ? new Date(r.at).toLocaleString() : ''}</td>
+          <td style="font-size:11.5px;color:var(--text-3)">${esc(r.error || '—')}</td>
+        </tr>`).join('') || '<tr><td colspan="5" class="text-muted">No delivery logs yet — logs appear after the campaign runs</td></tr>'}</tbody>
+      </table></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="bl-export">Export CSV</button>
+        <button class="btn btn-primary" onclick="closeModal()">Close</button>
+      </div>`;
+    document.getElementById('modal-body').innerHTML = html;
+    document.getElementById('modal-title').textContent = `Logs — ${res.job.name}`;
+    document.getElementById('bl-export').addEventListener('click', () => {
+      const csv = ['chat,status,run,time,error'].concat(res.logs.map(r =>
+        `"${(r.chat_name || '').replace(/"/g, '""')}",${r.status},${r.run},${r.at || ''},"${(r.error || '').replace(/"/g, '""')}"`)).join('\n');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+      a.download = `campaign_${jobId}_logs.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+  } catch(e) { toast(e.message, 'error'); closeModal(); }
+}
+
+async function showChatListModal(existing) {
+  let chats = [];
+  try { chats = await Api.inbox.chats({ limit: 200 }); } catch(_) {}
+  const selected = new Set(existing ? existing.chat_ids : []);
+  showModal(existing ? 'Edit Chat List' : 'New Chat List', `
+    <div class="form-group"><label>List Name *</label><input type="text" id="cl-name" value="${existing ? esc(existing.name) : ''}" placeholder="e.g. VIP customers"></div>
+    <div class="form-group"><label>Chats (<span id="cl-count">${selected.size}</span> selected)</label>
+      <input type="text" id="cl-filter" placeholder="Filter chats..." style="margin-bottom:.4rem">
+      <div id="cl-chats" style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:7px;padding:.3rem"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="cl-save">${existing ? 'Update List' : 'Save List'}</button>
+    </div>`);
+  const listEl = document.getElementById('cl-chats');
+  const render = (q) => {
+    const ql = (q || '').toLowerCase();
+    listEl.innerHTML = chats
+      .filter(c => !ql || displayName(c).toLowerCase().includes(ql))
+      .map(c => `<label style="display:flex;align-items:center;gap:.5rem;padding:.25rem .3rem;font-size:12.5px;font-weight:400">
+        <input type="checkbox" class="cl-pick" value="${c.id}" ${selected.has(c.id) ? 'checked' : ''}>
+        ${esc(displayName(c))}${c.is_group ? ' <span class="pill pill-in_progress" style="font-size:10px">group</span>' : ''}
+      </label>`).join('') || '<div class="text-muted" style="padding:.5rem;font-size:12px">No chats</div>';
+    listEl.querySelectorAll('.cl-pick').forEach(cb => cb.addEventListener('change', () => {
+      cb.checked ? selected.add(+cb.value) : selected.delete(+cb.value);
+      document.getElementById('cl-count').textContent = selected.size;
+    }));
+  };
+  document.getElementById('cl-filter').addEventListener('input', e => render(e.target.value));
+  render('');
+  document.getElementById('cl-save').addEventListener('click', async () => {
+    const name = document.getElementById('cl-name').value.trim();
+    if (!name) return toast('Name required', 'error');
+    if (!selected.size) return toast('Select at least one chat', 'error');
+    try {
+      if (existing) await Api.bulk.updateChatList(existing.id, { name, chat_ids: [...selected] });
+      else await Api.bulk.createChatList({ name, chat_ids: [...selected] });
+      closeModal(); toast('Chat list saved', 'success');
+      if (document.querySelector('#bulk-tabs .tab.active')?.dataset.btab === 'chatlists') loadBulkTab('chatlists');
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+async function showBulkModal() {
   const phoneOpts = State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('');
+  let templates = [], chatLists = [], chats = [];
+  try { [templates, chatLists, chats] = await Promise.all([
+    Api.bulk.templates().catch(() => []),
+    Api.bulk.chatLists().catch(() => []),
+    Api.inbox.chats({ limit: 200 }).catch(() => []),
+  ]); } catch(_) {}
+  const selected = new Set();
+  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
   showModal('New Bulk Campaign', `
     <div class="form-group"><label>Campaign Name *</label><input type="text" id="bk-name"></div>
     <div class="form-group"><label>Phone</label><select id="bk-phone">${phoneOpts}</select></div>
-    <div class="form-group"><label>Message *</label><textarea id="bk-msg" style="min-height:80px" placeholder="Your broadcast message..."></textarea></div>
-    <div class="form-group"><label>Recipient Chat IDs (comma separated)</label><input type="text" id="bk-ids" placeholder="1,2,3..."></div>
-    <div class="form-group"><label>Schedule At (leave empty for manual send)</label><input type="datetime-local" id="bk-schedule"></div>
+
+    <div class="form-group"><label>Recipients (<span id="bk-count">0</span> selected) *</label>
+      ${chatLists.length ? `<select id="bk-savedlist" style="margin-bottom:.4rem">
+        <option value="">— Load a saved chat list —</option>
+        ${chatLists.map(l => `<option value="${l.id}">${esc(l.name)} (${l.count})</option>`).join('')}
+      </select>` : ''}
+      <input type="text" id="bk-filter" placeholder="Filter chats..." style="margin-bottom:.4rem">
+      <div id="bk-chats" style="max-height:170px;overflow-y:auto;border:1px solid var(--border);border-radius:7px;padding:.3rem"></div>
+      <div style="margin-top:.35rem"><a href="#" id="bk-savelist" style="font-size:12px;color:var(--accent)">💾 Save selection as chat list</a></div>
+    </div>
+
+    <div class="form-group"><label>Type</label><select id="bk-type">
+      <option value="text">Text</option>
+      <option value="image">Image + caption</option>
+      <option value="file">File / PDF + caption</option>
+      <option value="poll">Poll</option>
+    </select></div>
+    <div class="form-group" id="bk-media-wrap" style="display:none">
+      <label>Media URL *</label><input type="text" id="bk-media" placeholder="https://example.com/image.png">
+    </div>
+    <div class="form-group" id="bk-poll-wrap" style="display:none">
+      <label>Poll Options (comma separated) *</label><input type="text" id="bk-poll" placeholder="Yes, No, Maybe">
+    </div>
+
+    <div class="form-group"><label id="bk-msg-label">Message *</label>
+      ${templates.length ? `<select id="bk-template" style="margin-bottom:.4rem">
+        <option value="">— Use a template (optional) —</option>
+        ${templates.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}
+      </select>` : ''}
+      <textarea id="bk-msg" style="min-height:80px" placeholder="Hi {{name}}, ..."></textarea>
+      <small class="text-muted">Personalize with {{name}}, {{phone}}, {{company}}</small>
+    </div>
+
+    <div class="form-group"><label>Delivery</label><select id="bk-delivery">
+      <option value="now">Send manually (Send Now button)</option>
+      <option value="once">Schedule once</option>
+      <option value="repeat">Schedule repeating broadcasts</option>
+    </select></div>
+    <div class="form-group" id="bk-schedule-wrap" style="display:none">
+      <label>First send at *</label><input type="datetime-local" id="bk-schedule">
+    </div>
+    <div id="bk-repeat-wrap" style="display:none">
+      <div class="form-group"><label>Repeat</label><select id="bk-repeat">
+        <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+      </select></div>
+      <div class="form-group"><label>Repeat every</label>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <input type="number" id="bk-interval" min="1" max="30" value="1" style="width:80px">
+          <span id="bk-interval-unit" class="text-muted" style="font-size:12.5px">day(s)</span>
+        </div></div>
+      <div class="form-group" id="bk-days-wrap"><label>On days (unchecked = every day)</label>
+        <div style="display:flex;gap:.55rem;flex-wrap:wrap">
+          ${DAYS.map((d, i) => `<label style="display:flex;align-items:center;gap:.25rem;font-size:12.5px;font-weight:400">
+            <input type="checkbox" class="bk-day" value="${i}">${d}</label>`).join('')}
+        </div></div>
+      <div class="form-group" id="bk-dom-wrap" style="display:none"><label>Day of month (1–31)</label>
+        <input type="number" id="bk-dom" min="1" max="31" placeholder="e.g. 1"></div>
+      <div class="form-group"><label>End date (optional)</label><input type="date" id="bk-end"></div>
+    </div>
+    <div class="form-group"><label>Delay between messages (seconds)</label>
+      <input type="number" id="bk-delay" min="1" max="60" value="1" style="width:100px"></div>
+
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="bk-save">Create Campaign</button>
     </div>`);
+
+  // Recipient picker
+  const chatsEl = document.getElementById('bk-chats');
+  const renderChats = (q) => {
+    const ql = (q || '').toLowerCase();
+    chatsEl.innerHTML = chats
+      .filter(c => !ql || displayName(c).toLowerCase().includes(ql))
+      .map(c => `<label style="display:flex;align-items:center;gap:.5rem;padding:.22rem .3rem;font-size:12.5px;font-weight:400">
+        <input type="checkbox" class="bk-pick" value="${c.id}" ${selected.has(c.id) ? 'checked' : ''}>
+        ${esc(displayName(c))}${c.is_group ? ' <span class="pill pill-in_progress" style="font-size:10px">group</span>' : ''}
+      </label>`).join('') || '<div class="text-muted" style="padding:.5rem;font-size:12px">No chats</div>';
+    chatsEl.querySelectorAll('.bk-pick').forEach(cb => cb.addEventListener('change', () => {
+      cb.checked ? selected.add(+cb.value) : selected.delete(+cb.value);
+      document.getElementById('bk-count').textContent = selected.size;
+    }));
+  };
+  document.getElementById('bk-filter').addEventListener('input', e => renderChats(e.target.value));
+  renderChats('');
+
+  document.getElementById('bk-savedlist')?.addEventListener('change', e => {
+    const list = chatLists.find(l => l.id == e.target.value);
+    if (!list) return;
+    list.chat_ids.forEach(id => selected.add(id));
+    document.getElementById('bk-count').textContent = selected.size;
+    renderChats(document.getElementById('bk-filter').value);
+    toast(`Loaded "${list.name}" (${list.count} chats)`, 'success');
+  });
+  document.getElementById('bk-savelist').addEventListener('click', async e => {
+    e.preventDefault();
+    if (!selected.size) return toast('Select chats first', 'error');
+    const name = prompt('Chat list name:');
+    if (!name) return;
+    try { await Api.bulk.createChatList({ name, chat_ids: [...selected] }); toast('Chat list saved', 'success'); }
+    catch(err) { toast(err.message, 'error'); }
+  });
+
+  // Template picker fills the compose box
+  document.getElementById('bk-template')?.addEventListener('change', e => {
+    const t = templates.find(x => x.id == e.target.value);
+    if (t) document.getElementById('bk-msg').value = t.body;
+  });
+
+  // Type toggles
+  const typeSel = document.getElementById('bk-type');
+  typeSel.addEventListener('change', () => {
+    const t = typeSel.value;
+    document.getElementById('bk-media-wrap').style.display = (t === 'image' || t === 'file') ? '' : 'none';
+    document.getElementById('bk-poll-wrap').style.display = t === 'poll' ? '' : 'none';
+    document.getElementById('bk-msg-label').textContent = t === 'poll' ? 'Poll Question *' : 'Message *';
+  });
+
+  // Delivery mode toggles
+  const deliverySel = document.getElementById('bk-delivery');
+  const repeatSel = document.getElementById('bk-repeat');
+  deliverySel.addEventListener('change', () => {
+    const mode = deliverySel.value;
+    document.getElementById('bk-schedule-wrap').style.display = mode === 'now' ? 'none' : 'block';
+    document.getElementById('bk-repeat-wrap').style.display = mode === 'repeat' ? 'block' : 'none';
+  });
+  repeatSel.addEventListener('change', () => {
+    document.getElementById('bk-days-wrap').style.display = repeatSel.value === 'daily' ? 'block' : 'none';
+    document.getElementById('bk-dom-wrap').style.display = repeatSel.value === 'monthly' ? 'block' : 'none';
+    document.getElementById('bk-interval-unit').textContent =
+      repeatSel.value === 'weekly' ? 'week(s)' : repeatSel.value === 'monthly' ? 'month(s)' : 'day(s)';
+  });
+
   document.getElementById('bk-save').addEventListener('click', async () => {
     const name = document.getElementById('bk-name').value.trim();
     const msg = document.getElementById('bk-msg').value.trim();
     if (!name || !msg) return toast('Name and message required', 'error');
-    const idsRaw = document.getElementById('bk-ids').value;
-    const ids = idsRaw ? idsRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : [];
+    if (!selected.size) return toast('Select at least one recipient', 'error');
+    const mode = deliverySel.value;
+    const schedule = document.getElementById('bk-schedule').value;
+    if (mode !== 'now' && !schedule) return toast('Pick the first send time', 'error');
+    const type = typeSel.value;
     try {
-      const body = {
+      await Api.bulk.create({
         name, message: msg,
         phone_id: parseInt(document.getElementById('bk-phone').value),
-        recipient_chat_ids: ids,
-        scheduled_at: document.getElementById('bk-schedule').value || null,
-      };
-      await Api.bulk.create(body);
-      closeModal(); toast('Campaign created', 'success'); loadBulkJobs();
+        recipient_chat_ids: [...selected].map(String),
+        scheduled_at: mode === 'now' ? null : schedule,
+        message_type: type,
+        media_url: document.getElementById('bk-media').value.trim() || null,
+        poll_options: type === 'poll'
+          ? document.getElementById('bk-poll').value.split(',').map(s => s.trim()).filter(Boolean)
+          : null,
+        delay_seconds: parseInt(document.getElementById('bk-delay').value) || 1,
+        repeat: mode === 'repeat' ? repeatSel.value : 'none',
+        interval: parseInt(document.getElementById('bk-interval')?.value) || 1,
+        days_of_week: mode === 'repeat' && repeatSel.value === 'daily'
+          ? [...document.querySelectorAll('.bk-day:checked')].map(c => +c.value) : null,
+        day_of_month: mode === 'repeat' && repeatSel.value === 'monthly'
+          ? (parseInt(document.getElementById('bk-dom')?.value) || null) : null,
+        end_date: mode === 'repeat' ? (document.getElementById('bk-end').value || null) : null,
+      });
+      closeModal(); toast('Campaign created', 'success'); loadBulkTab('campaigns');
     } catch(e) { toast(e.message, 'error'); }
   });
 }
@@ -1704,6 +2810,9 @@ async function renderSettings() {
         <div class="tab" data-tab="labels">Labels</div>
         <div class="tab" data-tab="quickreplies">Quick Replies</div>
         <div class="tab" data-tab="agents">Agents</div>
+        <div class="tab" data-tab="properties">Custom Properties</div>
+        <div class="tab" data-tab="developer">Developer API</div>
+        <div class="tab" data-tab="exports">Data Exports</div>
       </div>
       <div class="scroll-area" id="settings-content"></div>
     </div>`;
@@ -1876,7 +2985,39 @@ async function loadSettingsTab(tab) {
               <div style="font-size:11px;color:var(--text-3)">${esc(a.email)} · ${a.role}</div>
             </div>
             <span class="pill ${a.is_active ? 'pill-resolved' : 'pill-closed'}">${a.is_active ? 'Active' : 'Inactive'}</span>
+            <button class="btn btn-secondary btn-sm agent-numbers" data-aid="${a.id}" data-name="${esc(a.name)}">Numbers</button>
           </div>`).join('')}`;
+
+      el.querySelectorAll('.agent-numbers').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          try {
+            const [perm, phones] = await Promise.all([
+              Api.auth.agentPhones(btn.dataset.aid), Api.phones.list(),
+            ]);
+            const allowed = new Set(perm.phone_ids);
+            showModal(`Number Access — ${btn.dataset.name}`, `
+              <p class="text-muted" style="font-size:12.5px;margin-bottom:.75rem">
+                Select which WhatsApp numbers this agent can access. No selection = access to all numbers.
+              </p>
+              ${phones.map(p => `
+                <label style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;font-size:13px">
+                  <input type="checkbox" class="perm-phone" value="${p.id}" ${allowed.has(p.id) ? 'checked' : ''}>
+                  ${esc(p.name || p.phone_number)} (${esc(p.phone_number)})
+                </label>`).join('') || '<p class="text-muted">No phones connected</p>'}
+              <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" id="perm-save">Save</button>
+              </div>`);
+            document.getElementById('perm-save').addEventListener('click', async () => {
+              const ids = [...document.querySelectorAll('.perm-phone:checked')].map(c => parseInt(c.value));
+              try {
+                await Api.auth.setAgentPhones(btn.dataset.aid, ids);
+                closeModal(); toast('Number permissions saved', 'success');
+              } catch(e) { toast(e.message, 'error'); }
+            });
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
 
       document.getElementById('invite-agent-btn').addEventListener('click', () => {
         showModal('Invite Team Member', `
@@ -1902,6 +3043,235 @@ async function loadSettingsTab(tab) {
         });
       });
     } catch(_) {}
+  }
+
+  else if (tab === 'properties') {
+    const entity = window._propEntity || 'chat';
+    try {
+      const defs = await Api.properties.definitions(entity);
+      const sections = {};
+      defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
+      el.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+          <div class="tab-bar" style="border:none">
+            <div class="tab ${entity === 'chat' ? 'active' : ''}" data-ent="chat">Chat properties</div>
+            <div class="tab ${entity === 'ticket' ? 'active' : ''}" data-ent="ticket">Ticket properties</div>
+          </div>
+          <button class="btn btn-primary btn-sm" id="new-prop-btn">+ New Property</button>
+        </div>
+        ${Object.keys(sections).length ? Object.entries(sections).map(([sec, list]) => `
+          <div class="content-card" style="margin-bottom:.8rem">
+            <div class="card-header">${esc(sec)}</div>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>Name</th><th>Type</th><th>Options</th><th>Required</th><th></th></tr></thead>
+              <tbody>${list.map(d => `<tr>
+                <td style="font-weight:600">${esc(d.name)}</td>
+                <td><span class="pill pill-open" style="font-size:11px">${esc(d.prop_type)}</span></td>
+                <td style="font-size:12px;color:var(--text-3)">${(d.options || []).map(esc).join(', ') || '—'}</td>
+                <td>${d.required ? 'Yes' : 'No'}</td>
+                <td><button class="btn btn-danger btn-sm prop-del" data-pid="${d.id}">Delete</button></td>
+              </tr>`).join('')}</tbody>
+            </table></div>
+          </div>`).join('')
+        : `<div class="empty-state" style="padding:3rem;text-align:center">
+            <p class="text-muted" style="font-size:13px">No custom ${entity} properties yet.<br>
+            Create fields like "Plan", "Renewal date" or "Account owner" — they appear in the ${entity === 'chat' ? 'chat detail panel' : 'ticket view'}.</p>
+          </div>`}`;
+      el.querySelectorAll('.tab[data-ent]').forEach(t => t.addEventListener('click', () => {
+        window._propEntity = t.dataset.ent; loadSettingsTab('properties');
+      }));
+      el.querySelectorAll('.prop-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete this property? Its values will stay stored but hidden.')) return;
+        try { await Api.properties.deleteDef(btn.dataset.pid); toast('Deleted', 'success'); loadSettingsTab('properties'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      document.getElementById('new-prop-btn').addEventListener('click', () => {
+        showModal('New Custom Property', `
+          <div class="form-group"><label>Entity</label><select id="pr-entity">
+            <option value="chat" ${entity === 'chat' ? 'selected' : ''}>Chat</option>
+            <option value="ticket" ${entity === 'ticket' ? 'selected' : ''}>Ticket</option>
+          </select></div>
+          <div class="form-group"><label>Section</label><input type="text" id="pr-section" value="General" placeholder="e.g. Account details"></div>
+          <div class="form-group"><label>Name *</label><input type="text" id="pr-name" placeholder="e.g. Plan"></div>
+          <div class="form-group"><label>Type</label><select id="pr-type">
+            <option value="text">Text</option>
+            <option value="number">Number</option>
+            <option value="date">Date</option>
+            <option value="single_select">Single-select dropdown</option>
+            <option value="multi_select">Multi-select dropdown</option>
+          </select></div>
+          <div class="form-group" id="pr-options-wrap" style="display:none">
+            <label>Options (comma separated) *</label>
+            <input type="text" id="pr-options" placeholder="Free, Pro, Enterprise">
+          </div>
+          <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+            <input type="checkbox" id="pr-required" style="width:15px;height:15px"> Required (tickets)</label></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="pr-save">Create</button>
+          </div>`);
+        const typeSel = document.getElementById('pr-type');
+        typeSel.addEventListener('change', () => {
+          document.getElementById('pr-options-wrap').style.display =
+            typeSel.value.endsWith('_select') ? 'block' : 'none';
+        });
+        document.getElementById('pr-save').addEventListener('click', async () => {
+          const name = document.getElementById('pr-name').value.trim();
+          if (!name) return toast('Name required', 'error');
+          try {
+            await Api.properties.createDef({
+              entity: document.getElementById('pr-entity').value,
+              section: document.getElementById('pr-section').value.trim() || 'General',
+              name,
+              prop_type: typeSel.value,
+              options: typeSel.value.endsWith('_select')
+                ? document.getElementById('pr-options').value.split(',').map(s => s.trim()).filter(Boolean)
+                : null,
+              required: document.getElementById('pr-required').checked,
+            });
+            closeModal(); toast('Property created', 'success'); loadSettingsTab('properties');
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  else if (tab === 'developer') {
+    try {
+      const [keys, hooks, events] = await Promise.all([
+        Api.developer.apiKeys(), Api.developer.webhooks(), Api.developer.webhookEvents(),
+      ]);
+      el.innerHTML = `
+        <div class="content-card" style="margin-bottom:1rem">
+          <div class="card-header">API Keys
+            <div class="header-actions"><button class="btn btn-primary btn-sm" id="new-key-btn">+ New Key</button></div>
+          </div>
+          <div class="card-body">
+            <p class="text-muted" style="font-size:12.5px;margin-bottom:.6rem">
+              Use keys with the public API: <code>X-API-Key</code> header on <code>/api/v1/public/v1/*</code>
+              (send messages, list chats &amp; numbers, create tickets).
+            </p>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>Name</th><th>Key</th><th>Status</th><th>Last Used</th><th></th></tr></thead>
+              <tbody>${keys.map(k => `<tr>
+                <td style="font-weight:600">${esc(k.name)}</td>
+                <td style="font-family:monospace;font-size:12px">${esc(k.key_prefix)}…</td>
+                <td><span class="pill ${k.is_active ? 'pill-resolved' : 'pill-closed'}">${k.is_active ? 'Active' : 'Revoked'}</span></td>
+                <td style="font-size:12px;color:var(--text-3)">${k.last_used_at ? timeAgo(k.last_used_at) : 'Never'}</td>
+                <td>${k.is_active ? `<button class="btn btn-danger btn-sm key-revoke" data-kid="${k.id}">Revoke</button>` : ''}</td>
+              </tr>`).join('') || '<tr><td colspan="5" class="text-muted">No API keys yet</td></tr>'}</tbody>
+            </table></div>
+          </div>
+        </div>
+        <div class="content-card">
+          <div class="card-header">Outbound Webhooks
+            <div class="header-actions"><button class="btn btn-primary btn-sm" id="new-hook-btn">+ Add Webhook</button></div>
+          </div>
+          <div class="card-body">
+            <p class="text-muted" style="font-size:12.5px;margin-bottom:.6rem">
+              We POST platform events (signed with HMAC-SHA256 when a secret is set) to your endpoints.
+            </p>
+            <div class="table-wrap"><table class="data-table">
+              <thead><tr><th>URL</th><th>Events</th><th>Failures</th><th></th></tr></thead>
+              <tbody>${hooks.map(h => `<tr>
+                <td style="font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis">${esc(h.url)}</td>
+                <td style="font-size:11.5px">${(h.events && h.events.length) ? h.events.map(esc).join(', ') : 'All events'}</td>
+                <td>${h.failure_count || 0}</td>
+                <td style="white-space:nowrap">
+                  <button class="btn btn-secondary btn-sm hook-test" data-hid="${h.id}">Test</button>
+                  <button class="btn btn-danger btn-sm hook-del" data-hid="${h.id}">Delete</button>
+                </td>
+              </tr>`).join('') || '<tr><td colspan="4" class="text-muted">No webhooks configured</td></tr>'}</tbody>
+            </table></div>
+          </div>
+        </div>`;
+
+      document.getElementById('new-key-btn').addEventListener('click', () => {
+        showModal('New API Key', `
+          <div class="form-group"><label>Key Name *</label><input type="text" id="key-name" placeholder="e.g. Zapier integration"></div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="key-save">Create</button>
+          </div>`);
+        document.getElementById('key-save').addEventListener('click', async () => {
+          const name = document.getElementById('key-name').value.trim();
+          if (!name) return toast('Name required', 'error');
+          try {
+            const res = await Api.developer.createApiKey({ name });
+            showModal('API Key Created', `
+              <p style="font-size:13px;margin-bottom:.6rem">Copy this key now — it will <strong>not</strong> be shown again:</p>
+              <div class="api-key-box">${esc(res.api_key)}</div>
+              <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal();loadSettingsTab('developer')">Done</button></div>`);
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.key-revoke').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Revoke this API key?')) return;
+        try { await Api.developer.revokeApiKey(btn.dataset.kid); toast('Key revoked', 'success'); loadSettingsTab('developer'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+
+      document.getElementById('new-hook-btn').addEventListener('click', () => {
+        showModal('Add Outbound Webhook', `
+          <div class="form-group"><label>Endpoint URL *</label><input type="text" id="wh-url" placeholder="https://your-server.com/webhook"></div>
+          <div class="form-group"><label>Signing Secret (optional)</label><input type="text" id="wh-secret"></div>
+          <div class="form-group"><label>Events (default: all)</label>
+            ${events.map(ev => `<label style="display:flex;gap:.5rem;font-size:12.5px;padding:.2rem 0">
+              <input type="checkbox" class="wh-event" value="${ev}"> ${ev}</label>`).join('')}
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" id="wh-save">Add</button>
+          </div>`);
+        document.getElementById('wh-save').addEventListener('click', async () => {
+          const url = document.getElementById('wh-url').value.trim();
+          if (!url) return toast('URL required', 'error');
+          const evs = [...document.querySelectorAll('.wh-event:checked')].map(c => c.value);
+          try {
+            await Api.developer.createWebhook({
+              url, secret: document.getElementById('wh-secret').value.trim(),
+              events: evs.length ? evs : null,
+            });
+            closeModal(); toast('Webhook added', 'success'); loadSettingsTab('developer');
+          } catch(e) { toast(e.message, 'error'); }
+        });
+      });
+      el.querySelectorAll('.hook-test').forEach(btn => btn.addEventListener('click', async () => {
+        try { await Api.developer.testWebhook(btn.dataset.hid); toast('Test event queued', 'success'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+      el.querySelectorAll('.hook-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm('Delete webhook?')) return;
+        try { await Api.developer.delWebhook(btn.dataset.hid); toast('Deleted', 'success'); loadSettingsTab('developer'); }
+        catch(e) { toast(e.message, 'error'); }
+      }));
+    } catch(e) {
+      el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)} (admin only)</div>`;
+    }
+  }
+
+  else if (tab === 'exports') {
+    el.innerHTML = `
+      <div class="settings-grid">
+        ${[
+          ['Chats', 'chats', 'All chats with status, labels and assignment'],
+          ['Messages (30d)', 'messages', 'Message history for the last 30 days'],
+          ['Tickets', 'tickets', 'Tickets with status, priority and SLA info'],
+          ['Contacts', 'contacts', 'Contact book (masked numbers stay masked)'],
+          ['Audit Logs (30d)', 'logs', 'Full audit trail — admin only'],
+        ].map(([label, key, desc]) => `
+          <div class="content-card">
+            <div class="card-header">${label}</div>
+            <div class="card-body">
+              <p class="text-muted" style="font-size:12.5px;margin-bottom:.7rem">${desc}</p>
+              <button class="btn btn-secondary btn-sm export-btn" data-key="${key}">Download CSV</button>
+            </div>
+          </div>`).join('')}
+      </div>`;
+    el.querySelectorAll('.export-btn').forEach(btn => btn.addEventListener('click', async () => {
+      try { await Api.exports[btn.dataset.key](); toast('Export downloaded', 'success'); }
+      catch(e) { toast(e.message, 'error'); }
+    }));
   }
 }
 
@@ -2073,95 +3443,140 @@ async function renderDashboard() {
     { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`, title: 'Automation Rules', desc: 'Create rules to auto-assign, label and respond to messages.', action: 'automation', label: 'Create Rule' },
   ];
 
+  const wsName = 'Hyperscope';
   main.innerHTML = `
-  <div class="dashboard-wrap">
-    <div class="dashboard-inner">
-      <div class="dashboard-title">Getting Started</div>
-      <div class="dashboard-sub">Follow the steps to connect your phone to Periskope</div>
+  <div class="dashboard-wrap" style="overflow-y:auto">
+    <div class="dashboard-inner" style="max-width:1240px">
 
-      <div class="dash-stats" id="dash-stats">
-        <div class="dash-stat accent">
-          <div class="dash-stat-label">Total Chats</div>
-          <div class="dash-stat-value" id="ds-total">—</div>
-          <div class="dash-stat-sub">All conversations</div>
-        </div>
-        <div class="dash-stat orange">
-          <div class="dash-stat-label">Open Tickets</div>
-          <div class="dash-stat-value" id="ds-tickets">—</div>
-          <div class="dash-stat-sub" id="ds-tickets-sub">Active support tickets</div>
-        </div>
-        <div class="dash-stat blue">
-          <div class="dash-stat-label">Unread Messages</div>
-          <div class="dash-stat-value" id="ds-unread">—</div>
-          <div class="dash-stat-sub">Needs attention</div>
+      <div class="dash-workspace">
+        <div class="ws-logo">H</div>
+        <div>
+          <h2>${wsName}</h2>
+          <div class="ws-sub">${esc(State.agent?.email || 'workspace')}</div>
         </div>
       </div>
 
-      <div class="gs-steps">
-        <div class="gs-steps-list">
-          <div class="gs-step">
-            <div class="gs-step-num">1</div>
-            <div class="gs-step-body">
-              <h4>Open the WhatsApp app with the number you want to connect</h4>
-              <p>This can be a WhatsApp personal or business number connected to any device.</p>
+      <div class="dash-grid">
+        <div class="dash-main">
+
+          <div class="stat-cards">
+            <div class="stat-card">
+              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>All chats</div>
+              <div class="sc-num" id="ds-total">—</div>
+            </div>
+            <div class="stat-card">
+              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Unread chats</div>
+              <div class="sc-num" id="ds-unread">—</div>
+            </div>
+            <div class="stat-card flagged">
+              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Flagged chats</div>
+              <div class="sc-num" id="ds-flagged">—</div>
             </div>
           </div>
-          <div class="gs-step">
-            <div class="gs-step-num">2</div>
-            <div class="gs-step-body">
-              <h4>Scan the QR code to connect your phone</h4>
-              <p>On WhatsApp: Go to <strong>Settings → Linked Devices → Link a Device</strong><br>
-              Scan using a new device. The phone may need to be connected to the internet.</p>
+
+          <div class="dash-duo">
+            <div class="dash-panel">
+              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Team</div>
+              <div class="dp-body">
+                <div style="font-size:12.5px;color:var(--text-2);margin-bottom:.5rem"><span id="ds-online">—</span> online</div>
+                <div id="ds-team-avatars" style="display:flex;gap:.35rem"></div>
+              </div>
+            </div>
+            <div class="dash-panel">
+              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2z"/></svg>Tickets</div>
+              <div class="dp-body" style="display:flex;gap:2.5rem">
+                <div>
+                  <div style="font-size:12.5px;color:var(--text-3);display:flex;align-items:center;gap:.35rem"><span style="width:8px;height:8px;border-radius:50%;border:2px solid var(--danger);display:inline-block"></span>Open</div>
+                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets">—</div>
+                </div>
+                <div>
+                  <div style="font-size:12.5px;color:var(--text-3)">Assigned to me</div>
+                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-mine">—</div>
+                </div>
+                <div>
+                  <div style="font-size:12.5px;color:var(--text-3)">In progress</div>
+                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-prog">—</div>
+                </div>
+              </div>
             </div>
           </div>
+
+          <div class="quick-links-title">Quick links</div>
+          <div class="quick-links">
+            ${cards.map(c => `<div class="ql-card">
+              <h3>${c.icon} ${c.title}</h3>
+              <p>${c.desc}</p>
+              <div class="ql-actions">
+                <button class="btn btn-secondary btn-sm" onclick="switchView('${c.action}')">${c.label}</button>
+              </div>
+            </div>`).join('')}
+          </div>
+
         </div>
-        <div class="gs-qr">
-          <div class="gs-qr-box" id="dash-waha-box">
-            <div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1rem 0">
-              <div class="waha-spinner" style="width:36px;height:36px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+
+        <div class="dash-side">
+          <div class="phone-status-head">
+            <h3>Phone status</h3>
+            <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Add phone</button>
+          </div>
+          <div id="dash-phone-cards"></div>
+          <div class="dash-panel" style="margin-top:.4rem">
+            <div class="dp-body" style="text-align:center">
+              <div class="gs-qr-box" id="dash-waha-box" style="display:flex;align-items:center;justify-content:center;min-height:120px">
+                <div class="waha-spinner" style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+              </div>
+              <div class="gs-qr-label" id="dash-waha-label" style="font-size:12px;color:var(--text-3);margin-top:.5rem">Checking connection…</div>
+              <div class="gs-qr-actions" id="dash-waha-actions" style="margin-top:.5rem"></div>
             </div>
           </div>
-          <div class="gs-qr-label" id="dash-waha-label">Checking connection…</div>
-          <div class="gs-qr-actions" id="dash-waha-actions"></div>
         </div>
       </div>
 
-      <div class="gs-cards">
-        ${cards.map(c => `<div class="gs-card">
-          <div class="gs-card-icon">${c.icon}</div>
-          <h3>${c.title}</h3>
-          <p>${c.desc}</p>
-          <div class="gs-card-actions">
-            <button class="btn btn-primary btn-sm" onclick="switchView('${c.action}')">${c.label}</button>
-            <span class="gs-link" onclick="switchView('${c.action}')">
-              Watch tutorial
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-            </span>
-          </div>
-        </div>`).join('')}
-      </div>
     </div>
   </div>`;
 
   // Load quick stats asynchronously
   try {
-    const [dash, tkt] = await Promise.all([
+    const [dash, tkt, agents] = await Promise.all([
       Api.analytics.dashboard(),
       Api.analytics.tickets(),
+      Api.auth.agents().catch(() => []),
     ]);
-    const dsTotal = document.getElementById('ds-total');
-    const dsTickets = document.getElementById('ds-tickets');
-    const dsTicketsSub = document.getElementById('ds-tickets-sub');
-    const dsUnread = document.getElementById('ds-unread');
-    if (dsTotal) dsTotal.textContent = dash.total_chats ?? 0;
-    if (dsTickets) dsTickets.textContent = tkt.open ?? 0;
-    if (dsTicketsSub) dsTicketsSub.textContent = `${tkt.in_progress ?? 0} in progress`;
-    if (dsUnread) dsUnread.textContent = dash.unread_chats ?? 0;
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('ds-total', dash.total_chats ?? 0);
+    set('ds-unread', dash.unread_chats ?? 0);
+    set('ds-flagged', dash.flagged_chats ?? 0);
+    set('ds-tickets', tkt.open ?? 0);
+    set('ds-tickets-prog', tkt.in_progress ?? 0);
+    set('ds-tickets-mine', '-');
+    set('ds-online', `${dash.online_agents ?? agents.length} of ${agents.length || (dash.online_agents ?? 0)}`);
+    const avEl = document.getElementById('ds-team-avatars');
+    if (avEl) avEl.innerHTML = agents.slice(0, 8).map(a =>
+      `<div class="agent-avatar" title="${esc(a.name)}" style="background:${avatarColor(a.name)};width:28px;height:28px;font-size:11px">${initials(a.name)}</div>`
+    ).join('');
+    try {
+      const mine = await Api.tickets.list({ assigned_to: State.agent?.id, status: 'open' });
+      set('ds-tickets-mine', mine.length);
+    } catch(_) {}
   } catch(_) {}
 
-  // Start live WAHA poller
+  // Phone status cards + live WAHA poller
   try {
     const phones = await Api.phones.list();
+    const cardsEl = document.getElementById('dash-phone-cards');
+    if (cardsEl) cardsEl.innerHTML = phones.map(p => {
+      const ok = p.waha_status === 'WORKING';
+      return `<div class="phone-card">
+        <div class="pc-avatar">${initials(p.name || p.phone_number)}</div>
+        <div class="pc-meta">
+          <div class="pc-number">${esc(p.phone_number)}</div>
+          <div class="pc-name">${esc(p.name || '')}</div>
+        </div>
+        <div class="pc-status ${ok ? 'connected' : 'offline'}"><span class="dot"></span>${ok ? 'Connected' : esc(p.waha_status || 'Offline')}</div>
+        <button class="pc-menu-btn" title="Manage in Settings" onclick="switchView('settings')">⋯</button>
+      </div>`;
+    }).join('') || '';
+
     if (phones && phones.length > 0) {
       _startDashWahaPoller(phones[0].id);
     } else {
@@ -2181,22 +3596,226 @@ async function renderCommunities() {
   main.innerHTML = `
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
-        <h2>Communities</h2>
-        <div class="header-actions" style="margin-left:auto">
-          <button class="btn btn-primary btn-sm" onclick="switchView('contacts')">Manage Contacts</button>
+        <h2>Groups</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
+          <input type="text" id="grp-search" class="search-input" placeholder="Search groups..." style="max-width:220px">
+          <button class="btn btn-secondary btn-sm" id="grp-refresh">Refresh</button>
         </div>
       </div>
-      <div class="scroll-area">
-        <div class="empty-state" style="padding:4rem 2rem">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:52px;height:52px;opacity:.15"><path d="M3 21l9-18 9 18"/><path d="M6 15h12"/></svg>
-          <p style="font-size:14px;color:var(--text-3);max-width:320px;text-align:center;line-height:1.6">
-            Communities let you organize contacts and broadcast messages to specific groups.
-            Connect your WhatsApp to get started.
-          </p>
-          <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect a Phone</button>
-        </div>
-      </div>
+      <div class="scroll-area" id="groups-list"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>`;
+  document.getElementById('grp-refresh').addEventListener('click', () => loadGroups());
+  let t; document.getElementById('grp-search').addEventListener('input', e => {
+    clearTimeout(t); t = setTimeout(() => loadGroups(e.target.value.trim()), 300);
+  });
+  await loadGroups();
+}
+
+async function loadGroups(search) {
+  const el = document.getElementById('groups-list');
+  if (!el) return;
+  try {
+    const groups = await Api.groups.list(search ? { search } : undefined);
+    if (!groups.length) {
+      el.innerHTML = `<div class="empty-state" style="padding:4rem 2rem">
+        <p style="font-size:14px;color:var(--text-3);max-width:340px;text-align:center;line-height:1.6">
+          No WhatsApp groups synced yet. Connect a phone and sync chats — group chats will appear here automatically.
+        </p>
+        <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect a Phone</button>
+      </div>`;
+      return;
+    }
+    el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
+      <thead><tr><th>Group</th><th>Messages (7d)</th><th>Unread</th><th>Last Activity</th><th></th></tr></thead>
+      <tbody>${groups.map(g => `<tr>
+        <td style="font-weight:600">${esc(displayName(g))}${g.is_flagged ? ' 🚩' : ''}</td>
+        <td>${g.messages_7d}</td>
+        <td>${g.unread_count || 0}</td>
+        <td style="font-size:12px;color:var(--text-3)">${g.last_message_at ? timeAgo(g.last_message_at) : '—'}</td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-secondary btn-sm grp-members" data-gid="${g.id}">Members</button>
+          <button class="btn btn-secondary btn-sm grp-stats" data-gid="${g.id}" data-name="${esc(displayName(g))}">Analytics</button>
+        </td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+    el.querySelectorAll('.grp-members').forEach(btn => btn.addEventListener('click', () => showGroupMembers(btn.dataset.gid)));
+    el.querySelectorAll('.grp-stats').forEach(btn => btn.addEventListener('click', () => showGroupAnalytics(btn.dataset.gid, btn.dataset.name)));
+  } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+}
+
+async function showGroupMembers(gid) {
+  showModal('Group Members', '<div class="loading-center"><div class="spinner"></div></div>');
+  try {
+    const res = await Api.groups.participants(gid);
+    const body = document.querySelector('#modal .modal-body') || document.querySelector('#modal-body');
+    const html = `
+      <p style="font-size:13px;color:var(--text-2);margin-bottom:.75rem"><strong>${esc(res.group)}</strong> — ${res.count} members</p>
+      <div class="table-wrap" style="max-height:320px;overflow-y:auto"><table class="data-table">
+        <thead><tr><th>Number</th><th>Role</th></tr></thead>
+        <tbody>${res.participants.map(p => `<tr>
+          <td>+${esc(p.number)}</td>
+          <td>${p.is_admin ? '<span class="pill pill-resolved">Admin</span>' : 'Member'}</td>
+        </tr>`).join('') || '<tr><td colspan="2" class="text-muted">Participant list unavailable (session offline?)</td></tr>'}</tbody>
+      </table></div>`;
+    if (body) body.innerHTML = html; else showModal('Group Members', html);
+  } catch(e) { toast(e.message, 'error'); closeModal(); }
+}
+
+async function showGroupAnalytics(gid, name) {
+  showModal(`Analytics — ${name}`, '<div class="loading-center"><div class="spinner"></div></div>');
+  try {
+    const a = await Api.groups.analytics(gid, 30);
+    const maxDay = Math.max(1, ...a.daily_volume.map(d => d.count));
+    const html = `
+      <div style="display:flex;gap:1rem;margin-bottom:1rem">
+        <div class="stat-mini"><div class="stat-mini-num">${a.total_messages}</div><div class="stat-mini-label">Messages (30d)</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${a.incoming}</div><div class="stat-mini-label">Incoming</div></div>
+        <div class="stat-mini"><div class="stat-mini-num">${a.outgoing}</div><div class="stat-mini-label">Outgoing</div></div>
+      </div>
+      <div style="display:flex;align-items:flex-end;gap:2px;height:60px;margin-bottom:1rem">
+        ${a.daily_volume.map(d => `<div title="${d.date}: ${d.count}" style="flex:1;background:var(--accent);opacity:.75;border-radius:2px 2px 0 0;height:${Math.max(4, Math.round(d.count / maxDay * 60))}px"></div>`).join('') || '<span class="text-muted">No activity</span>'}
+      </div>
+      <p style="font-size:12px;font-weight:600;margin-bottom:.35rem">Top senders</p>
+      <div class="table-wrap" style="max-height:200px;overflow-y:auto"><table class="data-table">
+        <tbody>${a.top_senders.map(s => `<tr><td>${esc(s.name)}</td><td style="text-align:right">${s.messages}</td></tr>`).join('') || '<tr><td class="text-muted">No senders yet</td></tr>'}</tbody>
+      </table></div>`;
+    const body = document.querySelector('#modal .modal-body') || document.querySelector('#modal-body');
+    if (body) body.innerHTML = html; else showModal(`Analytics — ${name}`, html);
+  } catch(e) { toast(e.message, 'error'); closeModal(); }
+}
+
+// ── SCHEDULED MESSAGES VIEW ─────────────────────────────────────── //
+async function renderScheduled() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Scheduled Messages</h2>
+        <div class="header-actions" style="margin-left:auto">
+          <button class="btn btn-primary btn-sm" id="new-sched-btn">+ Schedule Message</button>
+        </div>
+      </div>
+      <div class="scroll-area" id="sched-list"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>`;
+  document.getElementById('new-sched-btn').addEventListener('click', () => showScheduleModal());
+  await loadScheduled();
+}
+
+async function loadScheduled() {
+  const el = document.getElementById('sched-list');
+  if (!el) return;
+  try {
+    const items = await Api.scheduled.list();
+    if (!items.length) { el.innerHTML = `<div class="loading-center text-muted">Nothing scheduled yet</div>`; return; }
+    el.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table">
+      <thead><tr><th>Chat</th><th>Message</th><th>Next Send</th><th>Repeat</th><th>Ends</th><th>Status</th><th>Sent</th><th></th></tr></thead>
+      <tbody>${items.map(m => `<tr>
+        <td style="font-weight:600">${esc(displayName(m.chat_name) || ('#' + m.chat_id))}</td>
+        <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
+        <td style="font-size:12px">${new Date(m.send_at).toLocaleString()}</td>
+        <td style="font-size:12px">${esc(m.repeat_summary || (m.repeat === 'none' ? 'Once' : m.repeat))}</td>
+        <td style="font-size:12px;color:var(--text-3)">${m.end_date ? new Date(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
+        <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${m.status}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
+        <td>${m.sent_count}</td>
+        <td style="white-space:nowrap">${m.status === 'pending' ? `
+          <button class="btn btn-secondary btn-sm sched-edit" data-sid="${m.id}">Edit</button>
+          <button class="btn btn-danger btn-sm sched-cancel" data-sid="${m.id}">Cancel</button>` : ''}</td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+    el.querySelectorAll('.sched-cancel').forEach(btn => btn.addEventListener('click', async () => {
+      try { await Api.scheduled.cancel(btn.dataset.sid); toast('Cancelled', 'success'); loadScheduled(); }
+      catch(e) { toast(e.message, 'error'); }
+    }));
+    el.querySelectorAll('.sched-edit').forEach(btn => btn.addEventListener('click', () => {
+      const item = items.find(x => x.id == btn.dataset.sid);
+      if (item) showScheduleModal(null, null, item);
+    }));
+  } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+}
+
+async function showScheduleModal(prefillChatId, prefillBody, editItem) {
+  let chats = [];
+  try { chats = await Api.inbox.chats({ limit: 200 }); } catch(_) {}
+  const selChat = editItem ? editItem.chat_id : prefillChatId;
+  const opts = chats.map(c => `<option value="${c.id}" ${selChat == c.id ? 'selected' : ''}>${esc(displayName(c))}</option>`).join('');
+  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const ed = editItem || {};
+
+  showModal(editItem ? 'Edit Scheduled Message' : 'Schedule Message', `
+    <div class="form-group"><label>Chat *</label><select id="sc-chat" ${editItem ? 'disabled' : ''}>${opts}</select></div>
+    <div class="form-group"><label>Message *</label><textarea id="sc-body" style="min-height:70px">${esc(ed.body || prefillBody || '')}</textarea></div>
+    <div class="form-group"><label>Send At *</label><input type="datetime-local" id="sc-at" value="${ed.send_at ? ed.send_at.slice(0, 16) : ''}"></div>
+    <div class="form-group"><label>Repeat</label><select id="sc-repeat">
+      <option value="none">Once</option>
+      <option value="daily" ${ed.repeat === 'daily' ? 'selected' : ''}>Daily</option>
+      <option value="weekly" ${ed.repeat === 'weekly' ? 'selected' : ''}>Weekly</option>
+      <option value="monthly" ${ed.repeat === 'monthly' ? 'selected' : ''}>Monthly</option>
+    </select></div>
+    <div id="sc-recur-opts" style="display:${ed.repeat && ed.repeat !== 'none' ? 'block' : 'none'}">
+      <div class="form-group"><label>Repeat every</label>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <input type="number" id="sc-interval" min="1" max="30" value="${ed.interval || 1}" style="width:80px">
+          <span id="sc-interval-unit" class="text-muted" style="font-size:12.5px">day(s)</span>
+        </div>
+      </div>
+      <div class="form-group" id="sc-days-wrap" style="display:${ed.repeat === 'daily' ? 'block' : 'none'}">
+        <label>On days (leave all unchecked = every day)</label>
+        <div style="display:flex;gap:.55rem;flex-wrap:wrap">
+          ${DAYS.map((d, i) => `<label style="display:flex;align-items:center;gap:.25rem;font-size:12.5px;font-weight:400">
+            <input type="checkbox" class="sc-day" value="${i}" ${(ed.days_of_week || []).includes(i) ? 'checked' : ''}>${d}</label>`).join('')}
+        </div>
+      </div>
+      <div class="form-group" id="sc-dom-wrap" style="display:${ed.repeat === 'monthly' ? 'block' : 'none'}">
+        <label>Day of month (1–31)</label>
+        <input type="number" id="sc-dom" min="1" max="31" value="${ed.day_of_month || ''}" placeholder="e.g. 1">
+      </div>
+      <div class="form-group"><label>End date (optional — leave empty for open-ended)</label>
+        <input type="date" id="sc-end" value="${ed.end_date ? ed.end_date.slice(0, 10) : ''}"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="sc-save">${editItem ? 'Save Changes' : 'Schedule'}</button>
+    </div>`);
+
+  const repeatSel = document.getElementById('sc-repeat');
+  repeatSel.addEventListener('change', () => {
+    const r = repeatSel.value;
+    document.getElementById('sc-recur-opts').style.display = r === 'none' ? 'none' : 'block';
+    document.getElementById('sc-days-wrap').style.display = r === 'daily' ? 'block' : 'none';
+    document.getElementById('sc-dom-wrap').style.display = r === 'monthly' ? 'block' : 'none';
+    document.getElementById('sc-interval-unit').textContent =
+      r === 'weekly' ? 'week(s)' : r === 'monthly' ? 'month(s)' : 'day(s)';
+  });
+
+  document.getElementById('sc-save').addEventListener('click', async () => {
+    const body = document.getElementById('sc-body').value.trim();
+    const at = document.getElementById('sc-at').value;
+    if (!body || !at) return toast('Message and time required', 'error');
+    const repeat = repeatSel.value;
+    const payload = {
+      body, send_at: at, repeat,
+      interval: parseInt(document.getElementById('sc-interval')?.value) || 1,
+      days_of_week: repeat === 'daily'
+        ? [...document.querySelectorAll('.sc-day:checked')].map(c => +c.value)
+        : null,
+      day_of_month: repeat === 'monthly'
+        ? (parseInt(document.getElementById('sc-dom')?.value) || null)
+        : null,
+      end_date: document.getElementById('sc-end')?.value || (editItem ? '' : null),
+    };
+    try {
+      if (editItem) {
+        await Api.scheduled.update(editItem.id, payload);
+        toast('Schedule updated', 'success');
+      } else {
+        payload.chat_id = parseInt(document.getElementById('sc-chat').value);
+        await Api.scheduled.create(payload);
+        toast('Message scheduled', 'success');
+      }
+      closeModal();
+      if (State.currentView === 'scheduled') loadScheduled();
+    } catch(e) { toast(e.message, 'error'); }
+  });
 }
 
 // ── LOGS VIEW ───────────────────────────────────────────────────── //
@@ -2205,33 +3824,468 @@ async function renderLogs() {
   main.innerHTML = `
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
-        <h2>Logs</h2>
-        <div class="header-actions" style="margin-left:auto">
-          <button class="btn btn-secondary btn-sm" onclick="switchView('analytics')">View Analytics</button>
+        <h2>Audit Logs</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
+          <select id="log-action-filter" style="max-width:220px"><option value="">All events</option></select>
+          <button class="btn btn-secondary btn-sm" id="log-export">Export CSV</button>
         </div>
       </div>
       <div class="scroll-area">
         <div class="content-card">
-          <div class="card-header">Activity Log</div>
           <div class="table-wrap">
             <table class="data-table">
               <thead>
                 <tr><th>Time</th><th>Event</th><th>Agent</th><th>Details</th></tr>
               </thead>
               <tbody id="logs-tbody">
-                <tr><td colspan="4" style="text-align:center;padding:3rem;color:var(--text-3)">
-                  No activity logs available yet. Logs will appear here as your team uses the platform.
-                </td></tr>
+                <tr><td colspan="4" style="text-align:center;padding:3rem"><div class="spinner"></div></td></tr>
               </tbody>
             </table>
           </div>
         </div>
       </div>
     </div>`;
+  document.getElementById('log-export').addEventListener('click', async () => {
+    try { await Api.exports.logs(30); toast('Export downloaded', 'success'); }
+    catch(e) { toast(e.message, 'error'); }
+  });
+  try {
+    const actions = await Api.logs.actions();
+    const sel = document.getElementById('log-action-filter');
+    actions.forEach(a => { const o = document.createElement('option'); o.value = a; o.textContent = a; sel.appendChild(o); });
+    sel.addEventListener('change', () => loadLogsTable(sel.value));
+  } catch(_) {}
+  await loadLogsTable('');
+}
+
+async function loadLogsTable(action) {
+  const tbody = document.getElementById('logs-tbody');
+  if (!tbody) return;
+  try {
+    const logs = await Api.logs.list(action ? { action } : undefined);
+    if (!logs.length) {
+      tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;padding:3rem;color:var(--text-3)">
+        No activity logs yet. Logs will appear here as your team uses the platform.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = logs.map(l => `<tr>
+      <td style="font-size:12px;color:var(--text-3);white-space:nowrap">${new Date(l.created_at).toLocaleString()}</td>
+      <td><span class="pill pill-open" style="font-family:monospace;font-size:11px">${esc(l.action)}</span></td>
+      <td>${esc(l.agent_name || 'System')}</td>
+      <td style="font-size:12.5px">${esc(l.description || '')}</td>
+    </tr>`).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-muted" style="text-align:center;padding:2rem">${esc(e.message)}</td></tr>`;
+  }
 }
 
 // Alias so dashboard card buttons can call switchView(...)
 function switchView(view) { navigateTo(view); }
+
+// ══ CHAT LIST (table view with bulk actions) ══════════════════════ //
+async function renderChatListView() {
+  const main = document.getElementById('main-content');
+  main.innerHTML = `
+    <div class="flex-col h-full" style="overflow-y:auto">
+      <div class="section-header">
+        <h2>Chat List</h2>
+        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem">
+          <input type="text" id="cl-search" class="search-input" placeholder="Search chats..." style="max-width:220px">
+          <button class="btn btn-secondary btn-sm" id="cl-refresh">Refresh</button>
+        </div>
+      </div>
+      <div class="scroll-area" id="cl-table-wrap"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>
+    <div class="bulk-toolbar" id="bulk-toolbar" style="display:none">
+      <span class="bt-count" id="bt-count">0 selected</span>
+      <button id="bt-update">✏️ Update Chats</button>
+      <button id="bt-group">👥 Group Actions</button>
+      <button id="bt-export">⬇ Export</button>
+      <button id="bt-clear" title="Clear selection">×</button>
+    </div>`;
+
+  const selected = new Set();
+  let rows = [];
+
+  function refreshToolbar() {
+    const tb = document.getElementById('bulk-toolbar');
+    const count = document.getElementById('bt-count');
+    if (!tb) return;
+    tb.style.display = selected.size ? 'flex' : 'none';
+    if (count) count.textContent = `${selected.size} chat${selected.size === 1 ? '' : 's'} selected`;
+  }
+
+  async function loadTable(search) {
+    const wrap = document.getElementById('cl-table-wrap');
+    try {
+      rows = await Api.inbox.chats({ limit: 200, ...(search ? { search } : {}) });
+      const agentNames = {};
+      try { (await Api.auth.agents()).forEach(a => agentNames[a.id] = a.name); } catch(_) {}
+      wrap.innerHTML = `<div class="content-card"><div class="table-wrap"><table class="data-table chatlist-table">
+        <thead><tr>
+          <th style="width:34px"><input type="checkbox" id="cl-all"></th>
+          <th>Chat Name</th><th>Labels</th><th>Assigned To</th><th>Last Active</th><th>Type</th>
+        </tr></thead>
+        <tbody>${rows.map(c => `<tr data-cid="${c.id}">
+          <td><input type="checkbox" class="cl-check" data-cid="${c.id}" ${selected.has(c.id) ? 'checked' : ''}></td>
+          <td style="font-weight:600">${esc(displayName(c))}</td>
+          <td>${(c.labels || []).map(id => {
+            const l = State.labels.find(x => x.id === id);
+            return l ? `<span class="chat-label-mini" style="background:${l.color}22;color:${l.color};border:1px solid ${l.color}44">${esc(l.name)}</span>` : '';
+          }).join(' ') || '<span class="text-muted" style="font-size:11px">—</span>'}</td>
+          <td style="font-size:12.5px">${agentNames[c.assigned_to] ? esc(agentNames[c.assigned_to]) : '<span class="text-muted">Unassigned</span>'}</td>
+          <td style="font-size:12px;color:var(--text-3)">${c.last_message_at ? timeAgo(c.last_message_at) : '—'}</td>
+          <td><span class="pill ${c.is_group ? 'pill-in_progress' : 'pill-open'}" style="font-size:11px">${c.is_group ? 'Group' : 'User'}</span></td>
+        </tr>`).join('')}</tbody>
+      </table></div></div>`;
+
+      document.getElementById('cl-all').addEventListener('change', e => {
+        rows.forEach(c => e.target.checked ? selected.add(c.id) : selected.delete(c.id));
+        wrap.querySelectorAll('.cl-check').forEach(cb => cb.checked = e.target.checked);
+        refreshToolbar();
+      });
+      wrap.querySelectorAll('.cl-check').forEach(cb => cb.addEventListener('change', () => {
+        cb.checked ? selected.add(+cb.dataset.cid) : selected.delete(+cb.dataset.cid);
+        refreshToolbar();
+      }));
+    } catch(e) { wrap.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  document.getElementById('cl-refresh').addEventListener('click', () => loadTable());
+  let t; document.getElementById('cl-search').addEventListener('input', e => {
+    clearTimeout(t); t = setTimeout(() => loadTable(e.target.value.trim()), 300);
+  });
+  document.getElementById('bt-clear').addEventListener('click', () => {
+    selected.clear();
+    document.querySelectorAll('.cl-check, #cl-all').forEach(cb => cb.checked = false);
+    refreshToolbar();
+  });
+
+  // Update Chats: labels, read state, pin, archive, AI — applied to selection
+  document.getElementById('bt-update').addEventListener('click', () => {
+    const labelOpts = State.labels.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('');
+    showModal(`Update ${selected.size} Chats`, `
+      <div class="form-group"><label>Add label</label><select id="bu-addlabel"><option value="">— none —</option>${labelOpts}</select></div>
+      <div class="form-group"><label>Remove label</label><select id="bu-removelabel"><option value="">— none —</option>${labelOpts}</select></div>
+      <div class="form-group"><label>Mark as</label><select id="bu-read">
+        <option value="">— no change —</option><option value="read">Read</option><option value="unread">Unread</option>
+      </select></div>
+      ${[['bu-pin', 'Pin chats'], ['bu-archive', 'Archive chats'], ['bu-ai', 'Activate AI Agent'], ['bu-flag', 'Flag chats']].map(([id, label]) => `
+        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+          <input type="checkbox" id="${id}" style="width:15px;height:15px"> ${label}</label></div>`).join('')}
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="bu-apply">Apply to ${selected.size} chats</button>
+      </div>`);
+    document.getElementById('bu-apply').addEventListener('click', async () => {
+      const updates = {};
+      if (document.getElementById('bu-pin').checked) updates.is_pinned = true;
+      if (document.getElementById('bu-archive').checked) updates.is_archived = true;
+      if (document.getElementById('bu-ai').checked) updates.ai_active = true;
+      if (document.getElementById('bu-flag').checked) updates.is_flagged = true;
+      const read = document.getElementById('bu-read').value;
+      try {
+        await Api.inbox.bulkUpdate({
+          chat_ids: [...selected],
+          updates: Object.keys(updates).length ? updates : null,
+          mark_read: read === 'read' ? true : read === 'unread' ? false : null,
+          add_label_id: parseInt(document.getElementById('bu-addlabel').value) || null,
+          remove_label_id: parseInt(document.getElementById('bu-removelabel').value) || null,
+        });
+        closeModal(); toast(`Updated ${selected.size} chats`, 'success');
+        selected.clear(); refreshToolbar(); loadTable();
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  });
+
+  // Group Actions: add participants to all selected groups
+  document.getElementById('bt-group').addEventListener('click', () => {
+    const groups = rows.filter(c => selected.has(c.id) && c.is_group);
+    if (!groups.length) return toast('Select at least one group chat', 'error');
+    showModal(`Group Actions — ${groups.length} group(s)`, `
+      <p class="text-muted" style="font-size:12.5px;margin-bottom:.6rem">
+        Add contacts to all selected groups at once:<br>
+        ${groups.slice(0, 5).map(g => esc(displayName(g))).join(', ')}${groups.length > 5 ? '…' : ''}
+      </p>
+      <div class="form-group"><label>Phone numbers (comma separated, with country code) *</label>
+        <input type="text" id="ga-numbers" placeholder="919876543210, 918765432109"></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="ga-apply">Add to groups</button>
+      </div>`);
+    document.getElementById('ga-apply').addEventListener('click', async () => {
+      const numbers = document.getElementById('ga-numbers').value.split(',').map(s => s.trim()).filter(Boolean);
+      if (!numbers.length) return toast('Enter at least one number', 'error');
+      try {
+        const res = await Api.groups.addParticipants({
+          chat_ids: groups.map(g => g.id), phone_numbers: numbers,
+        });
+        const ok = res.results.filter(r => r.ok).length;
+        closeModal(); toast(`Added to ${ok}/${res.results.length} groups`, ok ? 'success' : 'error');
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  });
+
+  // Export: CSV of the selected rows
+  document.getElementById('bt-export').addEventListener('click', () => {
+    const picked = rows.filter(c => selected.has(c.id));
+    const header = ['id', 'name', 'type', 'labels', 'unread', 'flagged', 'last_active'];
+    const csv = [header.join(',')].concat(picked.map(c => [
+      c.id,
+      '"' + displayName(c).replace(/"/g, '""') + '"',
+      c.is_group ? 'group' : 'user',
+      '"' + (c.labels || []).map(id => State.labels.find(l => l.id === id)?.name || id).join('; ') + '"',
+      c.unread_count || 0,
+      c.is_flagged ? 'yes' : 'no',
+      c.last_message_at || '',
+    ].join(','))).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'chat_list.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast(`Exported ${picked.length} chats`, 'success');
+  });
+
+  await loadTable();
+}
+
+// ══ TASKS PANEL (topbar) ══════════════════════════════════════════ //
+(() => {
+  const panel = document.getElementById('tasks-panel');
+  const openBtn = document.getElementById('topbar-tasks');
+  if (!panel || !openBtn) return;
+
+  const body = document.getElementById('tasks-panel-body');
+  const viewSel = document.getElementById('tasks-view');
+
+  async function loadTasks() {
+    body.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+    try {
+      const tasks = await Api.tasks.list({ view: viewSel.value });
+      if (!tasks.length) {
+        body.innerHTML = `<div class="empty-state" style="padding:3rem 1rem;text-align:center">
+          <p class="text-muted" style="font-size:13px">No tasks here yet</p>
+          <button class="btn btn-primary btn-sm" style="margin-top:.6rem" onclick="document.getElementById('tasks-create-btn').click()">Create Task +</button>
+        </div>`;
+        return;
+      }
+      body.innerHTML = tasks.map(t => `
+        <div class="task-row ${t.status === 'done' ? 'done' : ''}" data-tid="${t.id}">
+          <input type="checkbox" class="task-check" ${t.status === 'done' ? 'checked' : ''}>
+          <div style="flex:1;min-width:0">
+            <div class="task-title">${esc(t.title)}</div>
+            <div class="task-sub">
+              ${t.assignee_name ? esc(t.assignee_name) : 'Unassigned'}
+              ${t.due_date ? ' · due ' + new Date(t.due_date).toLocaleDateString() : ''}
+              ${t.notes ? ' · ' + esc(t.notes.slice(0, 40)) : ''}
+            </div>
+          </div>
+          <span class="task-prio ${esc(t.priority)}">${esc(t.priority)}</span>
+          <button class="modal-close task-del" title="Delete" style="font-size:14px">×</button>
+        </div>`).join('');
+      body.querySelectorAll('.task-check').forEach(cb => cb.addEventListener('change', async e => {
+        const id = e.target.closest('.task-row').dataset.tid;
+        try { await Api.tasks.update(id, { status: e.target.checked ? 'done' : 'open' }); loadTasks(); }
+        catch(err) { toast(err.message, 'error'); }
+      }));
+      body.querySelectorAll('.task-del').forEach(btn => btn.addEventListener('click', async e => {
+        const id = e.target.closest('.task-row').dataset.tid;
+        if (!confirm('Delete task?')) return;
+        try { await Api.tasks.del(id); loadTasks(); } catch(err) { toast(err.message, 'error'); }
+      }));
+    } catch(e) { body.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
+  }
+
+  openBtn.addEventListener('click', () => {
+    panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+    if (panel.style.display !== 'none') loadTasks();
+  });
+  document.getElementById('tasks-close').addEventListener('click', () => panel.style.display = 'none');
+  viewSel.addEventListener('change', loadTasks);
+
+  document.getElementById('tasks-create-btn').addEventListener('click', () => {
+    // Full task modal (due date, reminder, assignee, priority, notes)
+    showTaskModal({});
+    // refresh the panel after the modal closes
+    const overlay = document.getElementById('modal-overlay');
+    const watcher = setInterval(() => {
+      if (overlay.style.display === 'none') { clearInterval(watcher); loadTasks(); }
+    }, 400);
+  });
+})();
+
+// ══ NOTIFICATION SETTINGS (topbar bell) ═══════════════════════════ //
+const NotifPrefs = {
+  get() {
+    try { return JSON.parse(localStorage.getItem('notif_prefs')) || {}; } catch(_) { return {}; }
+  },
+  save(p) { localStorage.setItem('notif_prefs', JSON.stringify(p)); },
+};
+
+(() => {
+  const bell = document.getElementById('topbar-bell');
+  const pop = document.getElementById('notif-popover');
+  if (!bell || !pop) return;
+
+  const SETTINGS = [
+    ['inapp', 'In-App Notifications'],
+    ['desktop', 'Desktop Notifications'],
+    ['sound', 'Sound'],
+  ];
+  const TYPES = [
+    ['new_messages', 'New Messages'],
+    ['new_note', 'New Private Note'],
+    ['ticket_assign', 'Ticket Assignment'],
+    ['task_assign', 'Task Assignment'],
+    ['chat_assign', 'Chat Assignment'],
+  ];
+
+  function render() {
+    const p = NotifPrefs.get();
+    pop.innerHTML = `
+      <div class="np-title">Notification Settings</div>
+      ${SETTINGS.map(([k, label]) => `
+        <div class="notif-row">${label}
+          <label class="np-switch"><input type="checkbox" data-k="${k}" ${p[k] ? 'checked' : ''}><span class="np-slider"></span></label>
+        </div>`).join('')}
+      <div class="np-title">Notification Types</div>
+      ${TYPES.map(([k, label]) => `
+        <div class="notif-row">${label}
+          <input type="checkbox" class="np-check" data-k="${k}" ${p[k] !== false ? 'checked' : ''}>
+        </div>`).join('')}`;
+    pop.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('change', () => {
+      const prefs = NotifPrefs.get();
+      prefs[inp.dataset.k] = inp.checked;
+      NotifPrefs.save(prefs);
+      if (inp.dataset.k === 'desktop' && inp.checked && 'Notification' in window) {
+        Notification.requestPermission();
+      }
+    }));
+  }
+
+  bell.addEventListener('click', e => {
+    e.stopPropagation();
+    const open = pop.style.display !== 'none';
+    pop.style.display = open ? 'none' : 'block';
+    if (!open) render();
+  });
+  document.addEventListener('click', e => {
+    if (!pop.contains(e.target) && e.target !== bell) pop.style.display = 'none';
+  });
+})();
+
+// Called from the WS handler on incoming events
+function notifyUser(type, title, bodyText) {
+  const p = NotifPrefs.get();
+  if (p[type] === false) return;
+  if (p.inapp) toast(`${title}: ${bodyText}`.slice(0, 120), 'default');
+  if (p.desktop && 'Notification' in window && Notification.permission === 'granted') {
+    try { new Notification(title, { body: bodyText.slice(0, 140) }); } catch(_) {}
+  }
+  if (p.sound) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator(); const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = 880; gain.gain.value = 0.04;
+      osc.start(); osc.stop(ctx.currentTime + 0.12);
+    } catch(_) {}
+  }
+}
+
+// ══ ASK AI (Org & Chat Assistant) ═════════════════════════════════ //
+(() => {
+  const fab = document.getElementById('ask-ai-fab');
+  const panel = document.getElementById('ai-panel');
+  if (!fab || !panel) return;
+  const body = document.getElementById('ai-panel-body');
+  const input = document.getElementById('ai-panel-q');
+  const scopeChip = document.getElementById('ai-scope');
+
+  // Show the FAB once logged in
+  const bootWatch = setInterval(() => {
+    if (State.agent) { fab.style.display = 'flex'; clearInterval(bootWatch); }
+  }, 800);
+
+  const ORG_RECIPES = [
+    ['summarize_24h', '📋 Summarize last 24 hours'],
+    ['find_followups', '💬 Find chats needing follow-up'],
+    ['triage_unassigned', '👥 Triage unassigned'],
+    ['stale_tickets', '🎫 Find stale tickets'],
+  ];
+  const CHAT_RECIPES = [
+    ['summarize_chat', '📋 Summarize this chat'],
+    ['sentiment', '🙂 Sentiment scan'],
+    ['draft_reply', '✍️ Draft a reply'],
+  ];
+
+  function currentChatId() {
+    return State.currentView === 'inbox' ? State.inbox.selectedChatId : null;
+  }
+
+  function renderIntro() {
+    const chatId = currentChatId();
+    const chat = chatId ? State.inbox.chats?.find(c => c.id == chatId) : null;
+    scopeChip.textContent = chat ? `Chat: ${displayName(chat).slice(0, 22)}` : 'Org Assistant';
+    const recipes = chat ? CHAT_RECIPES.concat(ORG_RECIPES.slice(0, 2)) : ORG_RECIPES;
+    body.innerHTML = `
+      <div class="ai-greeting">Hi ${esc((State.agent?.name || '').split(' ')[0] || 'there')} 👋</div>
+      <div class="ai-sub">I can answer questions about your workspace${chat ? ' and this conversation' : ''} — powered by Gemini. I analyze and draft; I never send anything myself.</div>
+      <div class="ai-chips">${recipes.map(([k, label]) =>
+        `<button class="ai-chip" data-recipe="${k}">${label}</button>`).join('')}</div>
+      <div id="ai-thread"></div>`;
+    body.querySelectorAll('.ai-chip').forEach(chip =>
+      chip.addEventListener('click', () => ask('', chip.dataset.recipe, chip.textContent)));
+  }
+
+  async function ask(prompt, recipe, label) {
+    const thread = document.getElementById('ai-thread');
+    if (!thread) return;
+    const chatId = currentChatId();
+    thread.insertAdjacentHTML('beforeend',
+      `<div class="ai-msg q">${esc(label || prompt)}</div>
+       <div class="ai-msg a ai-pending">Thinking…</div>`);
+    body.scrollTop = body.scrollHeight;
+    try {
+      const isChatRecipe = recipe && CHAT_RECIPES.some(([k]) => k === recipe);
+      const res = await Api.ai.assistant({
+        prompt: prompt || '',
+        recipe: recipe || null,
+        chat_id: isChatRecipe ? chatId : (!recipe && chatId ? chatId : null),
+      });
+      const pending = thread.querySelector('.ai-pending');
+      if (pending) { pending.classList.remove('ai-pending'); pending.textContent = res.answer; }
+    } catch(e) {
+      const pending = thread.querySelector('.ai-pending');
+      if (pending) { pending.classList.remove('ai-pending'); pending.textContent = '⚠️ ' + e.message; }
+    }
+    body.scrollTop = body.scrollHeight;
+  }
+
+  fab.addEventListener('click', () => {
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'flex';
+    if (!open) { renderIntro(); setTimeout(() => input.focus(), 50); }
+  });
+  document.getElementById('ai-panel-close').addEventListener('click', () => panel.style.display = 'none');
+
+  const send = () => {
+    const q = input.value.trim();
+    if (!q) return;
+    input.value = '';
+    ask(q, null, null);
+  };
+  document.getElementById('ai-panel-send').addEventListener('click', send);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+  // Ctrl+K opens the assistant
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      fab.click();
+    }
+  });
+})();
 
 // ── Boot ────────────────────────────────────────────────────────── //
 window.onerror = (msg, src, line, col, err) => {

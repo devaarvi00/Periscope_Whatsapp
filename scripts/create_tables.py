@@ -54,7 +54,7 @@ EXPECTED_TABLES = [
 
 def main():
     print(f"\n{'='*60}")
-    print("  Periskope — Database Setup")
+    print("  Hyperscope — Database Setup")
     print(f"{'='*60}")
     print(f"  URL : {settings.database_url}")
     print()

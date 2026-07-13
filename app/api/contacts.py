@@ -76,3 +76,40 @@ def delete_contact(contact_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Contact not found")
     db.delete(c)
     db.commit()
+
+
+# ── Contact labels ────────────────────────────────────────────────────────────
+
+@router.get("/{contact_id}/labels")
+def get_contact_labels(contact_id: int, db: Session = Depends(get_db)):
+    from app.models.label import Label
+    rows = (
+        db.query(Label)
+        .join(ContactLabel, ContactLabel.label_id == Label.id)
+        .filter(ContactLabel.contact_id == contact_id)
+        .all()
+    )
+    return [{"id": l.id, "name": l.name, "color": l.color} for l in rows]
+
+
+@router.post("/{contact_id}/labels/{label_id}", status_code=201)
+def add_contact_label(contact_id: int, label_id: int, db: Session = Depends(get_db)):
+    if not db.query(Contact).filter(Contact.id == contact_id).first():
+        raise HTTPException(404, "Contact not found")
+    exists = db.query(ContactLabel).filter(
+        ContactLabel.contact_id == contact_id, ContactLabel.label_id == label_id
+    ).first()
+    if not exists:
+        db.add(ContactLabel(contact_id=contact_id, label_id=label_id))
+        db.commit()
+    return {"ok": True}
+
+
+@router.delete("/{contact_id}/labels/{label_id}", status_code=204)
+def remove_contact_label(contact_id: int, label_id: int, db: Session = Depends(get_db)):
+    row = db.query(ContactLabel).filter(
+        ContactLabel.contact_id == contact_id, ContactLabel.label_id == label_id
+    ).first()
+    if row:
+        db.delete(row)
+        db.commit()

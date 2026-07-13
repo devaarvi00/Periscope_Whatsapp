@@ -27,10 +27,16 @@ class InboxService:
         assigned_to: int | None = None,
         limit: int = 50,
         offset: int = 0,
+        phone_ids: list[int] | None = None,
+        is_group: bool | None = None,
     ) -> list[Chat]:
         q = self.db.query(Chat).filter(Chat.is_archived == is_archived)
         if phone_id:
             q = q.filter(Chat.phone_id == phone_id)
+        if phone_ids is not None:
+            q = q.filter(Chat.phone_id.in_(phone_ids or [0]))
+        if is_group is not None:
+            q = q.filter(Chat.is_group == is_group)
         if is_flagged is not None:
             q = q.filter(Chat.is_flagged == is_flagged)
         if assigned_to is not None:
@@ -79,17 +85,27 @@ class InboxService:
         return q.order_by(desc(Message.timestamp)).limit(limit).all()
 
     def upsert_message(self, data: dict[str, Any]) -> Message:
+        from sqlalchemy.exc import IntegrityError
         existing = self.db.query(Message).filter(
             Message.message_wid == data["message_wid"]
         ).first()
         if existing:
             return existing
-        msg = Message(**data)
-        self.db.add(msg)
-        self.db.commit()
-        self.db.refresh(msg)
-        self._update_chat_last_message(data["chat_id"], data.get("body", ""), data.get("timestamp"))
-        return msg
+        try:
+            with self.db.begin_nested():
+                msg = Message(**data)
+                self.db.add(msg)
+            self.db.commit()
+            self.db.refresh(msg)
+            self._update_chat_last_message(data["chat_id"], data.get("body", ""), data.get("timestamp"))
+            return msg
+        except IntegrityError:
+            existing = self.db.query(Message).filter(
+                Message.message_wid == data["message_wid"]
+            ).first()
+            if existing:
+                return existing
+            raise
 
     def _update_chat_last_message(self, chat_id: int, body: str, ts: datetime | None) -> None:
         chat = self.get_chat(chat_id)

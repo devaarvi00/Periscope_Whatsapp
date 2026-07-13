@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Periskope — WhatsApp CRM</title>
-<link rel="stylesheet" href="/static/css/app.css">
+<title>Hyperscope — WhatsApp CRM</title>
+<link rel="stylesheet" href="/static/css/app.css?v=34">
 </head>
 <body>
 
 <!-- LOGIN SCREEN -->
-<div id="login-screen" class="login-screen has-panel">
+<div id="login-screen" class="login-screen">
 
   <div class="ls-outer">
   <div class="ls-wrap">
@@ -21,18 +21,12 @@
           <mask id="ls-mask" maskUnits="userSpaceOnUse"><circle cx="256" cy="256" r="256" fill="#3C3"/></mask>
           <g mask="url(#ls-mask)">
             <circle cx="256" cy="256" r="256" fill="#15803D"/>
-            <path fill="#fff" d="M88 258c0-55.228 44.772-100 100-100h100v369H88z"/>
-            <path fill="#fff" d="M218 158h125c55.228 0 100 44.772 100 100s-44.772 100-100 100H218z"/>
-            <circle cx="339" cy="258" r="75" fill="#15803D"/>
-            <path fill="#15803D" d="m256.478 322.112 12.879-37.603 26.712 34.08z"/>
-            <circle cx="310" cy="261" r="10" fill="#fff"/>
-            <circle cx="343" cy="261" r="10" fill="#fff"/>
-            <circle cx="376" cy="261" r="10" fill="#fff"/>
+            <path fill="#fff" d="M148 128h72v112h72V128h72v256h-72V304h-72v80h-72z"/>
           </g>
         </svg>
       </div>
       <div class="ls-brand-name">
-        <span>Periskope</span>
+        <span>Hyperscope</span>
         <span class="ls-brand-tag">WhatsApp CRM Platform</span>
       </div>
     </div>
@@ -41,7 +35,7 @@
     <div class="ls-card">
 
       <div class="ls-card-head">
-        <h2>Log in to Periskope</h2>
+        <h2>Log in to Hyperscope</h2>
         <p>Enter your credentials to continue</p>
       </div>
 
@@ -51,7 +45,7 @@
           <label for="login-email">Email address</label>
           <div class="lf-input-wrap">
             <svg class="lf-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-            <input type="email" id="login-email" placeholder="admin@gmail.com" required autocomplete="email">
+            <input type="email" id="login-email" placeholder="you@company.com" required autocomplete="email">
           </div>
         </div>
 
@@ -102,47 +96,9 @@
       </span>
     </div>
 
-    <p class="ls-footer">© 2025 Periskope · WhatsApp CRM Platform</p>
+    <p class="ls-footer">© 2026 Hyperscope · WhatsApp CRM Platform</p>
 
   </div><!-- end ls-wrap -->
-
-  <!-- Changelog panel -->
-  <div class="ls-changelog">
-    <div class="ls-changelog-title">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-      What's New in Periskope
-    </div>
-    <div class="ls-cl-item">
-      <span class="ls-cl-version">v2.4</span>
-      <span class="ls-cl-date">June 2025</span>
-      <span class="ls-cl-text">Gemini AI Agent — auto-reply and takeover. Train on your knowledge base.</span>
-    </div>
-    <div class="ls-cl-item">
-      <span class="ls-cl-version">v2.3</span>
-      <span class="ls-cl-date">May 2025</span>
-      <span class="ls-cl-text">3-panel inbox with contact detail sidebar. Assign chats and manage labels inline.</span>
-    </div>
-    <div class="ls-cl-item">
-      <span class="ls-cl-version">v2.2</span>
-      <span class="ls-cl-date">Apr 2025</span>
-      <span class="ls-cl-text">Bulk messaging campaigns with scheduling and credit tracking.</span>
-    </div>
-    <div class="ls-cl-item">
-      <span class="ls-cl-version">v2.1</span>
-      <span class="ls-cl-date">Mar 2025</span>
-      <span class="ls-cl-text">Automation rules engine — auto-assign, label, and respond based on triggers.</span>
-    </div>
-    <div class="ls-cl-item">
-      <span class="ls-cl-version">v2.0</span>
-      <span class="ls-cl-date">Feb 2025</span>
-      <span class="ls-cl-text">Multi-number inbox. Connect multiple WhatsApp numbers to a single dashboard.</span>
-    </div>
-    <div class="ls-cl-item">
-      <span class="ls-cl-version">v1.9</span>
-      <span class="ls-cl-date">Jan 2025</span>
-      <span class="ls-cl-text">SLA tracking, ticket priorities, and breached SLA alerts for support teams.</span>
-    </div>
-  </div>
 
   </div><!-- end ls-outer -->
 
@@ -152,28 +108,22 @@
 <div id="app-shell" class="app-shell" style="display:none">
 
   <!-- SIDEBAR -->
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-top">
-      <div class="sidebar-brand">
+      <div class="sidebar-brand" id="sidebar-org">
         <svg class="brand-svg" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <mask id="sb-mask" maskUnits="userSpaceOnUse"><circle cx="256" cy="256" r="256" fill="#3C3"/></mask>
-          <g mask="url(#sb-mask)">
-            <circle cx="256" cy="256" r="256" fill="#15803D"/>
-            <path fill="#fff" d="M88 258c0-55.228 44.772-100 100-100h100v369H88z"/>
-            <path fill="#fff" d="M218 158h125c55.228 0 100 44.772 100 100s-44.772 100-100 100H218z"/>
-            <circle cx="339" cy="258" r="75" fill="#15803D"/>
-            <path fill="#15803D" d="m256.478 322.112 12.879-37.603 26.712 34.08z"/>
-            <circle cx="310" cy="261" r="10" fill="#fff"/>
-            <circle cx="343" cy="261" r="10" fill="#fff"/>
-            <circle cx="376" cy="261" r="10" fill="#fff"/>
-          </g>
+          <rect x="16" y="16" width="480" height="480" rx="96" fill="#15803D"/>
+          <path fill="#fff" d="M148 128h72v112h72V128h72v256h-72V304h-72v80h-72z"/>
         </svg>
-        <span>Periskope</span>
+        <div class="brand-meta">
+          <span class="brand-name">Hyperscope</span>
+          <span class="brand-sub" id="brand-agent-email"></span>
+        </div>
       </div>
     </div>
     <nav class="sidebar-nav">
       <a href="#" class="nav-item" data-view="dashboard">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
         <span>Dashboard</span>
       </a>
       <a href="#" class="nav-item active" data-view="inbox">
@@ -182,7 +132,7 @@
         <span class="badge" id="unread-badge" style="display:none">0</span>
       </a>
       <a href="#" class="nav-item" data-view="tickets">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2z"/></svg>
         <span>Tickets</span>
       </a>
       <a href="#" class="nav-item" data-view="analytics">
@@ -194,7 +144,7 @@
         <span>Chat List</span>
       </a>
       <a href="#" class="nav-item" data-view="bulk">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l18-8-8 18-2-8z"/></svg>
         <span>Bulk Messages</span>
       </a>
       <a href="#" class="nav-item" data-view="contacts">
@@ -202,23 +152,27 @@
         <span>Contacts</span>
       </a>
       <a href="#" class="nav-item" data-view="communities">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 21l9-18 9 18"/><path d="M6 15h12"/></svg>
-        <span>Communities</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="7" r="4"/><path d="M17 11a4 4 0 1 0 0-8"/><path d="M1 21v-2a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v2"/><path d="M23 21v-2a5 5 0 0 0-4-4.9"/></svg>
+        <span>Groups</span>
+      </a>
+      <a href="#" class="nav-item" data-view="scheduled">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span>Scheduled</span>
       </a>
       <a href="#" class="nav-item" data-view="knowledge-base">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
         <span>Media</span>
       </a>
       <a href="#" class="nav-item" data-view="ai-agent">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9z"/></svg>
         <span>AI</span>
       </a>
       <a href="#" class="nav-item" data-view="automation">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span>Automation Rules</span>
       </a>
       <a href="#" class="nav-item" data-view="logs">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
         <span>Logs</span>
       </a>
       <a href="#" class="nav-item" data-view="settings">
@@ -233,14 +187,10 @@
           <div class="agent-name" id="agent-name">Loading...</div>
           <div class="agent-role" id="agent-role">agent</div>
         </div>
+        <button class="logout-btn" id="logout-btn" title="Sign out">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
       </div>
-      <button class="logout-btn" id="logout-btn" title="Sign out">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-      </button>
-    </div>
-    <div class="sidebar-collapse">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 19l-7-7 7-7M18 19l-7-7 7-7"/></svg>
-      Collapse
     </div>
   </aside>
 
@@ -251,15 +201,31 @@
       <div class="app-topbar-left">
         <div class="app-breadcrumb" id="app-breadcrumb">Dashboard</div>
       </div>
+      <div class="app-topbar-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="global-search" placeholder="Search chats, messages, tickets, contacts...">
+      </div>
       <div class="app-topbar-right">
+        <button class="topbar-btn" id="topbar-refresh" title="Refresh current view">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          <span>Refresh</span>
+        </button>
+        <div class="topbar-phone-badge" id="topbar-phone-count" style="display:none">
+          <span class="phone-dot"></span>
+          <span id="topbar-phone-num">0</span>&nbsp;/&nbsp;<span id="topbar-phone-total">0</span>&nbsp;phones
+        </div>
         <div class="ws-status" id="ws-status" title="Connecting…">
           <span class="ws-dot"></span>
           <span class="ws-label" id="ws-label">Connecting</span>
         </div>
-        <div class="topbar-divider"></div>
-        <div class="topbar-phone-badge" id="topbar-phone-count" style="display:none">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
-          <span id="topbar-phone-num">0</span> phone
+        <button class="topbar-btn topbar-icon-btn" id="topbar-tasks" title="Tasks">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><polyline points="3 6 4 7 6 5"/><polyline points="3 12 4 13 6 11"/><polyline points="3 18 4 19 6 17"/></svg>
+        </button>
+        <div style="position:relative">
+          <button class="topbar-btn topbar-icon-btn" id="topbar-bell" title="Notification settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          </button>
+          <div class="notif-popover" id="notif-popover" style="display:none"></div>
         </div>
         <div class="topbar-agent" id="topbar-agent">
           <div class="topbar-avatar" id="topbar-avatar">?</div>
@@ -272,6 +238,43 @@
     </div>
   </main>
 
+</div>
+
+<!-- ASK AI FAB + PANEL -->
+<button class="ask-ai-fab" id="ask-ai-fab" title="Ask AI (workspace assistant)" style="display:none">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9z"/></svg>
+</button>
+<div class="ai-panel" id="ai-panel" style="display:none">
+  <div class="ai-panel-head">
+    <h3>✨ Ask AI <span class="ai-scope-chip" id="ai-scope">Org Assistant</span></h3>
+    <button class="modal-close" id="ai-panel-close">×</button>
+  </div>
+  <div class="ai-panel-body" id="ai-panel-body"></div>
+  <div class="ai-panel-input">
+    <input type="text" id="ai-panel-q" placeholder="Ask me anything about your workspace...">
+    <button class="btn btn-primary btn-sm" id="ai-panel-send">➤</button>
+  </div>
+</div>
+
+<!-- TASKS SIDE PANEL -->
+<div class="tasks-panel" id="tasks-panel" style="display:none">
+  <div class="tasks-panel-head">
+    <h3>Tasks</h3>
+    <div style="display:flex;gap:.5rem;align-items:center">
+      <button class="btn btn-primary btn-sm" id="tasks-create-btn">Create Task +</button>
+      <button class="modal-close" id="tasks-close">×</button>
+    </div>
+  </div>
+  <div class="tasks-panel-filter">
+    <select id="tasks-view">
+      <option value="my_open">My open tasks</option>
+      <option value="all_active">All active tasks</option>
+      <option value="all">All tasks</option>
+      <option value="assigned_to_me">Assigned to me</option>
+      <option value="high_priority">High priority tasks</option>
+    </select>
+  </div>
+  <div class="tasks-panel-body" id="tasks-panel-body"></div>
 </div>
 
 <!-- TOAST -->
@@ -288,7 +291,7 @@
   </div>
 </div>
 
-<script src="/static/js/api.js"></script>
-<script src="/static/js/app.js"></script>
+<script src="/static/js/api.js?v=34"></script>
+<script src="/static/js/app.js?v=34"></script>
 </body>
 </html>

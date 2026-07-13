@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -25,6 +25,8 @@ class Chat(Base, TimestampMixin):
     ai_state: Mapped[str] = mapped_column(String(20), default="INACTIVE")
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
     contact_id: Mapped[int | None] = mapped_column(ForeignKey("contacts.id"), nullable=True)
+    custom_properties: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    ai_snoozed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ChatLabel(Base):
