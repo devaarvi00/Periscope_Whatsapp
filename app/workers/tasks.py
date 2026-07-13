@@ -212,9 +212,20 @@ async def run_scheduled_messages() -> None:
                 db.commit()
                 continue
 
+            # Step 1: Send via WAHA — if this fails, mark as failed and stop.
             try:
                 waha = WAHAService(session_name=phone.session_name)
                 result = await waha.send_text(chat.chat_wid, item.body)
+            except Exception as exc:
+                item.status = "failed"
+                item.last_error = str(exc)[:500]
+                logger.warning("Scheduled message %s send failed: %s", item.id, exc)
+                db.commit()
+                continue
+
+            # Step 2: Record the sent message. WAHA also fires a webhook that inserts
+            # the same message_wid, so a duplicate-key race is expected and harmless.
+            try:
                 InboxService(db).upsert_message({
                     "chat_id": chat.id,
                     "phone_id": phone.id,
@@ -226,17 +237,16 @@ async def run_scheduled_messages() -> None:
                     "message_type": "text",
                     "timestamp": now,
                 })
-                item.sent_count = (item.sent_count or 0) + 1
-                nxt = _next_occurrence(item, now)
-                if nxt is None:
-                    item.status = "sent"
-                else:
-                    item.send_at = nxt
-                item.last_error = None
-            except Exception as exc:
-                item.status = "failed"
-                item.last_error = str(exc)[:500]
-                logger.warning("Scheduled message %s failed: %s", item.id, exc)
+            except Exception:
+                pass  # Webhook already inserted this message — not an error
+
+            item.sent_count = (item.sent_count or 0) + 1
+            nxt = _next_occurrence(item, now)
+            if nxt is None:
+                item.status = "sent"
+            else:
+                item.send_at = nxt
+            item.last_error = None
             db.commit()
     finally:
         db.close()

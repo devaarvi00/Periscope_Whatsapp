@@ -2388,12 +2388,6 @@ async function renderAIAgent() {
           </div>
           <div class="card-body" id="ai-cfg-body"><div class="spinner"></div></div>
         </div>
-        <div style="margin-bottom:1rem">
-          <div class="content-card">
-            <div class="card-header">Active AI Chats</div>
-            <div class="card-body" id="ai-chats-list"><div class="spinner"></div></div>
-          </div>
-        </div>
         <div class="content-card">
           <div class="card-header">Translate Message</div>
           <div class="card-body">
@@ -2477,26 +2471,6 @@ async function renderAIAgent() {
     const el = document.getElementById('ai-cfg-body');
     if (el) el.innerHTML = `<p class="text-muted" style="font-size:12.5px">${esc(e.message)}</p>`;
   }
-
-  try {
-    const chats = await Api.inbox.chats({ ai_active: true });
-    const el = document.getElementById('ai-chats-list');
-    if (!chats.length) { el.innerHTML = `<p class="text-muted">No active AI chats</p>`; }
-    else {
-      el.innerHTML = chats.map(c => `
-        <div style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;border-bottom:1px solid var(--border-light)">
-          <div style="flex:1"><div style="font-weight:600;font-size:13px">${esc(displayName(c))}</div>
-          <span class="${pillClass(c.ai_state||'ACTIVE')}">${c.ai_state||'ACTIVE'}</span></div>
-          <button class="btn btn-ghost btn-sm ai-takeover" data-cid="${c.id}">Takeover</button>
-        </div>`).join('');
-      el.querySelectorAll('.ai-takeover').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          try { await Api.ai.takeover(btn.dataset.cid); toast('Human takeover done', 'success'); renderAIAgent(); }
-          catch(e) { toast(e.message, 'error'); }
-        });
-      });
-    }
-  } catch(_) {}
 
   document.getElementById('tl-btn').addEventListener('click', async () => {
     const text = document.getElementById('tl-text').value.trim();
