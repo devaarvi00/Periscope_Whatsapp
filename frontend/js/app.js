@@ -3899,7 +3899,7 @@ async function _updateDashWaha(phoneId) {
 
     if (status === 'WORKING') {
       if (_dashWahaPrevStatus !== 'WORKING') {
-        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
+        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem">
           <div style="width:64px;height:64px;border-radius:50%;background:#dcfce7;display:flex;align-items:center;justify-content:center">
             <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#15803d" stroke-width="2.2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
           </div>
@@ -4137,17 +4137,6 @@ async function renderDashboard() {
             </div>
           </div>
 
-          <div class="dash-panel" style="margin:1rem 0">
-            <div class="dp-head">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-              Recent Conversations
-              <button class="btn btn-ghost btn-sm" style="margin-left:auto;font-size:12px" onclick="switchView('inbox')">View all →</button>
-            </div>
-            <div class="dp-body" id="ds-recent-chats" style="padding:0">
-              <div style="padding:1.5rem;text-align:center;color:var(--text-3);font-size:13px">Loading…</div>
-            </div>
-          </div>
-
           <div class="quick-links-title">Quick links</div>
           <div class="quick-links">
             ${cards.map(c => `<div class="ql-card">
@@ -4167,12 +4156,12 @@ async function renderDashboard() {
           </div>
           <div id="dash-phone-cards"></div>
           <div class="dash-panel" style="margin-top:.4rem">
-            <div class="dp-body" style="text-align:center">
-              <div class="gs-qr-box" id="dash-waha-box" style="display:flex;align-items:center;justify-content:center;min-height:120px">
+            <div class="dp-body" style="display:flex;flex-direction:column;align-items:center;gap:.5rem">
+              <div class="gs-qr-box" id="dash-waha-box" style="display:flex;align-items:center;justify-content:center;">
                 <div class="waha-spinner" style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
               </div>
-              <div class="gs-qr-label" id="dash-waha-label" style="font-size:12px;color:var(--text-3);margin-top:.5rem">Checking connection…</div>
-              <div class="gs-qr-actions" id="dash-waha-actions" style="margin-top:.5rem"></div>
+              <div class="gs-qr-label" id="dash-waha-label" style="font-size:12px;color:var(--text-3)">Checking connection…</div>
+              <div class="gs-qr-actions" id="dash-waha-actions" style="display:flex;gap:.5rem;justify-content:center"></div>
             </div>
           </div>
         </div>
@@ -4209,39 +4198,6 @@ async function renderDashboard() {
       set('ds-tickets-mine', mine.length);
     } catch(_) {}
 
-    // Recent conversations panel
-    try {
-      const recentEl = document.getElementById('ds-recent-chats');
-      if (recentEl && phoneConnected) {
-        const recent = await Api.inbox.chats({ limit: 8 });
-        if (!recent.length) {
-          recentEl.innerHTML = `<div style="padding:1.5rem;text-align:center;color:var(--text-3);font-size:13px">No conversations yet</div>`;
-        } else {
-          recentEl.innerHTML = recent.map(c => {
-            const unread = c.unread_count > 0;
-            const avatar = initials(c.name || c.chat_wid);
-            const color = avatarColor(c.name || c.chat_wid);
-            const preview = c.last_message
-              ? (c.last_message.length > 55 ? c.last_message.slice(0, 55) + '…' : c.last_message)
-              : '<span style="opacity:.45;font-style:italic">No messages</span>';
-            const time = c.last_message_at ? timeAgo(c.last_message_at) : '';
-            return `<div class="ds-chat-row" onclick="switchView('inbox');setTimeout(()=>openChat(${c.id}),300)" style="display:flex;align-items:center;gap:.65rem;padding:.55rem 1rem;cursor:pointer;border-bottom:1px solid var(--border-light);transition:background .1s" onmouseenter="this.style.background='var(--bg)'" onmouseleave="this.style.background=''">
-              <div class="agent-avatar" style="background:${color};width:34px;height:34px;font-size:12px;flex-shrink:0">${esc(avatar)}</div>
-              <div style="flex:1;min-width:0">
-                <div style="display:flex;align-items:center;justify-content:space-between;gap:.5rem">
-                  <span style="font-size:13px;font-weight:${unread ? 700 : 500};color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(displayName(c))}</span>
-                  <span style="font-size:11px;color:var(--text-4);flex-shrink:0">${time}</span>
-                </div>
-                <div style="font-size:12px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px">${preview}</div>
-              </div>
-              ${unread ? `<span style="background:var(--accent);color:#fff;font-size:11px;font-weight:600;min-width:18px;height:18px;border-radius:99px;display:flex;align-items:center;justify-content:center;padding:0 5px;flex-shrink:0">${c.unread_count > 99 ? '99+' : c.unread_count}</span>` : ''}
-            </div>`;
-          }).join('');
-        }
-      } else if (recentEl) {
-        recentEl.innerHTML = `<div style="padding:1.5rem;text-align:center;color:var(--text-3);font-size:13px">Connect WhatsApp to see conversations</div>`;
-      }
-    } catch(_) {}
   } catch(_) {}
 
   // Phone status cards + live WAHA poller
@@ -4958,7 +4914,6 @@ const NotifPrefs = {
   if (!bell || !pop) return;
 
   const SETTINGS = [
-    ['inapp', 'In-App Notifications'],
     ['desktop', 'Desktop Notifications'],
     ['sound', 'Sound'],
   ];
@@ -5007,7 +4962,6 @@ const NotifPrefs = {
 function notifyUser(type, title, bodyText) {
   const p = NotifPrefs.get();
   if (p[type] === false) return;
-  if (p.inapp) toast(`${title}: ${bodyText}`.slice(0, 120), 'default');
   if (p.desktop && 'Notification' in window && Notification.permission === 'granted') {
     try { new Notification(title, { body: bodyText.slice(0, 140) }); } catch(_) {}
   }
