@@ -298,17 +298,24 @@ async def _process_session_status(payload: dict[str, Any]) -> None:
 
         chat_ids = [r[0] for r in db.query(Chat.id).filter(Chat.phone_id == phone.id).all()]
         if chat_ids:
+            from sqlalchemy import update
+
             from app.models.note import Note
-            from app.models.ticket import Ticket
+            from app.models.ticket import Ticket, TicketLabel
             from app.models.bulk_message_job import BulkMessageLog
             from app.models.scheduled_message import ScheduledMessage
             from app.models.task import Task
 
+            ticket_ids = [r[0] for r in db.query(Ticket.id).filter(Ticket.chat_id.in_(chat_ids)).all()]
+            if ticket_ids:
+                db.execute(delete(TicketLabel).where(TicketLabel.ticket_id.in_(ticket_ids)))
             db.execute(delete(Note).where(Note.chat_id.in_(chat_ids)))
             db.execute(delete(Ticket).where(Ticket.chat_id.in_(chat_ids)))
             db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
             db.execute(delete(ScheduledMessage).where(ScheduledMessage.chat_id.in_(chat_ids)))
             db.execute(delete(Task).where(Task.chat_id.in_(chat_ids)))
+            msg_ids = db.query(Message.id).filter(Message.phone_id == phone.id).subquery()
+            db.execute(update(Task).where(Task.message_id.in_(msg_ids.select())).values(message_id=None))
             db.execute(delete(ChatLabel).where(ChatLabel.chat_id.in_(chat_ids)))
             db.execute(delete(Message).where(Message.phone_id == phone.id))
             db.execute(delete(Chat).where(Chat.phone_id == phone.id))
@@ -338,7 +345,8 @@ async def waha_webhook(
     try:
         import json
         body = await request.json()
-        logger.info("WAHA WEBHOOK BODY: %s", json.dumps(body))
+        # Full payloads only in debug mode — they contain customer message content
+        logger.debug("WAHA WEBHOOK BODY: %s", json.dumps(body))
     except Exception as exc:
         logger.exception("Failed to parse or log webhook JSON: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid JSON")
