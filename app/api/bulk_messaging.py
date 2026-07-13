@@ -34,11 +34,14 @@ def create_job(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    from datetime import datetime
+    from datetime import datetime, timezone
     scheduled_at = None
     if req.scheduled_at:
         try:
-            scheduled_at = datetime.fromisoformat(req.scheduled_at)
+            dt = datetime.fromisoformat(req.scheduled_at)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            scheduled_at = dt
         except ValueError:
             raise HTTPException(400, "Invalid scheduled_at format (use ISO 8601)")
     if req.message_type == "poll" and not (req.poll_options and len(req.poll_options) >= 2):
@@ -52,7 +55,10 @@ def create_job(
     end_date = None
     if req.end_date:
         try:
-            end_date = datetime.fromisoformat(req.end_date)
+            dt = datetime.fromisoformat(req.end_date)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            end_date = dt
         except ValueError:
             raise HTTPException(400, "Invalid end_date (use ISO 8601)")
     job = BulkService(db).create_job(

@@ -1316,7 +1316,10 @@ function renderThread(chat) {
   document.getElementById('btn-summarize').addEventListener('click', async () => {
     try {
       const res = await Api.ai.summarize(chat.id);
-      showModal('Chat Summary', `<p style="font-size:13px;line-height:1.6;color:var(--text-2)">${esc(res.summary || JSON.stringify(res))}</p>`);
+      const formattedSummary = esc(res.summary || '')
+        .replace(/\n/g, '<br>')
+        .replace(/(^|<br>)-\s*/g, '$1• ');
+      showModal('Chat Summary', `<div style="font-size:13px;line-height:1.6;color:var(--text-2)">${formattedSummary}</div>`);
     } catch(e) { toast(e.message, 'error'); }
   });
 
@@ -1678,7 +1681,10 @@ function renderMessage(m, isGroup) {
 
   return `<div class="msg ${cls}" data-mid="${m.id || ''}">
     ${senderDisplay ? `<div class="msg-sender">${esc(senderDisplay)}</div>` : ''}
-    <div class="msg-bubble">${bubbleContent}</div>
+    <div class="msg-bubble ${m.is_flagged ? 'flagged-msg' : ''}">
+      ${m.is_flagged ? '<div class="msg-flag-badge">🚩 AI Flagged</div>' : ''}
+      ${bubbleContent}
+    </div>
     <div class="msg-info">${fmt(m.timestamp)} ${m.from_me ? (m.is_read ? '<span style="color:#53bdeb">✓✓</span>' : '✓') : ''}</div>
   </div>`;
 }
@@ -3995,11 +4001,26 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
   const opts = chats.map(c => `<option value="${c.id}" ${selChat == c.id ? 'selected' : ''}>${esc(displayName(c))}</option>`).join('');
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const ed = editItem || {};
+  const toLocalDt = (iso) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0, 16);
+  };
+  const toLocalDateOnly = (iso) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  };
 
   showModal(editItem ? 'Edit Scheduled Message' : 'Schedule Message', `
     <div class="form-group"><label>Chat *</label><select id="sc-chat" ${editItem ? 'disabled' : ''}>${opts}</select></div>
     <div class="form-group"><label>Message *</label><textarea id="sc-body" style="min-height:70px">${esc(ed.body || prefillBody || '')}</textarea></div>
-    <div class="form-group"><label>Send At *</label><input type="datetime-local" id="sc-at" value="${ed.send_at ? ed.send_at.slice(0, 16) : ''}"></div>
+    <div class="form-group"><label>Send At *</label><input type="datetime-local" id="sc-at" value="${toLocalDt(ed.send_at)}"></div>
     <div class="form-group"><label>Repeat</label><select id="sc-repeat">
       <option value="none">Once</option>
       <option value="daily" ${ed.repeat === 'daily' ? 'selected' : ''}>Daily</option>
@@ -4025,7 +4046,7 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
         <input type="number" id="sc-dom" min="1" max="31" value="${ed.day_of_month || ''}" placeholder="e.g. 1">
       </div>
       <div class="form-group"><label>End date (optional — leave empty for open-ended)</label>
-        <input type="date" id="sc-end" value="${ed.end_date ? ed.end_date.slice(0, 10) : ''}"></div>
+        <input type="date" id="sc-end" value="${toLocalDateOnly(ed.end_date)}"></div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -4047,8 +4068,12 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
     const at = document.getElementById('sc-at').value;
     if (!body || !at) return toast('Message and time required', 'error');
     const repeat = repeatSel.value;
+    const sendAtUtc = new Date(at).toISOString();
+    const endVal = document.getElementById('sc-end')?.value;
+    const endDateUtc = endVal ? new Date(endVal).toISOString() : (editItem ? '' : null);
+
     const payload = {
-      body, send_at: at, repeat,
+      body, send_at: sendAtUtc, repeat,
       interval: parseInt(document.getElementById('sc-interval')?.value) || 1,
       days_of_week: repeat === 'daily'
         ? [...document.querySelectorAll('.sc-day:checked')].map(c => +c.value)
@@ -4056,7 +4081,7 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
       day_of_month: repeat === 'monthly'
         ? (parseInt(document.getElementById('sc-dom')?.value) || null)
         : null,
-      end_date: document.getElementById('sc-end')?.value || (editItem ? '' : null),
+      end_date: endDateUtc,
     };
     try {
       if (editItem) {
@@ -4450,14 +4475,14 @@ function notifyUser(type, title, bodyText) {
 
 // ══ ASK AI (Org & Chat Assistant) ═════════════════════════════════ //
 (() => {
-  const fab = document.getElementById('ask-ai-fab');
+  const fab = document.getElementById('topbar-ask-ai');
   const panel = document.getElementById('ai-panel');
   if (!fab || !panel) return;
   const body = document.getElementById('ai-panel-body');
   const input = document.getElementById('ai-panel-q');
   const scopeChip = document.getElementById('ai-scope');
 
-  // Show the FAB once logged in
+  // Show the button once logged in
   const bootWatch = setInterval(() => {
     if (State.agent) { fab.style.display = 'flex'; clearInterval(bootWatch); }
   }, 800);

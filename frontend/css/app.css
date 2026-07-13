@@ -1038,10 +1038,14 @@ textarea{resize:vertical;min-height:80px;}
   background:var(--surface);border:1px solid var(--border);
   border-radius:12px;width:100%;max-width:480px;
   box-shadow:0 8px 32px rgba(0,0,0,.14),0 2px 8px rgba(0,0,0,.06);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
 }
 .modal-header{
   padding:0 1.1rem;min-height:50px;border-bottom:1px solid var(--border);
   display:flex;align-items:center;justify-content:space-between;
+  flex-shrink: 0;
 }
 .modal-header h3{font-size:14.5px;font-weight:700;color:var(--text);}
 .modal-close{
@@ -1050,11 +1054,16 @@ textarea{resize:vertical;min-height:80px;}
   transition:background .1s,color .1s;
 }
 .modal-close:hover{background:var(--bg);color:var(--text);}
-.modal-body{padding:1.25rem 1.1rem;}
+.modal-body{
+  padding:1.25rem 1.1rem;
+  overflow-y: auto;
+  flex: 1;
+}
 .modal-footer{
   padding:.75rem 1.1rem;border-top:1px solid var(--border);
   display:flex;justify-content:flex-end;gap:.4rem;
   background:#f9fafb;border-radius:0 0 12px 12px;
+  flex-shrink: 0;
 }
 
 /* ── Scrollbar ──────────────────────────────────────────────────── */
@@ -1593,4 +1602,34 @@ textarea{resize:vertical;min-height:80px;}
 .ai-scope-chip{
   font-size:11px;font-weight:600;border-radius:99px;padding:.15rem .6rem;
   background:var(--accent-light);color:var(--accent-dark);
+}
+
+#topbar-ask-ai {
+  color: var(--accent);
+  background: rgba(21, 128, 61, 0.06);
+  border-color: rgba(21, 128, 61, 0.15);
+}
+#topbar-ask-ai:hover {
+  background: rgba(21, 128, 61, 0.12);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.msg-bubble.flagged-msg {
+  border: 1px solid rgba(245, 158, 11, 0.3) !important;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.15);
+  background: #fffbeb !important;
+}
+.msg-flag-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--warning, #eab308);
+  text-transform: uppercase;
+  margin-bottom: 4px;
+  opacity: 0.9;
+  border-bottom: 1px dashed rgba(245, 158, 11, 0.25);
+  padding-bottom: 2px;
 }
