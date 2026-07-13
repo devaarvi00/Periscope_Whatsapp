@@ -152,11 +152,15 @@ async def clear_phone_data(phone_id: int, db: Session = Depends(get_db)):
 async def auto_connect(db: Session = Depends(get_db)):
     """Find or create the default phone, start WAHA session, return phone + QR."""
     session_name = settings.waha_session_name
-    phone = db.query(Phone).filter(Phone.session_name == session_name, Phone.is_active == True).first()
+    phone = db.query(Phone).filter(Phone.session_name == session_name).first()
     if not phone:
         phone = Phone(name="My WhatsApp", phone_number="pending", session_name=session_name,
-                      waha_status="STOPPED", is_default=True)
+                      waha_status="STOPPED", is_default=True, is_active=True)
         db.add(phone)
+        db.commit()
+        db.refresh(phone)
+    elif not phone.is_active:
+        phone.is_active = True
         db.commit()
         db.refresh(phone)
 
