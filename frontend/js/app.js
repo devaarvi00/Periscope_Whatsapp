@@ -3315,7 +3315,7 @@ async function loadSettingsTab(tab) {
                 <div style="margin-bottom:0.75rem">
                   <div style="font-size:12px;color:var(--text-3)">Phone Number:</div>
                   <div style="font-size:14px;font-weight:500;color:var(--text)">
-                    ${p.phone_number && p.phone_number !== 'pending' ? '+' + p.phone_number : '<span style="color:#d97706;font-size:12px">⚠️ Pending connection</span>'}
+                    ${p.phone_number && !p.phone_number.startsWith('pending') ? '+' + p.phone_number : '<span style="color:#d97706;font-size:12px">⚠️ Pending connection</span>'}
                   </div>
                 </div>
 

@@ -30,11 +30,15 @@ def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
     existing_session = db.query(Phone).filter(Phone.session_name == req.session_name).first()
     if existing_session:
         raise HTTPException(400, "Session name already registered")
-    if req.phone_number and req.phone_number != "pending":
-        existing_num = db.query(Phone).filter(Phone.phone_number == req.phone_number).first()
+    data = req.model_dump()
+    # Use a unique placeholder so multiple pending phones don't conflict on the unique index
+    if not data.get("phone_number") or data["phone_number"] == "pending":
+        data["phone_number"] = f"pending_{req.session_name}"
+    else:
+        existing_num = db.query(Phone).filter(Phone.phone_number == data["phone_number"]).first()
         if existing_num:
             raise HTTPException(400, "Phone number already registered")
-    phone = Phone(**req.model_dump())
+    phone = Phone(**data)
     db.add(phone)
     db.commit()
     db.refresh(phone)
