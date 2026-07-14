@@ -149,15 +149,7 @@ async def _store_waha_messages(
     chat: dict,
     phone: Any,
 ) -> None:
-    _media_types = {"image", "photo", "video", "audio", "ptt", "voice",
-                    "document", "pdf", "sticker", "gif", "location", "contact", "vcard"}
-    _media_labels = {
-        "image": "📷 Photo", "photo": "📷 Photo", "video": "🎬 Video",
-        "audio": "🎤 Voice message", "voice": "🎤 Voice message", "ptt": "🎤 Voice message",
-        "document": "📄 Document", "pdf": "📄 Document",
-        "sticker": "🖼 Sticker", "gif": "🎞 GIF", "location": "📍 Location",
-        "contact": "👤 Contact", "vcard": "👤 Contact",
-    }
+    from app.api.webhooks import _MEDIA_TYPES as _media_types, _MEDIA_LABELS as _media_labels, _SYSTEM_LABELS as _system_labels
     from datetime import timezone
     for m in waha_msgs:
         raw_id = m.get("id") or {}
@@ -170,8 +162,11 @@ async def _store_waha_messages(
         ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc).replace(tzinfo=None) if isinstance(ts_raw, (int, float)) else datetime.utcnow()
         msg_type = str(m.get("type") or "text").lower()
         has_media = msg_type in _media_types or bool(m.get("hasMedia") or m.get("has_media"))
-        if not body and has_media:
-            body = _media_labels.get(msg_type, "📎 Media")
+        if not body:
+            if has_media:
+                body = _media_labels.get(msg_type, "📎 Media")
+            elif msg_type in _system_labels:
+                body = _system_labels[msg_type]
         sender_name = m.get("notifyName") or m.get("pushName") or ""
         from_raw = m.get("from") or m.get("author") or ""
         sender_number = str(from_raw.get("_serialized") or from_raw.get("id", "") if isinstance(from_raw, dict) else from_raw).split("@")[0]

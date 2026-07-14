@@ -55,6 +55,35 @@ def _serialize_chat(doc: dict) -> dict:
     }
 
 
+_SYSTEM_LABELS: dict[str, str] = {
+    "revoke": "🗑 Message deleted",
+    "call_log": "📞 Call",
+    "e2e_notification": "🔒 Encrypted notification",
+    "notification_template": "📋 Notification",
+    "protocol": "🔄 System message",
+    "order": "🛒 Order",
+    "product": "📦 Product",
+    "list": "📋 List message",
+    "list_response": "📋 List response",
+    "buttons_response": "📋 Button response",
+    "template_button_reply": "📋 Template reply",
+    "interactive": "📋 Interactive message",
+    "poll_creation": "📊 Poll",
+    "poll_update": "📊 Poll response",
+}
+
+
+def _body_for_display(doc: dict) -> str:
+    """Return a human-readable body string — never empty — from a message document."""
+    body = doc.get("body") or ""
+    if body:
+        return body
+    msg_type = (doc.get("message_type") or "text").lower()
+    if doc.get("has_media") or msg_type in _MEDIA_LABELS:
+        return _MEDIA_LABELS.get(msg_type, "📎 Media")
+    return _SYSTEM_LABELS.get(msg_type, "")
+
+
 def _serialize_message(doc: dict) -> dict:
     if not doc:
         return {}
@@ -69,7 +98,7 @@ def _serialize_message(doc: dict) -> dict:
         "sender_name": doc.get("sender_name") or "",
         "sender_number": doc.get("sender_number") or "",
         "sent_by_agent_id": doc.get("sent_by_agent_id"),
-        "body": doc.get("body") or "",
+        "body": _body_for_display(doc),
         "message_type": doc.get("message_type") or "text",
         "has_media": bool(doc.get("has_media")),
         "media_url": doc.get("media_url"),

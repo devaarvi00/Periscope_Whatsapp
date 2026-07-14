@@ -24,6 +24,20 @@ _MEDIA_LABELS = {
     "location": "📍 Location",
     "contact": "👤 Contact", "vcard": "👤 Contact",
 }
+_SYSTEM_LABELS = {
+    "revoke": "🗑 Message deleted",
+    "call_log": "📞 Call",
+    "e2e_notification": "🔒 Encrypted notification",
+    "order": "🛒 Order",
+    "product": "📦 Product",
+    "list": "📋 List message",
+    "list_response": "📋 List response",
+    "buttons_response": "📋 Button response",
+    "template_button_reply": "📋 Template reply",
+    "interactive": "📋 Interactive message",
+    "poll_creation": "📊 Poll",
+    "poll_update": "📊 Poll response",
+}
 
 
 async def _process_message_event(payload: dict[str, Any]) -> None:
@@ -66,6 +80,18 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             return
 
         notify_name = msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName") or ""
+
+        # Fall back to MySQL Contact table when WAHA gives no display name
+        contact_name = ""
+        if not notify_name and not chat_wid.endswith("@g.us"):
+            number = chat_wid.split("@")[0]
+            from app.models.contact import Contact as _Contact
+            _contact = db.query(_Contact).filter(_Contact.phone_number == number).first()
+            if _contact and _contact.name:
+                contact_name = _contact.name
+
+        best_name = notify_name or contact_name
+
         chat = await inbox.get_chat_by_wid(chat_wid, phone.id)
         chat_is_new = chat is None
 
@@ -81,7 +107,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                     pass
                 chat_name = chat_name or f"Group {chat_wid.split('@')[0][-6:]}"
             else:
-                chat_name = notify_name or chat_wid.split("@")[0]
+                chat_name = best_name or chat_wid.split("@")[0]
 
             from app.models.ai_settings import get_ai_settings
             _cfg = get_ai_settings(db)
@@ -93,11 +119,13 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                 "ai_active": bool(_cfg.enabled and _cfg.auto_activate_new_chats),
                 "ai_state": "ACTIVE" if (_cfg.enabled and _cfg.auto_activate_new_chats) else "INACTIVE",
             })
-        elif not (chat.get("is_group")) and notify_name:
+        elif not chat.get("is_group"):
             current = chat.get("name") or ""
-            if current == chat_wid or current == chat_wid.split("@")[0] or "@" in current:
-                await inbox.update_chat(chat["id"], name=notify_name)
-                chat["name"] = notify_name
+            # Upgrade from raw-number name whenever we have a better name now
+            raw_number = chat_wid.split("@")[0]
+            if best_name and (current == chat_wid or current == raw_number or "@" in current):
+                await inbox.update_chat(chat["id"], name=best_name)
+                chat["name"] = best_name
 
         body = msg_data.get("body") or msg_data.get("caption") or ""
         ts_raw = msg_data.get("timestamp")
@@ -109,8 +137,11 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         msg_type = str(msg_data.get("type") or "text").lower()
         waha_has_media = bool(msg_data.get("hasMedia") or msg_data.get("has_media"))
         has_media = msg_type in _MEDIA_TYPES or waha_has_media
-        if not body and has_media:
-            body = _MEDIA_LABELS.get(msg_type, "📎 Media")
+        if not body:
+            if has_media:
+                body = _MEDIA_LABELS.get(msg_type, "📎 Media")
+            elif msg_type in _SYSTEM_LABELS:
+                body = _SYSTEM_LABELS[msg_type]
 
         sender_name = msg_data.get("notifyName") or msg_data.get("pushName") or ""
         from_raw = msg_data.get("from") or msg_data.get("author") or ""
