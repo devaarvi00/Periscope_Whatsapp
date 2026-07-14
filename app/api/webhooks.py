@@ -57,7 +57,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         # another concurrent background task) already processed it — skip all side effects.
         msg_already_exists = db.query(Message.id).filter(Message.message_wid == msg_wid).scalar() is not None
 
-        chat = inbox.get_chat_by_wid(chat_wid)
+        chat = inbox.get_chat_by_wid(chat_wid, phone.id)
         chat_is_new = chat is None
         notify_name = msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName") or ""
         if not chat:

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -8,9 +8,10 @@ from app.models.base import Base, TimestampMixin
 
 class Chat(Base, TimestampMixin):
     __tablename__ = "chats"
+    __table_args__ = (UniqueConstraint("phone_id", "chat_wid", name="uq_chats_phone_chat"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    chat_wid: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    chat_wid: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     phone_id: Mapped[int] = mapped_column(ForeignKey("phones.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     is_group: Mapped[bool] = mapped_column(Boolean, default=False)

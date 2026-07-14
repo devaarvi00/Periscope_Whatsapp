@@ -50,12 +50,16 @@ class InboxService:
     def get_chat(self, chat_id: int) -> Chat | None:
         return self.db.query(Chat).filter(Chat.id == chat_id).first()
 
-    def get_chat_by_wid(self, chat_wid: str) -> Chat | None:
-        return self.db.query(Chat).filter(Chat.chat_wid == chat_wid).first()
+    def get_chat_by_wid(self, chat_wid: str, phone_id: int | None = None) -> Chat | None:
+        q = self.db.query(Chat).filter(Chat.chat_wid == chat_wid)
+        if phone_id is not None:
+            q = q.filter(Chat.phone_id == phone_id)
+        return q.first()
 
     def upsert_chat(self, data: dict[str, Any]) -> Chat:
         chat_wid = data["chat_wid"]
-        chat = self.get_chat_by_wid(chat_wid)
+        phone_id = data.get("phone_id")
+        chat = self.get_chat_by_wid(chat_wid, phone_id)
         if not chat:
             chat = Chat(**data)
             self.db.add(chat)
