@@ -85,23 +85,28 @@ class InboxService:
     def get_messages(self, chat_id: int, limit: int = 50,
                      before_id: int | None = None,
                      before_ts: str | None = None) -> list[Message]:
+        from sqlalchemy import or_, and_
         q = self.db.query(Message).filter(Message.chat_id == chat_id)
-        if before_ts:
-            # Timestamp cursor: correct even for historically-synced messages that
-            # arrive with new high IDs but old timestamps (id-based cursor misses them)
+        if before_id:
+            # Compound (timestamp, id) cursor: handles identical timestamps without gaps.
+            # Fetch the pivot row first so we can apply (ts < pivot_ts) OR (ts = pivot_ts AND id < pivot_id).
+            pivot = self.db.query(Message.id, Message.timestamp).filter(
+                Message.id == before_id, Message.chat_id == chat_id
+            ).first()
+            if pivot:
+                q = q.filter(
+                    or_(
+                        Message.timestamp < pivot.timestamp,
+                        and_(Message.timestamp == pivot.timestamp, Message.id < pivot.id),
+                    )
+                )
+        elif before_ts:
             try:
                 ts = datetime.fromisoformat(before_ts.replace("Z", "").split(".")[0])
                 q = q.filter(Message.timestamp < ts)
             except ValueError:
                 pass
-        elif before_id:
-            # Legacy fallback: find the pivot message and use its timestamp
-            pivot = self.db.query(Message.timestamp).filter(
-                Message.id == before_id, Message.chat_id == chat_id
-            ).scalar()
-            if pivot:
-                q = q.filter(Message.timestamp < pivot)
-        return q.order_by(desc(Message.timestamp)).limit(limit).all()
+        return q.order_by(desc(Message.timestamp), desc(Message.id)).limit(limit).all()
 
     def upsert_message(self, data: dict[str, Any]) -> Message:
         from sqlalchemy.exc import IntegrityError

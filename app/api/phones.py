@@ -278,10 +278,15 @@ async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
                     "Removing stale phone record %s (session=%s) — number %s now claimed by phone %s",
                     conflict.id, conflict.session_name, number, phone_id,
                 )
-                # Re-parent chats that belong to the stale record so we don't lose history
+                from app.models.agent_phone import AgentPhone as _AgentPhone
+                # Re-parent chats AND messages to the surviving phone so no FK dangles
                 db.query(Chat).filter(Chat.phone_id == conflict.id).update(
                     {"phone_id": phone_id}, synchronize_session=False
                 )
+                db.query(Message).filter(Message.phone_id == conflict.id).update(
+                    {"phone_id": phone_id}, synchronize_session=False
+                )
+                db.execute(delete(_AgentPhone).where(_AgentPhone.phone_id == conflict.id))
                 db.flush()
                 db.delete(conflict)
                 db.flush()
@@ -326,29 +331,42 @@ async def delete_phone(phone_id: int, db: Session = Depends(get_db)):
     except Exception:
         pass  # don't block deletion if WAHA is unreachable
 
-    # Hard-delete all associated DB data
+    # Hard-delete all associated DB data in FK-safe order
+    from sqlalchemy import update
+    from app.models.note import Note
+    from app.models.ticket import Ticket, TicketLabel
+    from app.models.bulk_message_job import BulkMessageJob, BulkMessageLog
+    from app.models.scheduled_message import ScheduledMessage
+    from app.models.task import Task
+    from app.models.agent_phone import AgentPhone
+
     chat_ids = [r[0] for r in db.query(Chat.id).filter(Chat.phone_id == phone_id).all()]
     if chat_ids:
-        from sqlalchemy import update
-        from app.models.note import Note
-        from app.models.ticket import Ticket, TicketLabel
-        from app.models.bulk_message_job import BulkMessageLog
-        from app.models.scheduled_message import ScheduledMessage
-        from app.models.task import Task
-
         ticket_ids = [r[0] for r in db.query(Ticket.id).filter(Ticket.chat_id.in_(chat_ids)).all()]
         if ticket_ids:
             db.execute(delete(TicketLabel).where(TicketLabel.ticket_id.in_(ticket_ids)))
         db.execute(delete(Note).where(Note.chat_id.in_(chat_ids)))
         db.execute(delete(Ticket).where(Ticket.chat_id.in_(chat_ids)))
-        db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
         db.execute(delete(ScheduledMessage).where(ScheduledMessage.chat_id.in_(chat_ids)))
         msg_ids = db.query(Message.id).filter(Message.phone_id == phone_id).subquery()
         db.execute(update(Task).where(Task.message_id.in_(msg_ids.select())).values(message_id=None))
         db.execute(delete(Task).where(Task.chat_id.in_(chat_ids)))
         db.execute(delete(ChatLabel).where(ChatLabel.chat_id.in_(chat_ids)))
+
+    # BulkMessageLog has FK to both chat and bulk_message_jobs — delete logs first, then jobs
+    job_ids = [r[0] for r in db.query(BulkMessageJob.id).filter(BulkMessageJob.phone_id == phone_id).all()]
+    if job_ids:
+        db.execute(delete(BulkMessageLog).where(BulkMessageLog.job_id.in_(job_ids)))
+        db.execute(delete(BulkMessageJob).where(BulkMessageJob.phone_id == phone_id))
+    elif chat_ids:
+        # Also clear any logs referencing chats of this phone (edge case)
+        db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
+
+    if chat_ids:
         db.execute(delete(Message).where(Message.phone_id == phone_id))
         db.execute(delete(Chat).where(Chat.phone_id == phone_id))
 
+    # Remove agent↔phone assignments and then the phone itself
+    db.execute(delete(AgentPhone).where(AgentPhone.phone_id == phone_id))
     db.delete(phone)
     db.commit()

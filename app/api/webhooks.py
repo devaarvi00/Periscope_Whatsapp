@@ -53,10 +53,6 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
 
         inbox = InboxService(db)
 
-        # Dedup guard: if this message_wid is already in DB, a previous event (or
-        # another concurrent background task) already processed it — skip all side effects.
-        msg_already_exists = db.query(Message.id).filter(Message.message_wid == msg_wid).scalar() is not None
-
         chat = inbox.get_chat_by_wid(chat_wid, phone.id)
         chat_is_new = chat is None
         notify_name = msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName") or ""
@@ -125,6 +121,11 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         else:
             sender_number = str(from_raw).split("@")[0]
 
+        # Dedup: if this message_wid already exists, skip all side effects.
+        # Check again right before insert — a concurrent task may have just inserted it.
+        if db.query(Message.id).filter(Message.message_wid == msg_wid).scalar() is not None:
+            return
+
         inbox.upsert_message({
             "chat_id": chat.id,
             "phone_id": phone.id,
@@ -137,10 +138,6 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             "has_media": has_media,
             "timestamp": ts,
         })
-
-        # Duplicate event (message.any fired twice, or race with another task) — stop here.
-        if msg_already_exists:
-            return
 
         if not from_me:
             chat.unread_count = (chat.unread_count or 0) + 1
