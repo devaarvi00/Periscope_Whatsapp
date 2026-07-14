@@ -3213,18 +3213,6 @@ function showAddPhoneModal() {
       <label>WAHA Session Name *</label>
       <input type="text" id="add-ph-session" placeholder="e.g. sales_support (lowercase, alphanumeric, no spaces)" style="font-family:monospace">
     </div>
-    <div style="border-top:1px solid var(--border-light);margin:.75rem 0 .5rem;padding-top:.75rem">
-      <div style="font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:.5rem">WAHA Connection (leave blank to use server default)</div>
-      <div class="form-group">
-        <label>WAHA Base URL</label>
-        <input type="text" id="add-ph-url" placeholder="e.g. http://127.0.0.1:3001" style="font-family:monospace">
-        <small class="text-muted">Only needed if this number uses a different WAHA container/port</small>
-      </div>
-      <div class="form-group">
-        <label>WAHA API Key</label>
-        <input type="password" id="add-ph-key" placeholder="Leave blank to use default API key">
-      </div>
-    </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="add-ph-save">Save & Connect</button>
@@ -3245,8 +3233,6 @@ function showAddPhoneModal() {
         session_name: session,
         phone_number: 'pending',
         is_default: false,
-        waha_base_url: document.getElementById('add-ph-url').value.trim() || null,
-        waha_api_key: document.getElementById('add-ph-key').value.trim() || null,
       });
       closeModal();
       toast('WhatsApp session created! Initializing connection...', 'success');
@@ -3330,15 +3316,6 @@ async function loadSettingsTab(tab) {
                   <div style="font-size:12px;color:var(--text-3)">Phone Number:</div>
                   <div style="font-size:14px;font-weight:500;color:var(--text)">
                     ${p.phone_number && p.phone_number !== 'pending' ? '+' + p.phone_number : '<span style="color:#d97706;font-size:12px">⚠️ Pending connection</span>'}
-                  </div>
-                </div>
-
-                <div style="margin-bottom:1rem;padding:.5rem .6rem;background:var(--bg-2,var(--border-light));border-radius:6px;font-size:11.5px;color:var(--text-3)">
-                  <div>WAHA: <span style="font-family:monospace;color:var(--text-2)">${esc(p.waha_base_url || '(default)')}</span></div>
-                  <div>API Key: <span style="font-family:monospace;color:var(--text-2)">${p.waha_api_key ? '••••••••' : '(default)'}</span>
-                    <button class="btn btn-ghost btn-sm phone-btn-waha-edit" data-pid="${p.id}"
-                      data-url="${esc(p.waha_base_url || '')}" data-haskey="${p.waha_api_key ? '1' : '0'}"
-                      style="font-size:10px;padding:1px 6px;margin-left:4px">Edit</button>
                   </div>
                 </div>
 
@@ -3479,44 +3456,6 @@ async function loadSettingsTab(tab) {
         });
       });
 
-      el.querySelectorAll('.phone-btn-waha-edit').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const pid = parseInt(btn.dataset.pid);
-          const currentUrl = btn.dataset.url || '';
-          showModal('Edit WAHA Connection', `
-            <p style="font-size:12.5px;color:var(--text-2);margin-bottom:1rem">
-              Set the WAHA base URL and API key for this specific phone number.<br>
-              Leave blank to use the server default from <code>.env</code>.
-            </p>
-            <div class="form-group">
-              <label>WAHA Base URL</label>
-              <input type="text" id="waha-edit-url" value="${esc(currentUrl)}"
-                placeholder="e.g. http://127.0.0.1:3001" style="font-family:monospace">
-              <small class="text-muted">Port 3000 = waha_1 &nbsp;|&nbsp; Port 3001 = waha_2 &nbsp;|&nbsp; Port 3003 = waha_3</small>
-            </div>
-            <div class="form-group">
-              <label>WAHA API Key</label>
-              <input type="password" id="waha-edit-key" placeholder="Leave blank to keep existing / use default">
-              <small class="text-muted">Only enter a new key if you want to change it</small>
-            </div>
-            <div class="modal-footer">
-              <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-              <button class="btn btn-primary" id="waha-edit-save">Save</button>
-            </div>`);
-          document.getElementById('waha-edit-save').addEventListener('click', async () => {
-            const url = document.getElementById('waha-edit-url').value.trim();
-            const key = document.getElementById('waha-edit-key').value.trim();
-            const body = { waha_base_url: url || null };
-            if (key) body.waha_api_key = key;
-            try {
-              await Api.phones.update(pid, body);
-              closeModal();
-              toast('WAHA connection updated — restart the session to apply', 'success');
-              loadSettingsTab('phones');
-            } catch(e) { toast(e.message, 'error'); }
-          });
-        });
-      });
 
     } catch(_) { el.innerHTML = '<div class="loading-center text-muted">Could not load WhatsApp status</div>'; }
   }
