@@ -3249,6 +3249,10 @@ async function loadSettingsTab(tab) {
   if (tab === 'phones') {
     try {
       const phones = await Api.phones.list();
+      // Silently resolve any WORKING phone still showing "pending" number —
+      // happens when app restarted before sync-number completed after QR scan
+      phones.filter(p => p.waha_status === 'WORKING' && (p.phone_number || '').startsWith('pending'))
+            .forEach(p => Api.phones.syncNumber(p.id).catch(() => {}));
       
       let html = `
         <div class="flex-col gap-4">
@@ -3359,6 +3363,20 @@ async function loadSettingsTab(tab) {
                 }, 4000);
               }
             } else {
+              // No QR — session may already be connected; check status
+              try {
+                const s = await Api.phones.status(phoneId);
+                if (s.status === 'WORKING') {
+                  clearInterval(_pollTimer); clearInterval(_syncTimer);
+                  await Api.phones.syncNumber(phoneId).catch(() => {});
+                  toast('WhatsApp connected! Syncing chats…', 'success');
+                  loadSettingsTab('phones'); loadPhones();
+                  _chatAutoSynced = false;
+                  try { await Api.inbox.sync(phoneId); } catch(_) {}
+                  loadChats();
+                  return;
+                }
+              } catch(_) {}
               area.innerHTML = `<p style="font-size:12px;color:var(--text-2);text-align:center">Waiting for QR…</p>`;
             }
           } catch(e) { area.innerHTML = `<p style="font-size:12px;color:var(--danger);text-align:center">${esc(e.message)}</p>`; }

@@ -81,8 +81,34 @@ async def get_status(phone_id: int, db: Session = Depends(get_db)):
         logger.warning("Failed to query WAHA status for phone %s: %s", phone.session_name, exc)
         status = "OFFLINE"
     phone.waha_status = status
+
+    # Auto-resolve stale "pending_*" placeholder: if WAHA is connected but we
+    # never stored the real number (e.g. app restarted before sync-number ran),
+    # fetch it now so the card stops showing "Pending connection".
+    if status == "WORKING" and str(phone.phone_number or "").startswith("pending"):
+        try:
+            me = await waha.get_me()
+            number = me.get("id", "").split("@")[0] if me.get("id") else ""
+            if number:
+                conflict = db.query(Phone).filter(
+                    Phone.phone_number == number, Phone.id != phone.id
+                ).first()
+                if conflict:
+                    from app.models.agent_phone import AgentPhone as _AP
+                    db.query(Message).filter(Message.phone_id == conflict.id).update(
+                        {"phone_id": phone.id}, synchronize_session=False)
+                    db.query(Chat).filter(Chat.phone_id == conflict.id).update(
+                        {"phone_id": phone.id}, synchronize_session=False)
+                    db.execute(delete(_AP).where(_AP.phone_id == conflict.id))
+                    db.flush()
+                    db.delete(conflict)
+                    db.flush()
+                phone.phone_number = number
+        except Exception:
+            pass
+
     db.commit()
-    return {"phone_id": phone_id, "status": status}
+    return {"phone_id": phone_id, "status": status, "phone_number": phone.phone_number}
 
 
 @router.get("/{phone_id}/qr")
