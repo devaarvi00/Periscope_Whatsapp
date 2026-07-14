@@ -257,6 +257,8 @@ async def auto_connect(db: Session = Depends(get_db)):
 @router.post("/{phone_id}/sync-number")
 async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
     """After QR scan: fetch real phone number from WAHA and update the record."""
+    from app.api.webhooks import logger
+
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
@@ -265,11 +267,28 @@ async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
         me = await waha.get_me()
         number = me.get("id", "").split("@")[0] if me.get("id") else ""
         if number:
+            # Remove any stale phone record that already holds this number
+            # (happens when the same WhatsApp account was previously registered under a different session)
+            conflict = db.query(Phone).filter(
+                Phone.phone_number == number,
+                Phone.id != phone_id,
+            ).first()
+            if conflict:
+                logger.info(
+                    "Removing stale phone record %s (session=%s) — number %s now claimed by phone %s",
+                    conflict.id, conflict.session_name, number, phone_id,
+                )
+                # Re-parent chats that belong to the stale record so we don't lose history
+                db.query(Chat).filter(Chat.phone_id == conflict.id).update(
+                    {"phone_id": phone_id}, synchronize_session=False
+                )
+                db.flush()
+                db.delete(conflict)
+                db.flush()
             phone.phone_number = number
         status = await waha.get_session_status()
         phone.waha_status = status
     except Exception as exc:
-        from app.api.webhooks import logger
         logger.warning("Failed to sync phone number for phone %s: %s", phone.session_name, exc)
         status = "OFFLINE"
     db.commit()
