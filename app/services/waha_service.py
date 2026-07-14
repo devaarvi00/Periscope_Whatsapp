@@ -65,11 +65,44 @@ class WAHAService:
             return data.get("me") or {}
         return {}
 
+    async def ensure_session_exists(self, webhook_url: str = "", webhook_secret: str = "") -> bool:
+        """Create the WAHA session if it doesn't exist yet. Returns True if ready."""
+        from app.core.http_client import get_http_client
+        # Check if session already exists
+        status_url = f"{self.base}/api/sessions/{self.session}"
+        resp = await get_http_client().get(status_url, headers=self._headers)
+        if resp.is_success:
+            return True  # already exists
+        # Create it
+        payload: dict = {"name": self.session}
+        if webhook_url:
+            payload["config"] = {
+                "webhooks": [{
+                    "url": webhook_url,
+                    "events": ["message.any", "message.reaction", "session.status"],
+                    "customHeaders": [{"name": "X-Webhook-Secret", "value": webhook_secret}],
+                }]
+            }
+        create_url = f"{self.base}/api/sessions"
+        resp = await get_http_client().post(create_url, headers=self._headers, json=payload)
+        return resp.is_success or resp.status_code == 409  # 409 = already exists, fine
+
     async def start_session(self) -> bool:
         from app.core.http_client import get_http_client
         url = f"{self.base}/api/sessions/{self.session}/start"
         resp = await get_http_client().post(url, headers=self._headers, json={})
         return resp.is_success
+
+    async def delete_waha_session(self) -> bool:
+        """Stop and permanently delete the WAHA session."""
+        from app.core.http_client import get_http_client
+        await self.stop_session()
+        url = f"{self.base}/api/sessions/{self.session}"
+        try:
+            resp = await get_http_client().delete(url, headers=self._headers)
+            return resp.is_success or resp.status_code == 404
+        except Exception:
+            return False
 
     async def stop_session(self) -> bool:
         from app.core.http_client import get_http_client

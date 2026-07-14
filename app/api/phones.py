@@ -84,6 +84,8 @@ async def start_session(phone_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Phone not found")
     waha = WAHAService.from_phone(phone)
     try:
+        # Create the session in WAHA if it doesn't exist yet, then start it
+        await waha.ensure_session_exists(settings.waha_webhook_url, settings.waha_webhook_secret)
         ok = await waha.start_session()
         if ok:
             await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
@@ -196,7 +198,7 @@ async def auto_connect(db: Session = Depends(get_db)):
     session_name = settings.waha_session_name
     phone = db.query(Phone).filter(Phone.session_name == session_name).first()
     if not phone:
-        phone = Phone(name="My WhatsApp", phone_number="pending", session_name=session_name,
+        phone = Phone(name="My WhatsApp", phone_number=f"pending_{session_name}", session_name=session_name,
                       waha_status="STOPPED", is_default=True, is_active=True)
         db.add(phone)
         db.commit()
@@ -208,12 +210,12 @@ async def auto_connect(db: Session = Depends(get_db)):
 
     waha = WAHAService.from_phone(phone)
     try:
+        await waha.ensure_session_exists(settings.waha_webhook_url, settings.waha_webhook_secret)
         status = await waha.get_session_status()
         if status not in ("WORKING", "SCAN_QR_CODE"):
             await waha.start_session()
             await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
         else:
-            # Session is already started/working, make sure webhook is configured
             await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
     except Exception as exc:
         from app.api.webhooks import logger
@@ -270,9 +272,41 @@ def update_phone(phone_id: int, req: dict, db: Session = Depends(get_db)):
 
 
 @router.delete("/{phone_id}", status_code=204)
-def delete_phone(phone_id: int, db: Session = Depends(get_db)):
+async def delete_phone(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    phone.is_active = False
+
+    # Stop + delete the WAHA session
+    try:
+        waha = WAHAService.from_phone(phone)
+        await waha.delete_waha_session()
+    except Exception:
+        pass  # don't block deletion if WAHA is unreachable
+
+    # Hard-delete all associated DB data
+    chat_ids = [r[0] for r in db.query(Chat.id).filter(Chat.phone_id == phone_id).all()]
+    if chat_ids:
+        from sqlalchemy import update
+        from app.models.note import Note
+        from app.models.ticket import Ticket, TicketLabel
+        from app.models.bulk_message_job import BulkMessageLog
+        from app.models.scheduled_message import ScheduledMessage
+        from app.models.task import Task
+
+        ticket_ids = [r[0] for r in db.query(Ticket.id).filter(Ticket.chat_id.in_(chat_ids)).all()]
+        if ticket_ids:
+            db.execute(delete(TicketLabel).where(TicketLabel.ticket_id.in_(ticket_ids)))
+        db.execute(delete(Note).where(Note.chat_id.in_(chat_ids)))
+        db.execute(delete(Ticket).where(Ticket.chat_id.in_(chat_ids)))
+        db.execute(delete(BulkMessageLog).where(BulkMessageLog.chat_id.in_(chat_ids)))
+        db.execute(delete(ScheduledMessage).where(ScheduledMessage.chat_id.in_(chat_ids)))
+        msg_ids = db.query(Message.id).filter(Message.phone_id == phone_id).subquery()
+        db.execute(update(Task).where(Task.message_id.in_(msg_ids.select())).values(message_id=None))
+        db.execute(delete(Task).where(Task.chat_id.in_(chat_ids)))
+        db.execute(delete(ChatLabel).where(ChatLabel.chat_id.in_(chat_ids)))
+        db.execute(delete(Message).where(Message.phone_id == phone_id))
+        db.execute(delete(Chat).where(Chat.phone_id == phone_id))
+
+    db.delete(phone)
     db.commit()
