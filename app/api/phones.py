@@ -46,7 +46,7 @@ async def get_status(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         status = await waha.get_session_status()
     except Exception as exc:
@@ -63,7 +63,7 @@ async def get_qr(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         qr = await waha.get_qr()
     except Exception as exc:
@@ -78,7 +78,7 @@ async def start_session(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         ok = await waha.start_session()
         if ok:
@@ -96,7 +96,7 @@ async def logout_session(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         ok = await waha.logout_session()
     except Exception as exc:
@@ -117,7 +117,7 @@ async def stop_session(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         ok = await waha.stop_session()
     except Exception as exc:
@@ -132,7 +132,7 @@ async def restart_session(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         ok = await waha.restart_session()
         if ok:
@@ -202,7 +202,7 @@ async def auto_connect(db: Session = Depends(get_db)):
         db.commit()
         db.refresh(phone)
 
-    waha = WAHAService(session_name=session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         status = await waha.get_session_status()
         if status not in ("WORKING", "SCAN_QR_CODE"):
@@ -231,7 +231,7 @@ async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         me = await waha.get_me()
         number = me.get("id", "").split("@")[0] if me.get("id") else ""
@@ -246,6 +246,23 @@ async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(phone)
     return {"phone_id": phone_id, "phone_number": phone.phone_number, "status": phone.waha_status}
+
+
+@router.patch("/{phone_id}", response_model=PhoneOut)
+def update_phone(phone_id: int, req: dict, db: Session = Depends(get_db)):
+    """Update phone name or WAHA connection settings (base_url, api_key)."""
+    from pydantic import BaseModel
+
+    phone = db.query(Phone).filter(Phone.id == phone_id).first()
+    if not phone:
+        raise HTTPException(404, "Phone not found")
+    allowed = {"name", "waha_base_url", "waha_api_key", "is_default"}
+    for k, v in req.items():
+        if k in allowed and hasattr(phone, k):
+            setattr(phone, k, v or None)
+    db.commit()
+    db.refresh(phone)
+    return phone
 
 
 @router.delete("/{phone_id}", status_code=204)

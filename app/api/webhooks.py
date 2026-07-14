@@ -67,7 +67,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                 chat_name = ""
                 try:
                     from app.services.waha_service import WAHAService
-                    info = await WAHAService(session_name=session).get_group_info(chat_wid)
+                    info = await WAHAService.from_phone(phone).get_group_info(chat_wid)
                     chat_name = info.get("subject") or info.get("name") or ""
                 except Exception:
                     pass
@@ -221,7 +221,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             recent = [{"body": body, "from_me": from_me, "sender_name": sender_name}]
             reply = await ai.handle_incoming_message(chat, body, recent)
             if reply:
-                waha = WAHAService(session_name=session)
+                waha = WAHAService.from_phone(phone)
                 ai_result = await waha.send_text(chat_wid, reply)
                 ai_ts = datetime.utcnow()
                 # Use the real WAHA message_wid so the incoming message.any webhook

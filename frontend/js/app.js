@@ -2080,7 +2080,12 @@ async function loadTickets(status = '') {
   try {
     const q = {};
     if (status) q.status = status;
-    const list = await Api.tickets.list(q);
+    const [list, agents] = await Promise.all([
+      Api.tickets.list(q),
+      Api.auth.agents().catch(() => []),
+    ]);
+    const agentMap = {};
+    agents.forEach(a => { agentMap[a.id] = a.name; });
     State.tickets.list = list;
     const tbody = document.getElementById('tickets-tbody');
     if (!tbody) return;
@@ -2093,7 +2098,7 @@ async function loadTickets(status = '') {
         <td><a href="#" class="ticket-link text-accent" data-tid="${t.id}" style="font-weight:600">${esc(t.title)}</a></td>
         <td><span class="${pillClass(t.status)}">${t.status?.replace('_',' ')}</span></td>
         <td><span class="${pillClass(t.priority)}">${t.priority}</span></td>
-        <td style="font-size:12px;color:var(--text-3)">${t.assigned_to ? 'Agent #'+t.assigned_to : '—'}</td>
+        <td style="font-size:12px;color:var(--text-3)">${t.assigned_to ? esc(agentMap[t.assigned_to] || 'Agent #'+t.assigned_to) : '—'}</td>
         <td style="font-size:12px;color:var(--text-3)">${t.due_date ? new Date(t.due_date).toLocaleDateString() : '—'}</td>
         <td>${t.sla_breached ? '<span class="pill" style="background:#FEF2F2;color:#DC2626">Breached</span>' : '<span class="pill" style="background:var(--success-bg);color:var(--success)">OK</span>'}</td>
         <td style="text-align:right">
@@ -2116,12 +2121,12 @@ async function loadTickets(status = '') {
 }
 
 async function showCreateTicketModal() {
-  let chats = [];
-  try {
-    chats = await Api.inbox.chats({ limit: 200 }).catch(() => []);
-  } catch (_) {}
+  let chats = [], agents = [];
+  try { chats = await Api.inbox.chats({ limit: 200 }).catch(() => []); } catch (_) {}
+  try { agents = await Api.auth.agents(); } catch (_) {}
 
   const chatOpts = chats.map(c => `<option value="${c.id}">${esc(displayName(c))}</option>`).join('');
+  const agentOpts = agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
 
   showModal('New Ticket', `
     <div class="form-group"><label>Customer Chat *</label>
@@ -2133,7 +2138,21 @@ async function showCreateTicketModal() {
       <div class="form-group"><label>Priority</label>
         <select id="ntk-priority"><option>low</option><option selected>medium</option><option>high</option><option>urgent</option></select>
       </div>
+      <div class="form-group"><label>Assignee</label>
+        <select id="ntk-assignee">
+          <option value="">Unassigned</option>
+          ${agentOpts}
+        </select>
+      </div>
       <div class="form-group"><label>Due Date</label><input type="date" id="ntk-due"></div>
+      <div class="form-group"><label>Status</label>
+        <select id="ntk-status">
+          <option value="open" selected>Open</option>
+          <option value="in_progress">In Progress</option>
+          <option value="resolved">Resolved</option>
+          <option value="closed">Closed</option>
+        </select>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -2152,7 +2171,9 @@ async function showCreateTicketModal() {
         title,
         description: document.getElementById('ntk-desc').value,
         priority: document.getElementById('ntk-priority').value,
-        due_date: document.getElementById('ntk-due').value || null
+        status: document.getElementById('ntk-status').value,
+        assigned_to: parseInt(document.getElementById('ntk-assignee').value) || null,
+        due_date: document.getElementById('ntk-due').value || null,
       });
       closeModal();
       toast('Ticket created', 'success');
@@ -2163,24 +2184,36 @@ async function showCreateTicketModal() {
   });
 }
 
-function showEditTicketModal(ticket) {
+async function showEditTicketModal(ticket) {
+  let agents = [];
+  try { agents = await Api.auth.agents(); } catch (_) {}
+  const agentOpts = agents.map(a =>
+    `<option value="${a.id}" ${ticket.assigned_to == a.id ? 'selected' : ''}>${esc(a.name)}</option>`
+  ).join('');
+
   showModal('Edit Ticket #' + ticket.id, `
     <div class="form-group"><label>Title</label><input type="text" id="etk-title" value="${esc(ticket.title)}"></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
       <div class="form-group"><label>Status</label>
         <select id="etk-status">
-          <option ${ticket.status==='open'?'selected':''}>open</option>
-          <option ${ticket.status==='in_progress'?'selected':''} value="in_progress">in_progress</option>
-          <option ${ticket.status==='resolved'?'selected':''}>resolved</option>
-          <option ${ticket.status==='closed'?'selected':''}>closed</option>
+          <option ${ticket.status==='open'?'selected':''} value="open">Open</option>
+          <option ${ticket.status==='in_progress'?'selected':''} value="in_progress">In Progress</option>
+          <option ${ticket.status==='resolved'?'selected':''} value="resolved">Resolved</option>
+          <option ${ticket.status==='closed'?'selected':''} value="closed">Closed</option>
         </select>
       </div>
       <div class="form-group"><label>Priority</label>
         <select id="etk-priority">
-          <option ${ticket.priority==='low'?'selected':''}>low</option>
-          <option ${ticket.priority==='medium'?'selected':''}>medium</option>
-          <option ${ticket.priority==='high'?'selected':''}>high</option>
-          <option ${ticket.priority==='urgent'?'selected':''}>urgent</option>
+          <option ${ticket.priority==='low'?'selected':''} value="low">Low</option>
+          <option ${ticket.priority==='medium'?'selected':''} value="medium">Medium</option>
+          <option ${ticket.priority==='high'?'selected':''} value="high">High</option>
+          <option ${ticket.priority==='urgent'?'selected':''} value="urgent">Urgent</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Assignee</label>
+        <select id="etk-assignee">
+          <option value="" ${!ticket.assigned_to ? 'selected' : ''}>Unassigned</option>
+          ${agentOpts}
         </select>
       </div>
     </div>
@@ -2190,7 +2223,12 @@ function showEditTicketModal(ticket) {
     </div>`);
   document.getElementById('etk-save').addEventListener('click', async () => {
     try {
-      await Api.tickets.update(ticket.id, { title: document.getElementById('etk-title').value, status: document.getElementById('etk-status').value, priority: document.getElementById('etk-priority').value });
+      await Api.tickets.update(ticket.id, {
+        title: document.getElementById('etk-title').value,
+        status: document.getElementById('etk-status').value,
+        priority: document.getElementById('etk-priority').value,
+        assigned_to: parseInt(document.getElementById('etk-assignee').value) || null,
+      });
       closeModal(); toast('Updated', 'success'); loadTickets();
     } catch(e) { toast(e.message, 'error'); }
   });
@@ -3175,6 +3213,18 @@ function showAddPhoneModal() {
       <label>WAHA Session Name *</label>
       <input type="text" id="add-ph-session" placeholder="e.g. sales_support (lowercase, alphanumeric, no spaces)" style="font-family:monospace">
     </div>
+    <div style="border-top:1px solid var(--border-light);margin:.75rem 0 .5rem;padding-top:.75rem">
+      <div style="font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:.5rem">WAHA Connection (leave blank to use server default)</div>
+      <div class="form-group">
+        <label>WAHA Base URL</label>
+        <input type="text" id="add-ph-url" placeholder="e.g. http://127.0.0.1:3001" style="font-family:monospace">
+        <small class="text-muted">Only needed if this number uses a different WAHA container/port</small>
+      </div>
+      <div class="form-group">
+        <label>WAHA API Key</label>
+        <input type="password" id="add-ph-key" placeholder="Leave blank to use default API key">
+      </div>
+    </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="add-ph-save">Save & Connect</button>
@@ -3188,13 +3238,15 @@ function showAddPhoneModal() {
     if (!/^[a-z0-9_-]+$/.test(session)) {
       return toast('Session name must be lowercase alphanumeric and may contain dashes or underscores only.', 'error');
     }
-    
+
     try {
       const res = await Api.phones.create({
         name,
         session_name: session,
         phone_number: 'pending',
-        is_default: false
+        is_default: false,
+        waha_base_url: document.getElementById('add-ph-url').value.trim() || null,
+        waha_api_key: document.getElementById('add-ph-key').value.trim() || null,
       });
       closeModal();
       toast('WhatsApp session created! Initializing connection...', 'success');
@@ -3274,16 +3326,25 @@ async function loadSettingsTab(tab) {
                   <span class="pill" style="background:${statusBg};color:${statusColor};border:1px solid ${statusColor}33;padding:1px 6px;font-size:10px">${statusText}</span>
                 </div>
                 
-                <div style="margin-bottom:1.25rem">
+                <div style="margin-bottom:0.75rem">
                   <div style="font-size:12px;color:var(--text-3)">Phone Number:</div>
                   <div style="font-size:14px;font-weight:500;color:var(--text)">
                     ${p.phone_number && p.phone_number !== 'pending' ? '+' + p.phone_number : '<span style="color:#d97706;font-size:12px">⚠️ Pending connection</span>'}
                   </div>
                 </div>
-                
+
+                <div style="margin-bottom:1rem;padding:.5rem .6rem;background:var(--bg-2,var(--border-light));border-radius:6px;font-size:11.5px;color:var(--text-3)">
+                  <div>WAHA: <span style="font-family:monospace;color:var(--text-2)">${esc(p.waha_base_url || '(default)')}</span></div>
+                  <div>API Key: <span style="font-family:monospace;color:var(--text-2)">${p.waha_api_key ? '••••••••' : '(default)'}</span>
+                    <button class="btn btn-ghost btn-sm phone-btn-waha-edit" data-pid="${p.id}"
+                      data-url="${esc(p.waha_base_url || '')}" data-haskey="${p.waha_api_key ? '1' : '0'}"
+                      style="font-size:10px;padding:1px 6px;margin-left:4px">Edit</button>
+                  </div>
+                </div>
+
                 <div id="phone-qr-area-${p.id}" style="margin-bottom:1rem"></div>
               </div>
-              
+
               <div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center">
                 ${connected
                   ? `<button class="btn btn-secondary btn-sm phone-btn-reconnect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Reconnect / QR</button>
@@ -3415,6 +3476,45 @@ async function loadSettingsTab(tab) {
             toast('Phone session removed', 'success');
             loadSettingsTab('phones'); loadPhones();
           } catch(e) { toast(e.message, 'error'); btn.disabled = false; }
+        });
+      });
+
+      el.querySelectorAll('.phone-btn-waha-edit').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const pid = parseInt(btn.dataset.pid);
+          const currentUrl = btn.dataset.url || '';
+          showModal('Edit WAHA Connection', `
+            <p style="font-size:12.5px;color:var(--text-2);margin-bottom:1rem">
+              Set the WAHA base URL and API key for this specific phone number.<br>
+              Leave blank to use the server default from <code>.env</code>.
+            </p>
+            <div class="form-group">
+              <label>WAHA Base URL</label>
+              <input type="text" id="waha-edit-url" value="${esc(currentUrl)}"
+                placeholder="e.g. http://127.0.0.1:3001" style="font-family:monospace">
+              <small class="text-muted">Port 3000 = waha_1 &nbsp;|&nbsp; Port 3001 = waha_2 &nbsp;|&nbsp; Port 3003 = waha_3</small>
+            </div>
+            <div class="form-group">
+              <label>WAHA API Key</label>
+              <input type="password" id="waha-edit-key" placeholder="Leave blank to keep existing / use default">
+              <small class="text-muted">Only enter a new key if you want to change it</small>
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+              <button class="btn btn-primary" id="waha-edit-save">Save</button>
+            </div>`);
+          document.getElementById('waha-edit-save').addEventListener('click', async () => {
+            const url = document.getElementById('waha-edit-url').value.trim();
+            const key = document.getElementById('waha-edit-key').value.trim();
+            const body = { waha_base_url: url || null };
+            if (key) body.waha_api_key = key;
+            try {
+              await Api.phones.update(pid, body);
+              closeModal();
+              toast('WAHA connection updated — restart the session to apply', 'success');
+              loadSettingsTab('phones');
+            } catch(e) { toast(e.message, 'error'); }
+          });
         });
       });
 

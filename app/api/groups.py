@@ -62,7 +62,7 @@ async def group_participants(chat_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == chat.phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     raw, api_ok = await waha.get_group_participants_with_status(chat.chat_wid)
     result = []
     for p in raw:
@@ -107,7 +107,7 @@ async def add_participants(
         if not phone:
             results.append({"chat_id": cid, "ok": False, "error": "Phone missing"})
             continue
-        waha = WAHAService(session_name=phone.session_name)
+        waha = WAHAService.from_phone(phone)
         ok = await waha.add_group_participants(chat.chat_wid, wids)
         results.append({"chat_id": cid, "group": chat.name, "ok": ok})
     from app.services.activity_service import log_activity

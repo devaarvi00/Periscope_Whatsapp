@@ -198,7 +198,7 @@ async def send_message(
         logger.warning("WAHA session %s status is %s (not WORKING) in development environment. Mocking message send.", phone.session_name, phone.waha_status)
         result = SendResult(message_id=f"mock_{int(time.time())}_{chat.id}", raw={"status": "mock_sent"})
     else:
-        waha = WAHAService(session_name=phone.session_name)
+        waha = WAHAService.from_phone(phone)
         try:
             if req.message_type == "image" and req.media_url:
                 result = await waha.send_image(chat.chat_wid, req.media_url, caption=req.body)
@@ -281,7 +281,7 @@ async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depend
     if not phone:
         raise HTTPException(404, "Phone not found")
 
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         messages = await waha.get_messages(chat.chat_wid, limit=min(max(limit, 1), 500))
     except Exception:
@@ -443,7 +443,7 @@ async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     chats = await waha.get_chats(limit=500)
     svc = InboxService(db)
     synced = 0

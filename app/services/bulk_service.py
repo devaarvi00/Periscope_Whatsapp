@@ -77,7 +77,7 @@ class BulkService:
 
         from app.models.bulk_message_job import BulkMessageLog
 
-        waha = WAHAService(session_name=phone.session_name)
+        waha = WAHAService.from_phone(phone)
         sent = 0
         failed = 0
         run_no = (job.runs_count or 0) + 1

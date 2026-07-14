@@ -16,3 +16,6 @@ class Phone(Base, TimestampMixin):
     waha_status: Mapped[str] = mapped_column(String(30), default="STOPPED")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Per-phone WAHA connection — overrides global settings when set
+    waha_base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    waha_api_key: Mapped[str | None] = mapped_column(String(500), nullable=True)

@@ -68,7 +68,7 @@ async def public_send_message(
     if not phone:
         raise HTTPException(503, "No active WhatsApp number connected")
 
-    waha = WAHAService(session_name=phone.session_name)
+    waha = WAHAService.from_phone(phone)
     try:
         result = await waha.send_text(target, req.message)
     except Exception as exc:

@@ -54,7 +54,7 @@ async def _configure_waha_webhook() -> None:
     try:
         phones = db.query(Phone).filter(Phone.is_active == True).all()
         for phone in phones:
-            waha = WAHAService(session_name=phone.session_name)
+            waha = WAHAService.from_phone(phone)
             status = await waha.get_session_status()
             if status == "UNKNOWN":
                 logger.info("Session %s not running in WAHA. Starting it...", phone.session_name)

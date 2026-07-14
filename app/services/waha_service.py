@@ -25,14 +25,25 @@ class SendResult:
 
 
 class WAHAService:
-    def __init__(self, session_name: str = "") -> None:
-        self.base = settings.waha_base_url.rstrip("/")
+    def __init__(self, session_name: str = "",
+                 base_url: str | None = None,
+                 api_key: str | None = None) -> None:
+        self.base = (base_url or settings.waha_base_url).rstrip("/")
         self.session = session_name or settings.waha_session_name
         self._headers = {
-            "X-Api-Key": settings.waha_api_key,
+            "X-Api-Key": api_key or settings.waha_api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+
+    @classmethod
+    def from_phone(cls, phone: object) -> "WAHAService":
+        """Build WAHAService using a Phone model's own WAHA URL/key (falls back to global settings)."""
+        return cls(
+            session_name=getattr(phone, "session_name", ""),
+            base_url=getattr(phone, "waha_base_url", None) or None,
+            api_key=getattr(phone, "waha_api_key", None) or None,
+        )
 
     # ── Session ──────────────────────────────────────────────────────────────
 

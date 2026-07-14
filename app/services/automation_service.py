@@ -395,7 +395,7 @@ class AutomationService:
         phone = self.db.query(Phone).filter(Phone.id == chat.phone_id).first()
         if not phone:
             return
-        waha = WAHAService(session_name=phone.session_name)
+        waha = WAHAService.from_phone(phone)
         result = await waha.send_text(chat.chat_wid, text)
         InboxService(self.db).upsert_message({
             "chat_id": chat.id,

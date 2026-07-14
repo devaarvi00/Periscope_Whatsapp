@@ -67,6 +67,8 @@ class PhoneOut(BaseModel):
     waha_status: str
     is_active: bool
     is_default: bool
+    waha_base_url: str | None = None
+    waha_api_key: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -76,3 +78,5 @@ class PhoneCreate(BaseModel):
     phone_number: str
     session_name: str
     is_default: bool = False
+    waha_base_url: str | None = None
+    waha_api_key: str | None = None

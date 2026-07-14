@@ -15,7 +15,7 @@ async def sync_phone_statuses() -> None:
         phones = db.query(Phone).filter(Phone.is_active == True).all()
         for phone in phones:
             try:
-                waha = WAHAService(session_name=phone.session_name)
+                waha = WAHAService.from_phone(phone)
                 status = await waha.get_session_status()
                 phone.waha_status = status
             except Exception as exc:
@@ -214,7 +214,7 @@ async def run_scheduled_messages() -> None:
 
             # Step 1: Send via WAHA — if this fails, mark as failed and stop.
             try:
-                waha = WAHAService(session_name=phone.session_name)
+                waha = WAHAService.from_phone(phone)
                 result = await waha.send_text(chat.chat_wid, item.body)
             except Exception as exc:
                 item.status = "failed"
