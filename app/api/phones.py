@@ -26,22 +26,45 @@ def list_phones(db: Session = Depends(get_db), agent=Depends(_current_agent)):
 
 
 @router.post("", response_model=PhoneOut, status_code=201)
-def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
-    existing_session = db.query(Phone).filter(Phone.session_name == req.session_name).first()
-    if existing_session:
-        raise HTTPException(400, "Session name already registered")
-    data = req.model_dump()
-    # Use a unique placeholder so multiple pending phones don't conflict on the unique index
-    if not data.get("phone_number") or data["phone_number"] == "pending":
-        data["phone_number"] = f"pending_{req.session_name}"
-    else:
-        existing_num = db.query(Phone).filter(Phone.phone_number == data["phone_number"]).first()
-        if existing_num:
-            raise HTTPException(400, "Phone number already registered")
-    phone = Phone(**data)
+async def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
+    import re as _re
+
+    # Auto-generate unique session name: hyperscope_1, hyperscope_2, …
+    prefix = settings.waha_session_prefix
+    existing_nums: list[int] = []
+    for (sname,) in db.query(Phone.session_name).filter(
+        Phone.session_name.like(f"{prefix}_%")
+    ).all():
+        m = _re.match(rf"^{_re.escape(prefix)}_(\d+)$", sname)
+        if m:
+            existing_nums.append(int(m.group(1)))
+    next_num = max(existing_nums, default=0) + 1
+    session_name = f"{prefix}_{next_num}"
+
+    phone = Phone(
+        name=req.name,
+        phone_number=f"pending_{session_name}",
+        session_name=session_name,
+        waha_status="STOPPED",
+        is_active=True,
+        is_default=req.is_default,
+    )
     db.add(phone)
     db.commit()
     db.refresh(phone)
+
+    # Create + start the WAHA session immediately so QR is ready
+    waha = WAHAService.from_phone(phone)
+    try:
+        await waha.ensure_session_exists(settings.waha_webhook_url, settings.waha_webhook_secret)
+        await waha.start_session()
+        await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
+        phone.waha_status = "SCAN_QR_CODE"
+        db.commit()
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Could not start WAHA session %s after creation: %s", session_name, exc)
+
     return phone
 
 

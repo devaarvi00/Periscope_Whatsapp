@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     waha_base_url: str = "http://localhost:3000"
     waha_api_key: str = ""
     waha_session_name: str = "default"
+    waha_session_prefix: str = "hyperscope"  # auto-generated sessions: hyperscope_1, hyperscope_2 …
     waha_webhook_secret: str = Field("replace-webhook-secret", min_length=8)
     waha_human_simulation_enabled: bool = True
     waha_typing_min_seconds: float = 1.0

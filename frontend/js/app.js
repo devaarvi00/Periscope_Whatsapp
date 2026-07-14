@@ -3207,11 +3207,8 @@ function showAddPhoneModal() {
   showModal('Add WhatsApp Number', `
     <div class="form-group">
       <label>Display Name *</label>
-      <input type="text" id="add-ph-name" placeholder="e.g. Sales Support">
-    </div>
-    <div class="form-group">
-      <label>WAHA Session Name *</label>
-      <input type="text" id="add-ph-session" placeholder="e.g. sales_support (lowercase, alphanumeric, no spaces)" style="font-family:monospace">
+      <input type="text" id="add-ph-name" placeholder="e.g. Marketing, Sales, Support" autofocus>
+      <small class="text-muted">A session will be created automatically</small>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -3221,38 +3218,25 @@ function showAddPhoneModal() {
 
   document.getElementById('add-ph-save').addEventListener('click', async () => {
     const name = document.getElementById('add-ph-name').value.trim();
-    const session = document.getElementById('add-ph-session').value.trim();
-    if (!name || !session) return toast('All fields are required', 'error');
-    if (!/^[a-z0-9_-]+$/.test(session)) {
-      return toast('Session name must be lowercase alphanumeric and may contain dashes or underscores only.', 'error');
-    }
+    if (!name) return toast('Display name is required', 'error');
+
+    const btn = document.getElementById('add-ph-save');
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
 
     try {
-      const res = await Api.phones.create({
-        name,
-        session_name: session,
-        phone_number: 'pending',
-        is_default: false,
-      });
+      const res = await Api.phones.create({ name });
       closeModal();
-      toast('WhatsApp session created! Initializing connection...', 'success');
-      loadSettingsTab('phones'); loadPhones();
-      
-      // Auto-connect after brief timeout so WAHA is ready
-      setTimeout(async () => {
-        try {
-          await Api.phones.start(res.id);
-          // Highlight/show QR immediately by opening the QR flow
-          loadSettingsTab('phones').then(() => {
-            const reconnectBtn = document.querySelector(`.phone-btn-reconnect[data-pid="${res.id}"]`) 
-                              || document.querySelector(`.phone-btn-connect[data-pid="${res.id}"]`);
-            if (reconnectBtn) reconnectBtn.click();
-          });
-        } catch(_) {}
-      }, 1000);
-      
+      toast(`"${name}" session created — scan QR to connect`, 'success');
+      // Reload and auto-open QR flow
+      await loadSettingsTab('phones');
+      loadPhones();
+      const connectBtn = document.querySelector(`.phone-btn-connect[data-pid="${res.id}"]`);
+      if (connectBtn) connectBtn.click();
     } catch(e) {
       toast(e.message, 'error');
+      btn.disabled = false;
+      btn.textContent = 'Save & Connect';
     }
   });
 }

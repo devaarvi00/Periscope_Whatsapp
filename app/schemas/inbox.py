@@ -75,8 +75,4 @@ class PhoneOut(BaseModel):
 
 class PhoneCreate(BaseModel):
     name: str
-    phone_number: str
-    session_name: str
     is_default: bool = False
-    waha_base_url: str | None = None
-    waha_api_key: str | None = None
