@@ -44,19 +44,19 @@ async def init_mongo_indexes() -> None:
     db = get_mongo_db()
 
     # chats
-    await db.chats.create_index([("phone_id", 1), ("chat_wid", 1)], unique=True, background=True)
-    await db.chats.create_index([("id", 1)], unique=True, background=True)
-    await db.chats.create_index([("phone_id", 1), ("last_message_at", -1)], background=True)
-    await db.chats.create_index([("phone_id", 1), ("is_archived", 1), ("last_message_at", -1)], background=True)
-    await db.chats.create_index([("phone_id", 1), ("is_flagged", 1)], background=True)
-    await db.chats.create_index([("phone_id", 1), ("assigned_to", 1)], background=True)
-    await db.chats.create_index([("phone_id", 1), ("label_ids", 1)], background=True)
-    await db.chats.create_index([("phone_id", 1), ("name", 1)], background=True)
+    await db.chats.create_index([("phone_id", 1), ("chat_wid", 1)], unique=True)
+    await db.chats.create_index([("id", 1)], unique=True)
+    await db.chats.create_index([("phone_id", 1), ("last_message_at", -1)])
+    await db.chats.create_index([("phone_id", 1), ("is_archived", 1), ("last_message_at", -1)])
+    await db.chats.create_index([("phone_id", 1), ("is_flagged", 1)])
+    await db.chats.create_index([("phone_id", 1), ("assigned_to", 1)])
+    await db.chats.create_index([("phone_id", 1), ("label_ids", 1)])
+    await db.chats.create_index([("phone_id", 1), ("name", 1)])
 
     # messages
-    await db.messages.create_index([("message_wid", 1)], unique=True, background=True)
-    await db.messages.create_index([("id", 1)], unique=True, background=True)
-    await db.messages.create_index([("chat_wid", 1), ("phone_id", 1), ("timestamp", -1)], background=True)
-    await db.messages.create_index([("phone_id", 1), ("chat_wid", 1), ("timestamp", -1)], background=True)
+    await db.messages.create_index([("message_wid", 1)], unique=True)
+    await db.messages.create_index([("id", 1)], unique=True)
+    await db.messages.create_index([("chat_wid", 1), ("phone_id", 1), ("timestamp", -1)])
+    await db.messages.create_index([("phone_id", 1), ("chat_wid", 1), ("timestamp", -1)])
 
     logger.info("MongoDB indexes ensured")

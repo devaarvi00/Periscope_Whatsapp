@@ -66,6 +66,20 @@ async def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
     return phone
 
 
+def _delete_phone_relations(db: Session, phone_id: int) -> None:
+    """Delete all MySQL rows that FK-reference a phone before deleting it."""
+    from app.models.agent_phone import AgentPhone as _AP
+    from app.models.bulk_message_job import BulkMessageJob, BulkMessageLog
+    from app.models.scheduled_message import ScheduledMessage
+
+    db.execute(delete(ScheduledMessage).where(ScheduledMessage.phone_id == phone_id))
+    job_ids = [r[0] for r in db.query(BulkMessageJob.id).filter(BulkMessageJob.phone_id == phone_id).all()]
+    if job_ids:
+        db.execute(delete(BulkMessageLog).where(BulkMessageLog.job_id.in_(job_ids)))
+        db.execute(delete(BulkMessageJob).where(BulkMessageJob.phone_id == phone_id))
+    db.execute(delete(_AP).where(_AP.phone_id == phone_id))
+
+
 @router.get("/{phone_id}/status")
 async def get_status(phone_id: int, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
@@ -90,7 +104,6 @@ async def get_status(phone_id: int, db: Session = Depends(get_db)):
                     Phone.phone_number == number, Phone.id != phone.id
                 ).first()
                 if conflict:
-                    from app.models.agent_phone import AgentPhone as _AP
                     # Re-parent MongoDB chats/messages from conflict → this phone
                     inbox = MongoInboxService()
                     await inbox.db.chats.update_many(
@@ -99,15 +112,22 @@ async def get_status(phone_id: int, db: Session = Depends(get_db)):
                     await inbox.db.messages.update_many(
                         {"phone_id": conflict.id}, {"$set": {"phone_id": phone.id}}
                     )
-                    db.execute(delete(_AP).where(_AP.phone_id == conflict.id))
+                    # Delete all FK rows before deleting the phone row
+                    _delete_phone_relations(db, conflict.id)
                     db.flush()
                     db.delete(conflict)
                     db.flush()
                 phone.phone_number = number
-        except Exception:
-            pass
+        except Exception as exc:
+            from app.api.webhooks import logger
+            logger.warning("Failed to resolve conflict phone during get_status: %s", exc)
+            db.rollback()
+            db.add(phone)  # re-attach phone to session after rollback
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
     return {"phone_id": phone_id, "status": status, "phone_number": phone.phone_number}
 
 
@@ -268,7 +288,6 @@ async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
                     "Removing stale phone record %s (session=%s) — number %s now claimed by phone %s",
                     conflict.id, conflict.session_name, number, phone_id,
                 )
-                from app.models.agent_phone import AgentPhone as _AP
                 inbox = MongoInboxService()
                 await inbox.db.chats.update_many(
                     {"phone_id": conflict.id}, {"$set": {"phone_id": phone_id}}
@@ -276,7 +295,8 @@ async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
                 await inbox.db.messages.update_many(
                     {"phone_id": conflict.id}, {"$set": {"phone_id": phone_id}}
                 )
-                db.execute(delete(_AP).where(_AP.phone_id == conflict.id))
+                # Delete all FK rows before deleting the phone row
+                _delete_phone_relations(db, conflict.id)
                 db.flush()
                 db.delete(conflict)
                 db.flush()
