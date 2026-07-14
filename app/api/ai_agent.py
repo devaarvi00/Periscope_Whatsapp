@@ -4,51 +4,51 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_agent
 from app.db.session import get_db
-from app.models.chat import Chat
+from app.models.agent import Agent
 from app.services.ai_agent_service import AIAgentService
 from app.services.gemini_service import GeminiService
-from app.services.inbox_service import InboxService
+from app.services.mongo_chat_service import MongoInboxService, _serialize_message
 
 router = APIRouter(prefix="/ai", tags=["ai-agent"])
 
 
 @router.post("/chat/{chat_id}/activate")
-def activate_ai(chat_id: int, db: Session = Depends(get_db)):
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+async def activate_ai(chat_id: int):
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
-    chat.ai_active = True
-    chat.ai_state = "ACTIVE"
-    db.commit()
+    await inbox.update_chat(chat_id, ai_active=True, ai_state="ACTIVE")
     return {"ok": True, "ai_state": "ACTIVE"}
 
 
 @router.post("/chat/{chat_id}/deactivate")
-def deactivate_ai(chat_id: int, db: Session = Depends(get_db)):
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+async def deactivate_ai(chat_id: int):
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
-    chat.ai_active = False
-    chat.ai_state = "INACTIVE"
-    db.commit()
+    await inbox.update_chat(chat_id, ai_active=False, ai_state="INACTIVE")
     return {"ok": True, "ai_state": "INACTIVE"}
 
 
 @router.post("/chat/{chat_id}/takeover")
-def human_takeover(chat_id: int, db: Session = Depends(get_db)):
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+async def human_takeover(chat_id: int, db: Session = Depends(get_db)):
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
-    AIAgentService(db).human_takeover(chat)
+    await AIAgentService(db).human_takeover(chat)
     return {"ok": True, "ai_state": "SNOOZED"}
 
 
 @router.post("/chat/{chat_id}/summarize")
-async def summarize_chat(chat_id: int, db: Session = Depends(get_db)):
-    msgs = InboxService(db).get_messages(chat_id, limit=40)
+async def summarize_chat(chat_id: int):
+    inbox = MongoInboxService()
+    msgs = await inbox.get_messages(chat_id=chat_id, limit=40)
     if not msgs:
         return {"summary": "No messages yet."}
-    msg_list = [{"sender_name": m.sender_name, "body": m.body} for m in msgs]
+    msg_list = [{"sender_name": m.get("sender_name"), "body": m.get("body")} for m in msgs]
     try:
         summary = await GeminiService().summarize_chat(msg_list)
     except Exception as exc:
@@ -57,10 +57,11 @@ async def summarize_chat(chat_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/chat/{chat_id}/suggest-reply")
-async def suggest_reply(chat_id: int, db: Session = Depends(get_db)):
-    msgs = InboxService(db).get_messages(chat_id, limit=10)
+async def suggest_reply(chat_id: int):
+    inbox = MongoInboxService()
+    msgs = await inbox.get_messages(chat_id=chat_id, limit=10)
     context = "\n".join(
-        f"[{'Me' if m.from_me else m.sender_name}]: {m.body}"
+        f"[{'Me' if m.get('from_me') else m.get('sender_name')}]: {m.get('body')}"
         for m in msgs
     )
     try:
@@ -175,7 +176,6 @@ class PolishRequest(BaseModel):
 
 @router.post("/polish")
 async def polish_reply(req: PolishRequest):
-    """Polish a draft reply: fix grammar, keep it WhatsApp-natural (Hyperscope 'Polish replies')."""
     if not req.text.strip():
         raise HTTPException(400, "Text is empty")
     try:
@@ -185,136 +185,107 @@ async def polish_reply(req: PolishRequest):
     return {"polished": polished}
 
 
-# ── Org & Chat Assistant ─────────────────────────────────────────────────────
+# ── Org & Chat Assistant ──────────────────────────────────────────────────────
 
 class AssistantRequest(BaseModel):
     prompt: str = ""
-    chat_id: int | None = None   # present → chat assistant, absent → org assistant
-    recipe: str | None = None    # optional shortcut action
+    chat_id: int | None = None
+    recipe: str | None = None
 
 
-def _org_context_pack(db: Session) -> str:
-    """Snapshot of workspace state the assistant can reason over."""
+async def _org_context_pack(db: Session) -> str:
     from datetime import datetime, timedelta
-
     from app.models.agent import Agent as AgentModel
     from app.models.task import Task
     from app.models.ticket import Ticket, TicketStatus
     from app.services.analytics_service import AnalyticsService
 
-    dash = AnalyticsService(db).get_dashboard_metrics()
+    dash = await AnalyticsService(db).get_dashboard_metrics()
     lines = [
         f"Now (UTC): {datetime.utcnow().isoformat(timespec='minutes')}",
         f"Totals: {dash['total_chats']} chats, {dash['unread_chats']} unread, "
         f"{dash['flagged_chats']} flagged, {dash['open_tickets']} open tickets, "
         f"{dash['in_progress_tickets']} in-progress tickets",
     ]
-
     agents = {a.id: a.name for a in db.query(AgentModel).all()}
-
-    recent = (
-        db.query(Chat).filter(Chat.is_archived == False)
-        .order_by(Chat.last_message_at.desc()).limit(20).all()
-    )
+    inbox = MongoInboxService()
+    recent = await inbox.list_chats(is_archived=False, limit=20)
     lines.append("\nRecent chats (name | unread | flagged | assigned | last message):")
     for c in recent:
         lines.append(
-            f"- {c.name or c.chat_wid} | unread={c.unread_count or 0} | "
-            f"flagged={'yes' if c.is_flagged else 'no'} | "
-            f"assigned={agents.get(c.assigned_to, 'nobody')} | "
-            f"{(c.last_message or '')[:70]}"
+            f"- {c.get('name') or c.get('chat_wid')} | unread={c.get('unread_count') or 0} | "
+            f"flagged={'yes' if c.get('is_flagged') else 'no'} | "
+            f"assigned={agents.get(c.get('assigned_to'), 'nobody')} | "
+            f"{(c.get('last_message') or '')[:70]}"
         )
-
     tickets = (
         db.query(Ticket)
         .filter(Ticket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS]))
         .order_by(Ticket.created_at.desc()).limit(15).all()
     )
-    lines.append("\nOpen tickets (title | priority | assigned | age):")
+    lines.append("\nOpen tickets:")
     now = datetime.utcnow()
     for t in tickets:
         age_h = int((now - t.created_at).total_seconds() // 3600) if t.created_at else 0
         prio = t.priority.value if hasattr(t.priority, "value") else str(t.priority)
-        lines.append(
-            f"- #{t.id} {t.title[:60]} | {prio} | "
-            f"{agents.get(t.assigned_to, 'unassigned')} | {age_h}h old"
-        )
-
+        lines.append(f"- #{t.id} {t.title[:60]} | {prio} | {agents.get(t.assigned_to, 'unassigned')} | {age_h}h old")
     open_tasks = db.query(Task).filter(Task.status == "open").count()
-    overdue = db.query(Task).filter(
-        Task.status == "open", Task.due_date.isnot(None),
-        Task.due_date < now,
-    ).count()
-    lines.append(f"\nTasks: {open_tasks} open, {overdue} overdue")
+    lines.append(f"\nTasks: {open_tasks} open")
     return "\n".join(lines)
 
 
-def _chat_context_pack(db: Session, chat_id: int) -> str:
-    from app.services.inbox_service import InboxService
-
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+async def _chat_context_pack(chat_id: int) -> str:
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(chat_id)
     if not chat:
         return "Chat not found."
-    msgs = InboxService(db).get_messages(chat_id, limit=40)
+    msgs = await inbox.get_messages(chat_id=chat_id, limit=40)
     lines = [
-        f"Chat: {chat.name or chat.chat_wid} ({'group' if chat.is_group else '1:1'}), "
-        f"unread={chat.unread_count or 0}, flagged={'yes' if chat.is_flagged else 'no'}",
+        f"Chat: {chat.get('name') or chat.get('chat_wid')} ({'group' if chat.get('is_group') else '1:1'}), "
+        f"unread={chat.get('unread_count') or 0}, flagged={'yes' if chat.get('is_flagged') else 'no'}",
         "\nConversation (oldest first):",
     ]
-    for m in reversed(msgs):
-        who = "Business" if m.from_me else (m.sender_name or "Customer")
-        lines.append(f"[{who}] {(m.body or '(media)')[:200]}")
+    for m in msgs:
+        who = "Business" if m.get("from_me") else (m.get("sender_name") or "Customer")
+        lines.append(f"[{who}] {(m.get('body') or '(media)')[:200]}")
     return "\n".join(lines)
 
 
 RECIPES = {
-    # org scope
-    "summarize_24h": "Summarize what happened across all chats in the last 24 hours: "
-                     "key conversations, unanswered customers, and anything urgent.",
-    "find_followups": "Which chats are waiting on a reply from us? List them by name with "
-                      "what the customer last said, most urgent first.",
-    "triage_unassigned": "List chats and tickets that have no assigned agent and suggest "
-                         "who should pick each up, with a one-line reason.",
-    "stale_tickets": "Which open tickets look stale (old, unassigned or high priority)? "
-                     "Recommend next steps for each.",
-    # chat scope
+    "summarize_24h": "Summarize what happened across all chats in the last 24 hours.",
+    "find_followups": "Which chats are waiting on a reply from us? List them by name.",
+    "triage_unassigned": "List chats and tickets with no assigned agent and suggest who should pick each up.",
+    "stale_tickets": "Which open tickets look stale? Recommend next steps for each.",
     "summarize_chat": "Summarize this conversation in 3-5 short bullet points.",
-    "sentiment": "What is the customer's sentiment in this conversation and why? "
-                 "One short paragraph.",
-    "draft_reply": "Draft a short WhatsApp-style reply to the customer's last message. "
-                   "Return only the reply text.",
+    "sentiment": "What is the customer's sentiment in this conversation and why?",
+    "draft_reply": "Draft a short WhatsApp-style reply to the customer's last message.",
 }
 
 
 @router.post("/assistant")
 async def assistant(req: AssistantRequest, db: Session = Depends(get_db)):
-    """Org & Chat Assistant: answers workspace questions from real data.
-
-    Read-only by design — it analyzes and drafts, it never sends messages
-    or changes records itself.
-    """
     question = (RECIPES.get(req.recipe) or req.prompt or "").strip()
     if not question:
         raise HTTPException(400, "Ask a question or pick a recipe")
 
     if req.chat_id:
-        pack = _chat_context_pack(db, req.chat_id)
+        pack = await _chat_context_pack(req.chat_id)
     else:
-        pack = _org_context_pack(db)
-        # Include last-24h message activity for the summary recipe
+        pack = await _org_context_pack(db)
         if req.recipe == "summarize_24h":
             from datetime import datetime, timedelta
-            from app.models.message import Message
+            inbox = MongoInboxService()
             since = datetime.utcnow() - timedelta(hours=24)
-            msgs = (
-                db.query(Message).filter(Message.timestamp >= since)
-                .order_by(Message.chat_id, Message.timestamp).limit(300).all()
+            recent_msgs = await (
+                inbox.db.messages.find({"timestamp": {"$gte": since}})
+                .sort("timestamp", 1).limit(300).to_list(300)
             )
-            chat_names = {c.id: c.name for c in db.query(Chat).all()}
             lines = ["\nMessages in the last 24h:"]
-            for m in msgs:
-                who = "Business" if m.from_me else (m.sender_name or "Customer")
-                lines.append(f"[{chat_names.get(m.chat_id, m.chat_id)}] {who}: {(m.body or '(media)')[:100]}")
+            for m in recent_msgs:
+                who = "Business" if m.get("from_me") else (m.get("sender_name") or "Customer")
+                chat = await inbox.get_chat_by_id(m.get("chat_id"))
+                chat_label = (chat.get("name") if chat else None) or str(m.get("chat_id"))
+                lines.append(f"[{chat_label}] {who}: {(m.get('body') or '(media)')[:100]}")
             pack += "\n".join(lines)
 
     try:

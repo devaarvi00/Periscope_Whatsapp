@@ -13,7 +13,10 @@ class ScheduledMessage(Base, TimestampMixin):
     __tablename__ = "scheduled_messages"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"), nullable=False, index=True)
+    # chat_id references MongoDB chat.id; chat_wid is the WhatsApp identifier used for sending
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    chat_wid: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    phone_id: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     send_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     repeat: Mapped[str] = mapped_column(String(20), default="none")  # none|daily|weekly|monthly

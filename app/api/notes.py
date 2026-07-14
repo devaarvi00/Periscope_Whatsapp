@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.models.chat import Chat
 from app.models.note import Note
 from app.schemas.ai_agent import NoteCreate
 from app.services.activity_service import log_activity
@@ -67,8 +66,9 @@ async def create_note(
     db.commit()
     db.refresh(note)
 
-    chat = db.query(Chat).filter(Chat.id == req.chat_id).first()
-    chat_name = chat.name if chat else f"#{req.chat_id}"
+    from app.services.mongo_chat_service import MongoInboxService
+    chat = await MongoInboxService().get_chat_by_id(req.chat_id)
+    chat_name = chat.get("name") if chat else f"#{req.chat_id}"
 
     # Notify @mentioned teammates over WebSocket (team-only, never sent to WhatsApp)
     mentioned = _find_mentions(db, req.content)

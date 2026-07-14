@@ -9,12 +9,11 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.models.chat import Chat
 from app.models.contact import Contact
-from app.models.message import Message
 from app.models.ticket import Ticket
 from app.models.activity_log import ActivityLog
 from app.services.activity_service import log_activity
+from app.services.mongo_chat_service import MongoInboxService
 
 router = APIRouter(prefix="/exports", tags=["exports"])
 
@@ -40,40 +39,41 @@ def _log_export(db: Session, agent: Agent, entity: str, count: int) -> None:
 
 
 @router.get("/chats.csv")
-def export_chats(
+async def export_chats(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    chats = db.query(Chat).order_by(Chat.last_message_at.desc()).all()
-    agents = {a.id: a.name for a in db.query(Agent).all()}
-    
-    from app.models.label import Label
-    from app.models.chat import ChatLabel
-    from app.models.property_definition import PropertyDefinition
+    inbox = MongoInboxService()
+    chats = await inbox.list_chats(limit=10000)
+    agents_map = {a.id: a.name for a in db.query(Agent).all()}
 
-    chat_labels = db.query(ChatLabel.chat_id, Label.name).join(Label, ChatLabel.label_id == Label.id).all()
-    labels_by_chat = {}
-    for cid, lname in chat_labels:
-        labels_by_chat.setdefault(cid, []).append(lname)
+    from app.models.label import Label
+    from app.models.property_definition import PropertyDefinition
 
     prop_defs = {str(p.id): p.name for p in db.query(PropertyDefinition).filter(PropertyDefinition.entity == "chat").all()}
 
     rows = []
     for c in chats:
-        props_list = []
-        if c.custom_properties:
-            for pid, val in c.custom_properties.items():
-                pname = prop_defs.get(str(pid), f"Property {pid}")
-                props_list.append(f"{pname}: {val}")
-        props_str = "; ".join(props_list)
+        label_ids = c.get("label_ids") or []
+        label_names = []
+        for lid in label_ids:
+            lbl = db.query(Label).filter(Label.id == lid).first()
+            if lbl:
+                label_names.append(lbl.name)
 
+        props_list = []
+        for pid, val in (c.get("custom_properties") or {}).items():
+            pname = prop_defs.get(str(pid), f"Property {pid}")
+            props_list.append(f"{pname}: {val}")
+
+        lma = c.get("last_message_at")
         rows.append([
-            c.id, c.chat_wid, c.name, "group" if c.is_group else "1:1", c.phone_id,
-            c.unread_count, c.is_flagged, c.is_archived,
-            agents.get(c.assigned_to, "") if c.assigned_to else "",
-            ", ".join(labels_by_chat.get(c.id, [])),
-            props_str,
-            c.last_message_at.isoformat() if c.last_message_at else ""
+            c["id"], c["chat_wid"], c.get("name") or "", "group" if c.get("is_group") else "1:1",
+            c["phone_id"], c.get("unread_count") or 0, bool(c.get("is_flagged")), bool(c.get("is_archived")),
+            agents_map.get(c.get("assigned_to"), "") if c.get("assigned_to") else "",
+            ", ".join(label_names),
+            "; ".join(props_list),
+            lma.isoformat() if isinstance(lma, datetime) else (lma or ""),
         ])
 
     _log_export(db, agent, "chats", len(rows))
@@ -86,23 +86,34 @@ def export_chats(
 
 
 @router.get("/messages.csv")
-def export_messages(
+async def export_messages(
     days: int = 30,
     chat_id: int | None = None,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
+    inbox = MongoInboxService()
     since = datetime.utcnow() - timedelta(days=min(days, 365))
-    q = db.query(Message).filter(Message.timestamp >= since)
+    filt: dict = {"timestamp": {"$gte": since}}
     if chat_id:
-        q = q.filter(Message.chat_id == chat_id)
-    msgs = q.order_by(Message.timestamp.asc()).limit(50000).all()
-    rows = [
-        [m.id, m.chat_id, m.phone_id, m.message_wid, "out" if m.from_me else "in",
-         m.sender_name, m.sender_number, (m.body or "").replace("\n", " "),
-         m.message_type, m.timestamp.isoformat()]
-        for m in msgs
-    ]
+        filt["chat_id"] = chat_id
+    msg_docs = await (
+        inbox.db.messages.find(filt)
+        .sort("timestamp", 1)
+        .limit(50000)
+        .to_list(50000)
+    )
+    rows = []
+    for m in msg_docs:
+        ts = m.get("timestamp")
+        rows.append([
+            m["id"], m.get("chat_id"), m.get("phone_id"), m.get("message_wid") or "",
+            "out" if m.get("from_me") else "in",
+            m.get("sender_name") or "", m.get("sender_number") or "",
+            (m.get("body") or "").replace("\n", " "),
+            m.get("message_type") or "text",
+            ts.isoformat() if isinstance(ts, datetime) else (ts or ""),
+        ])
     _log_export(db, agent, "messages", len(rows))
     return _csv_response(
         "messages.csv",
@@ -119,7 +130,7 @@ def export_tickets(
 ):
     tickets = db.query(Ticket).order_by(Ticket.created_at.desc()).all()
     agents = {a.id: a.name for a in db.query(Agent).all()}
-    
+
     from app.models.label import Label
     from app.models.ticket import TicketLabel
     from app.models.property_definition import PropertyDefinition
@@ -167,7 +178,7 @@ def export_contacts(
     agent: Agent = Depends(get_current_agent),
 ):
     contacts = db.query(Contact).order_by(Contact.name.asc()).all()
-    
+
     from app.models.label import Label
     from app.models.contact import ContactLabel
 
@@ -181,7 +192,7 @@ def export_contacts(
         number = c.phone_number
         if c.is_masked:
             number = number[:4] + "****" + number[-2:] if len(number) > 6 else "****"
-            
+
         props_list = []
         if c.custom_properties:
             for k, val in c.custom_properties.items():
@@ -192,7 +203,7 @@ def export_contacts(
             c.id, c.name, number, c.email or "", c.company or "", c.is_masked,
             ", ".join(labels_by_contact.get(c.id, [])), props_str
         ])
-        
+
     _log_export(db, agent, "contacts", len(rows))
     return _csv_response(
         "contacts.csv",

@@ -8,13 +8,13 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
 @router.get("/dashboard")
-def dashboard_metrics(db: Session = Depends(get_db)):
-    return AnalyticsService(db).get_dashboard_metrics()
+async def dashboard_metrics(db: Session = Depends(get_db)):
+    return await AnalyticsService(db).get_dashboard_metrics()
 
 
 @router.get("/messages")
-def message_metrics(days: int = 7, db: Session = Depends(get_db)):
-    return AnalyticsService(db).get_message_metrics(days=days)
+async def message_metrics(days: int = 7, db: Session = Depends(get_db)):
+    return await AnalyticsService(db).get_message_metrics(days=days)
 
 
 @router.get("/tickets")
@@ -23,5 +23,5 @@ def ticket_metrics(db: Session = Depends(get_db)):
 
 
 @router.get("/agents")
-def agent_performance(days: int = 7, db: Session = Depends(get_db)):
-    return AnalyticsService(db).get_agent_performance(days=days)
+async def agent_performance(days: int = 7, db: Session = Depends(get_db)):
+    return await AnalyticsService(db).get_agent_performance(days=days)

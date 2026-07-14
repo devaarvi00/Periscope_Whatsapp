@@ -7,9 +7,9 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.models.chat import Chat
 from app.models.scheduled_message import ScheduledMessage
 from app.services.activity_service import log_activity
+from app.services.mongo_chat_service import MongoInboxService
 
 router = APIRouter(prefix="/scheduled", tags=["scheduled-messages"])
 
@@ -99,7 +99,7 @@ def _parse_recurrence(req) -> dict:
 
 
 @router.get("")
-def list_scheduled(
+async def list_scheduled(
     chat_id: int | None = None,
     status: str | None = None,
     db: Session = Depends(get_db),
@@ -110,20 +110,27 @@ def list_scheduled(
     if status:
         q = q.filter(ScheduledMessage.status == status)
     items = q.order_by(ScheduledMessage.send_at.asc()).limit(200).all()
-    chat_names = {
-        c.id: c.name for c in
-        db.query(Chat).filter(Chat.id.in_([i.chat_id for i in items] or [0])).all()
-    }
+
+    # Fetch chat names from MongoDB
+    inbox = MongoInboxService()
+    chat_ids = list({i.chat_id for i in items})
+    chat_names: dict[int, str] = {}
+    for cid in chat_ids:
+        chat = await inbox.get_chat_by_id(cid)
+        if chat:
+            chat_names[cid] = chat.get("name") or ""
+
     return [_serialize(m, chat_names) for m in items]
 
 
 @router.post("", status_code=201)
-def create_scheduled(
+async def create_scheduled(
     req: ScheduledMessageCreate,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    chat = db.query(Chat).filter(Chat.id == req.chat_id).first()
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(req.chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
     try:
@@ -135,7 +142,10 @@ def create_scheduled(
     rec = _parse_recurrence(req)
 
     msg = ScheduledMessage(
-        chat_id=req.chat_id, body=req.body, send_at=send_at,
+        chat_id=req.chat_id,
+        chat_wid=chat["chat_wid"],
+        phone_id=chat["phone_id"],
+        body=req.body, send_at=send_at,
         repeat=rec.get("repeat", "none"),
         interval=rec.get("interval", 1),
         days_of_week=rec.get("days_of_week"),
@@ -146,16 +156,17 @@ def create_scheduled(
     db.add(msg)
     db.commit()
     db.refresh(msg)
+    chat_name = chat.get("name") or ""
     log_activity(
         db, "scheduled_message_created", entity_type="scheduled_message",
         entity_id=msg.id, agent_id=agent.id,
-        description=f"Message scheduled for '{chat.name}' at {send_at.isoformat()} ({_repeat_summary(msg)})",
+        description=f"Message scheduled for '{chat_name}' at {send_at.isoformat()} ({_repeat_summary(msg)})",
     )
-    return _serialize(msg, {chat.id: chat.name})
+    return _serialize(msg, {chat["id"]: chat_name})
 
 
 @router.patch("/{msg_id}")
-def update_scheduled(
+async def update_scheduled(
     msg_id: int,
     req: ScheduledMessageUpdate,
     db: Session = Depends(get_db),
@@ -185,8 +196,10 @@ def update_scheduled(
         entity_id=msg.id, agent_id=agent.id,
         description=f"Scheduled message #{msg.id} updated ({_repeat_summary(msg)})",
     )
-    chat = db.query(Chat).filter(Chat.id == msg.chat_id).first()
-    return _serialize(msg, {msg.chat_id: chat.name if chat else ""})
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(msg.chat_id)
+    chat_name = (chat.get("name") if chat else None) or ""
+    return _serialize(msg, {msg.chat_id: chat_name})
 
 
 @router.delete("/{msg_id}", status_code=204)

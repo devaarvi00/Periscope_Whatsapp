@@ -69,9 +69,9 @@ async def check_no_reply_timeouts() -> None:
 
     from app.db.session import SessionLocal
     from app.models.activity_log import ActivityLog
-    from app.models.chat import Chat
     from app.services.activity_service import log_activity
     from app.services.automation_service import AutomationService
+    from app.services.mongo_chat_service import MongoInboxService
 
     db = SessionLocal()
     try:
@@ -79,39 +79,37 @@ async def check_no_reply_timeouts() -> None:
         rules = svc.get_active_rules("no_reply_timeout")
         if not rules:
             return
+        inbox = MongoInboxService()
         now = datetime.utcnow()
         for rule in rules:
             timeout_min = int((rule.criteria or {}).get("timeout_minutes", 60))
             cutoff = now - timedelta(minutes=timeout_min)
-            chats = (
-                db.query(Chat)
-                .filter(
-                    Chat.unread_count > 0,
-                    Chat.is_archived == False,
-                    Chat.last_message_at.isnot(None),
-                    Chat.last_message_at <= cutoff,
-                )
-                .all()
-            )
+            chats = await inbox.db.chats.find(
+                {
+                    "unread_count": {"$gt": 0},
+                    "is_archived": False,
+                    "last_message_at": {"$ne": None, "$lte": cutoff},
+                }
+            ).to_list(500)
             for chat in chats:
                 already_fired = (
                     db.query(ActivityLog)
                     .filter(
                         ActivityLog.action == "no_reply_timeout_fired",
                         ActivityLog.entity_type == "chat",
-                        ActivityLog.entity_id == chat.id,
-                        ActivityLog.created_at >= chat.last_message_at,
+                        ActivityLog.entity_id == chat["id"],
+                        ActivityLog.created_at >= chat["last_message_at"],
                     )
                     .first()
                 )
                 if already_fired:
                     continue
                 context = {
-                    "chat_id": chat.id,
-                    "chat_wid": chat.chat_wid,
-                    "chat_name": chat.name,
-                    "message": chat.last_message or "",
-                    "is_group": chat.is_group,
+                    "chat_id": chat["id"],
+                    "chat_wid": chat["chat_wid"],
+                    "chat_name": chat.get("name") or "",
+                    "message": chat.get("last_message") or "",
+                    "is_group": chat.get("is_group", False),
                     "timeout_minutes": timeout_min,
                 }
                 if not svc._matches_criteria(rule, context):
@@ -120,7 +118,7 @@ async def check_no_reply_timeouts() -> None:
                 rule.runs_count = (rule.runs_count or 0) + 1
                 db.commit()
                 log_activity(
-                    db, "no_reply_timeout_fired", entity_type="chat", entity_id=chat.id,
+                    db, "no_reply_timeout_fired", entity_type="chat", entity_id=chat["id"],
                     description=f"Rule '{rule.name}' fired after {timeout_min}m without reply",
                     metadata={"rule_id": rule.id, "actions": taken},
                 )
@@ -177,10 +175,9 @@ def _next_occurrence(item, after: datetime):
 async def run_scheduled_messages() -> None:
     """Send due per-chat scheduled messages; reschedule recurring ones."""
     from app.db.session import SessionLocal
-    from app.models.chat import Chat
     from app.models.phone import Phone
     from app.models.scheduled_message import ScheduledMessage
-    from app.services.inbox_service import InboxService
+    from app.services.mongo_chat_service import MongoInboxService
     from app.services.waha_service import WAHAService
 
     db = SessionLocal()
@@ -192,17 +189,27 @@ async def run_scheduled_messages() -> None:
             .limit(50)
             .all()
         )
+        inbox = MongoInboxService()
         for item in due:
-            chat = db.query(Chat).filter(Chat.id == item.chat_id).first()
-            phone = db.query(Phone).filter(Phone.id == chat.phone_id).first() if chat else None
-            if not chat or not phone:
+            # Prefer the stored chat_wid / phone_id (added in MongoDB migration).
+            # Fall back to MongoDB lookup for older records that lack them.
+            chat_wid = item.chat_wid if item.chat_wid else None
+            phone_id = item.phone_id if item.phone_id else None
+
+            if not chat_wid or not phone_id:
+                chat = await inbox.get_chat_by_id(item.chat_id)
+                if chat:
+                    chat_wid = chat["chat_wid"]
+                    phone_id = chat["phone_id"]
+
+            phone = db.query(Phone).filter(Phone.id == phone_id).first() if phone_id else None
+            if not chat_wid or not phone:
                 item.status = "failed"
                 item.last_error = "Chat or phone missing"
                 db.commit()
                 continue
 
-            # Daily schedules restricted to specific weekdays: skip disallowed
-            # days by rolling forward without sending.
+            # Daily schedules restricted to specific weekdays: skip disallowed days
             if item.repeat == "daily" and item.days_of_week and now.weekday() not in item.days_of_week:
                 nxt = _next_occurrence(item, now)
                 if nxt is None:
@@ -212,10 +219,10 @@ async def run_scheduled_messages() -> None:
                 db.commit()
                 continue
 
-            # Step 1: Send via WAHA — if this fails, mark as failed and stop.
+            # Step 1: Send via WAHA
             try:
                 waha = WAHAService.from_phone(phone)
-                result = await waha.send_text(chat.chat_wid, item.body)
+                result = await waha.send_text(chat_wid, item.body)
             except Exception as exc:
                 item.status = "failed"
                 item.last_error = str(exc)[:500]
@@ -223,11 +230,11 @@ async def run_scheduled_messages() -> None:
                 db.commit()
                 continue
 
-            # Step 2: Record the sent message. WAHA also fires a webhook that inserts
-            # the same message_wid, so a duplicate-key race is expected and harmless.
+            # Step 2: Record the sent message in MongoDB
             try:
-                InboxService(db).upsert_message({
-                    "chat_id": chat.id,
+                await inbox.upsert_message({
+                    "chat_id": item.chat_id,
+                    "chat_wid": chat_wid,
                     "phone_id": phone.id,
                     "message_wid": result.message_id or f"sched_{item.id}_{now.timestamp()}",
                     "from_me": True,

@@ -1,8 +1,6 @@
 from app.models.agent import Agent
 from app.models.agent_phone import AgentPhone
 from app.models.phone import Phone
-from app.models.chat import Chat, ChatLabel
-from app.models.message import Message
 from app.models.ticket import Ticket, TicketLabel
 from app.models.contact import Contact, ContactLabel
 from app.models.label import Label
@@ -24,7 +22,7 @@ from app.models.task import Task
 from app.models.property_definition import PropertyDefinition
 
 __all__ = [
-    "Agent", "AgentPhone", "Phone", "Chat", "ChatLabel", "Message",
+    "Agent", "AgentPhone", "Phone",
     "Ticket", "TicketLabel", "Contact", "ContactLabel", "Label",
     "Note", "QuickReply", "AutomationRule", "KnowledgeItem",
     "BulkMessageJob", "ActivityLog", "ApiKey", "WebhookEndpoint",

@@ -13,9 +13,8 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.models.api_key import ApiKey
-from app.models.chat import Chat
 from app.models.phone import Phone
-from app.services.inbox_service import InboxService
+from app.services.mongo_chat_service import MongoInboxService
 from app.services.waha_service import WAHAService
 
 router = APIRouter(prefix="/public/v1", tags=["public-api"])
@@ -57,10 +56,14 @@ async def public_send_message(
     if not req.message.strip():
         raise HTTPException(400, "message is empty")
 
-    chat = db.query(Chat).filter(Chat.chat_wid == target).first()
+    inbox = MongoInboxService()
+    # Try to find the chat in MongoDB by WID
+    docs = await inbox.db.chats.find({"chat_wid": target}).to_list(1)
+    chat = docs[0] if docs else None
+
     phone = None
     if chat:
-        phone = db.query(Phone).filter(Phone.id == chat.phone_id).first()
+        phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
     if not phone:
         phone = db.query(Phone).filter(
             Phone.is_active == True
@@ -76,8 +79,9 @@ async def public_send_message(
 
     if chat:
         try:
-            InboxService(db).upsert_message({
-                "chat_id": chat.id,
+            await inbox.upsert_message({
+                "chat_id": chat["id"],
+                "chat_wid": chat["chat_wid"],
                 "phone_id": phone.id,
                 "message_wid": result.message_id or f"api_{datetime.utcnow().timestamp()}",
                 "from_me": True,
@@ -88,7 +92,7 @@ async def public_send_message(
                 "timestamp": datetime.utcnow(),
             })
         except Exception:
-            db.rollback()
+            pass
 
     from app.services.webhook_dispatcher import dispatch_event
     await dispatch_event("message.sent", {
@@ -98,46 +102,45 @@ async def public_send_message(
 
 
 @router.get("/chats")
-def public_list_chats(
+async def public_list_chats(
     is_group: bool | None = None,
     limit: int = 50,
     offset: int = 0,
-    db: Session = Depends(get_db),
     _key: ApiKey = Depends(require_api_key),
 ):
-    chats = InboxService(db).list_chats(
-        is_group=is_group, limit=min(limit, 200), offset=offset
-    )
+    inbox = MongoInboxService()
+    chats = await inbox.list_chats(is_group=is_group, limit=min(limit, 200), offset=offset)
     return [
         {
-            "id": c.id, "chat_id": c.chat_wid, "name": c.name,
-            "is_group": c.is_group, "unread_count": c.unread_count,
-            "last_message": c.last_message,
-            "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+            "id": c["id"], "chat_id": c["chat_wid"], "name": c.get("name") or "",
+            "is_group": bool(c.get("is_group")), "unread_count": c.get("unread_count") or 0,
+            "last_message": c.get("last_message") or "",
+            "last_message_at": c["last_message_at"].isoformat() if isinstance(c.get("last_message_at"), datetime) else c.get("last_message_at"),
         }
         for c in chats
     ]
 
 
 @router.get("/chats/{chat_wid}/messages")
-def public_get_messages(
+async def public_get_messages(
     chat_wid: str,
     limit: int = 50,
-    db: Session = Depends(get_db),
     _key: ApiKey = Depends(require_api_key),
 ):
-    chat = db.query(Chat).filter(Chat.chat_wid == chat_wid).first()
-    if not chat:
+    inbox = MongoInboxService()
+    docs = await inbox.db.chats.find({"chat_wid": chat_wid}).to_list(1)
+    if not docs:
         raise HTTPException(404, "Chat not found")
-    msgs = InboxService(db).get_messages(chat.id, limit=min(limit, 200))
+    chat = docs[0]
+    msgs = await inbox.get_messages(chat_id=chat["id"], limit=min(limit, 200))
     return [
         {
-            "id": m.message_wid, "from_me": m.from_me,
-            "sender_name": m.sender_name, "sender_number": m.sender_number,
-            "body": m.body, "type": m.message_type,
-            "timestamp": m.timestamp.isoformat(),
+            "id": m.get("message_wid") or m["id"], "from_me": bool(m.get("from_me")),
+            "sender_name": m.get("sender_name") or "", "sender_number": m.get("sender_number") or "",
+            "body": m.get("body") or "", "type": m.get("message_type") or "text",
+            "timestamp": m["timestamp"].isoformat() if isinstance(m.get("timestamp"), datetime) else (m.get("timestamp") or ""),
         }
-        for m in reversed(msgs)
+        for m in msgs
     ]
 
 
@@ -149,14 +152,16 @@ class PublicTicketRequest(BaseModel):
 
 
 @router.post("/tickets", status_code=201)
-def public_create_ticket(
+async def public_create_ticket(
     req: PublicTicketRequest,
     db: Session = Depends(get_db),
     api_key: ApiKey = Depends(require_api_key),
 ):
-    chat = db.query(Chat).filter(Chat.chat_wid == req.chat_id).first()
-    if not chat:
+    inbox = MongoInboxService()
+    docs = await inbox.db.chats.find({"chat_wid": req.chat_id}).to_list(1)
+    if not docs:
         raise HTTPException(404, "Chat not found")
+    chat = docs[0]
     from app.services.ticket_service import TicketService
     from app.models.ticket import TicketPriority
     try:
@@ -164,7 +169,7 @@ def public_create_ticket(
     except ValueError:
         priority = TicketPriority.MEDIUM
     ticket = TicketService(db).create_ticket(
-        chat_id=chat.id, title=req.title[:500],
+        chat_id=chat["id"], title=req.title[:500],
         description=req.description, priority=priority,
     )
     return {"id": ticket.id, "title": ticket.title, "status": "open"}

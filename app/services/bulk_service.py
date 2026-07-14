@@ -2,13 +2,12 @@ import asyncio
 import logging
 from datetime import datetime
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.bulk_message_job import BulkMessageJob
-from app.models.chat import Chat
 from app.models.contact import Contact
+from app.services.mongo_chat_service import MongoInboxService
 from app.services.waha_service import WAHAService
 
 logger = logging.getLogger(__name__)
@@ -39,16 +38,12 @@ class BulkService:
     def credits_remaining(self) -> int:
         return 999999
 
-    def _render_variables(self, template: str, chat: Chat) -> str:
+    def _render_variables(self, template: str, chat: dict) -> str:
         """Personalize message per recipient: {{name}}, {{phone}}, {{company}}."""
-        number = chat.chat_wid.split("@")[0]
-        name = chat.name or number
+        number = chat.get("chat_wid", "").split("@")[0]
+        name = chat.get("name") or number
         company = ""
-        contact = None
-        if chat.contact_id:
-            contact = self.db.query(Contact).filter(Contact.id == chat.contact_id).first()
-        if not contact:
-            contact = self.db.query(Contact).filter(Contact.phone_number == number).first()
+        contact = self.db.query(Contact).filter(Contact.phone_number == number).first()
         if contact:
             name = contact.name or name
             company = contact.company or ""
@@ -78,6 +73,7 @@ class BulkService:
         from app.models.bulk_message_job import BulkMessageLog
 
         waha = WAHAService.from_phone(phone)
+        inbox = MongoInboxService()
         sent = 0
         failed = 0
         run_no = (job.runs_count or 0) + 1
@@ -90,12 +86,14 @@ class BulkService:
                 break
             log_row = BulkMessageLog(job_id=job.id, run_number=run_no)
             try:
-                # recipient_chat_ids stores WIDs (e.g. "918320356326@c.us") or int IDs
                 chat_id_str = str(chat_id)
                 if "@" in chat_id_str:
-                    chat = self.db.query(Chat).filter(Chat.chat_wid == chat_id_str).first()
+                    # WID provided — find by chat_wid in MongoDB
+                    docs = await inbox.db.chats.find({"chat_wid": chat_id_str}).to_list(1)
+                    chat = docs[0] if docs else None
                 else:
-                    chat = self.db.query(Chat).filter(Chat.id == int(chat_id_str)).first()
+                    chat = await inbox.get_chat_by_id(int(chat_id_str))
+
                 if not chat:
                     logger.warning("Bulk: chat %s not found, skipping", chat_id)
                     failed += 1
@@ -105,22 +103,22 @@ class BulkService:
                     self.db.commit()
                     continue
 
-                log_row.chat_id = chat.id
-                log_row.chat_name = chat.name or chat.chat_wid
+                log_row.chat_id = chat["id"]
+                log_row.chat_name = chat.get("name") or chat.get("chat_wid") or ""
                 text = self._render_variables(job.message, chat)
                 if settings.environment == "development" and phone.waha_status != "WORKING":
-                    logger.warning("WAHA session %s status is %s (not WORKING) in development environment. Mocking bulk send to %s.", phone.session_name, phone.waha_status, chat.chat_wid)
+                    logger.warning("WAHA session %s status is %s (not WORKING) in development environment. Mocking bulk send to %s.", phone.session_name, phone.waha_status, chat.get("chat_wid"))
                     await asyncio.sleep(0.01)
                 else:
                     try:
                         if job.message_type == "image" and job.media_url:
-                            await waha.send_image(chat.chat_wid, job.media_url, caption=text)
+                            await waha.send_image(chat["chat_wid"], job.media_url, caption=text)
                         elif job.message_type == "file" and job.media_url:
-                            await waha.send_file(chat.chat_wid, job.media_url, caption=text)
+                            await waha.send_file(chat["chat_wid"], job.media_url, caption=text)
                         elif job.message_type == "poll" and job.poll_options:
-                            await waha.send_poll(chat.chat_wid, text, [str(o) for o in job.poll_options])
+                            await waha.send_poll(chat["chat_wid"], text, [str(o) for o in job.poll_options])
                         else:
-                            await waha.send_text(chat.chat_wid, text)
+                            await waha.send_text(chat["chat_wid"], text)
                     except Exception as exc:
                         if settings.environment == "development":
                             logger.warning("WAHA bulk send failed in development, falling back to mock: %s", exc)
@@ -144,7 +142,6 @@ class BulkService:
         job.credits_used = (job.credits_used or 0) + sent
         job.runs_count = run_no
 
-        # Repeating broadcasts: line up the next run instead of finishing
         if job.status != "cancelled" and (job.repeat or "none") != "none":
             nxt = self._next_run(job)
             if nxt:

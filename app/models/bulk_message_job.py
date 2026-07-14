@@ -63,7 +63,8 @@ class BulkMessageLog(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("bulk_message_jobs.id"), nullable=False, index=True)
-    chat_id: Mapped[int | None] = mapped_column(ForeignKey("chats.id"), nullable=True)
+    # chat_id references MongoDB chat.id (integer) — no FK since chats live in MongoDB
+    chat_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     chat_name: Mapped[str] = mapped_column(String(500), default="")
     status: Mapped[str] = mapped_column(String(20), default="sent")  # sent|failed|skipped
     error: Mapped[str | None] = mapped_column(String(500), nullable=True)

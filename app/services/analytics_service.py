@@ -5,8 +5,6 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.agent import Agent
-from app.models.chat import Chat
-from app.models.message import Message
 from app.models.ticket import Ticket, TicketStatus
 
 logger = logging.getLogger(__name__)
@@ -16,30 +14,30 @@ class AnalyticsService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def _response_stats(self, since: datetime) -> tuple[float, dict[int, float]]:
-        """Compute first-response times from message flow.
-
-        Returns (median first-response minutes overall,
-                 {agent_id: avg response minutes}).
-        A "response" is the first outgoing message after one or more incoming
-        messages in the same chat; the delta is measured from the first
-        unanswered incoming message.
-        """
-        msgs = (
-            self.db.query(
-                Message.chat_id, Message.from_me, Message.timestamp,
-                Message.sent_by_agent_id,
+    async def _response_stats(self, since: datetime) -> tuple[float, dict[int, float]]:
+        """Compute first-response times from MongoDB messages."""
+        from app.services.mongo_chat_service import MongoInboxService
+        inbox = MongoInboxService()
+        msgs = await (
+            inbox.db.messages.find(
+                {"timestamp": {"$gte": since}},
+                {"chat_id": 1, "from_me": 1, "timestamp": 1, "sent_by_agent_id": 1},
             )
-            .filter(Message.timestamp >= since)
-            .order_by(Message.chat_id, Message.timestamp)
+            .sort([("chat_id", 1), ("timestamp", 1)])
             .limit(100_000)
-            .all()
+            .to_list(100_000)
         )
         deltas: list[float] = []
         per_agent: dict[int, list[float]] = {}
         current_chat = None
         pending_inbound: datetime | None = None
-        for chat_id, from_me, ts, agent_id in msgs:
+        for m in msgs:
+            chat_id = m.get("chat_id")
+            from_me = m.get("from_me", False)
+            ts = m.get("timestamp")
+            agent_id = m.get("sent_by_agent_id")
+            if not ts:
+                continue
             if chat_id != current_chat:
                 current_chat = chat_id
                 pending_inbound = None
@@ -64,10 +62,12 @@ class AnalyticsService:
         }
         return round(median, 1), agent_avgs
 
-    def get_dashboard_metrics(self) -> dict:
-        total_chats = self.db.query(func.count(Chat.id)).scalar() or 0
-        unread_chats = self.db.query(func.count(Chat.id)).filter(Chat.unread_count > 0).scalar() or 0
-        flagged_chats = self.db.query(func.count(Chat.id)).filter(Chat.is_flagged == True).scalar() or 0
+    async def get_dashboard_metrics(self) -> dict:
+        from app.services.mongo_chat_service import MongoInboxService
+        inbox = MongoInboxService()
+        total_chats = await inbox.db.chats.count_documents({})
+        unread_chats = await inbox.db.chats.count_documents({"unread_count": {"$gt": 0}})
+        flagged_chats = await inbox.db.chats.count_documents({"is_flagged": True})
         open_tickets = self.db.query(func.count(Ticket.id)).filter(Ticket.status == TicketStatus.OPEN).scalar() or 0
         in_progress = self.db.query(func.count(Ticket.id)).filter(Ticket.status == TicketStatus.IN_PROGRESS).scalar() or 0
         active_agents = self.db.query(func.count(Agent.id)).filter(Agent.is_active == True).scalar() or 0
@@ -80,21 +80,21 @@ class AnalyticsService:
             "online_agents": active_agents,
         }
 
-    def get_message_metrics(self, days: int = 7) -> dict:
+    async def get_message_metrics(self, days: int = 7) -> dict:
+        from app.services.mongo_chat_service import MongoInboxService
+        inbox = MongoInboxService()
         since = datetime.utcnow() - timedelta(days=days)
-        outgoing = self.db.query(func.count(Message.id)).filter(
-            Message.from_me == True, Message.timestamp >= since
-        ).scalar() or 0
-        incoming = self.db.query(func.count(Message.id)).filter(
-            Message.from_me == False, Message.timestamp >= since
-        ).scalar() or 0
-        flagged = self.db.query(func.count(Message.id)).filter(
-            Message.is_flagged == True, Message.timestamp >= since
-        ).scalar() or 0
-        active_chats = self.db.query(func.count(func.distinct(Message.chat_id))).filter(
-            Message.timestamp >= since
-        ).scalar() or 0
-        median_response, _ = self._response_stats(since)
+        outgoing = await inbox.db.messages.count_documents({"from_me": True, "timestamp": {"$gte": since}})
+        incoming = await inbox.db.messages.count_documents({"from_me": False, "timestamp": {"$gte": since}})
+        flagged = await inbox.db.messages.count_documents({"is_flagged": True, "timestamp": {"$gte": since}})
+        pipeline = [
+            {"$match": {"timestamp": {"$gte": since}}},
+            {"$group": {"_id": "$chat_id"}},
+            {"$count": "n"},
+        ]
+        result = await inbox.db.messages.aggregate(pipeline).to_list(1)
+        active_chats = result[0]["n"] if result else 0
+        median_response, _ = await self._response_stats(since)
         return {
             "active_chats": active_chats,
             "outgoing_messages": outgoing,
@@ -137,22 +137,22 @@ class AnalyticsService:
             "sla_breached": sla_breached,
         }
 
-    def get_agent_performance(self, days: int = 7) -> list[dict]:
+    async def get_agent_performance(self, days: int = 7) -> list[dict]:
+        from app.services.mongo_chat_service import MongoInboxService
+        inbox = MongoInboxService()
         since = datetime.utcnow() - timedelta(days=days)
         agents = self.db.query(Agent).filter(Agent.is_active == True).all()
-        _, agent_response_times = self._response_stats(since)
+        _, agent_response_times = await self._response_stats(since)
         result = []
         for agent in agents:
-            msgs_sent = self.db.query(func.count(Message.id)).filter(
-                Message.sent_by_agent_id == agent.id, Message.timestamp >= since
-            ).scalar() or 0
+            msgs_sent = await inbox.db.messages.count_documents(
+                {"sent_by_agent_id": agent.id, "timestamp": {"$gte": since}}
+            )
             open_tickets = self.db.query(func.count(Ticket.id)).filter(
                 Ticket.assigned_to == agent.id,
                 Ticket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS])
             ).scalar() or 0
-            chats_assigned = self.db.query(func.count(Chat.id)).filter(
-                Chat.assigned_to == agent.id
-            ).scalar() or 0
+            chats_assigned = await inbox.db.chats.count_documents({"assigned_to": agent.id})
             result.append({
                 "agent_id": agent.id,
                 "agent_name": agent.name,

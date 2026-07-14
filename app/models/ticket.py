@@ -25,8 +25,10 @@ class Ticket(Base, TimestampMixin):
     __tablename__ = "tickets"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"), nullable=False, index=True)
-    message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id"), nullable=True)
+    # chat_id references MongoDB chat.id (integer) — no FK constraint since chats live in MongoDB
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # message_wid is the WAHA message ID string (was message_id FK to MySQL messages)
+    message_wid: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[TicketStatus] = mapped_column(SAEnum(TicketStatus), default=TicketStatus.OPEN)

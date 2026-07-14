@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 
 from app.models.agent import Agent, AgentRole
 from app.models.automation_rule import AutomationRule
-from app.models.chat import Chat, ChatLabel
 from app.models.label import Label
 from app.models.note import Note
 from app.models.ticket import Ticket, TicketPriority
@@ -15,39 +14,21 @@ from app.services.activity_service import log_activity
 logger = logging.getLogger(__name__)
 
 TRIGGER_TYPES = [
-    "message_received",
-    "message_keyword",
-    "chat_created",
-    "ticket_created",
-    "ticket_updated",
-    "chat_assigned",
-    "no_reply_timeout",
-    "label_added",
+    "message_received", "message_keyword", "chat_created", "ticket_created",
+    "ticket_updated", "chat_assigned", "no_reply_timeout", "label_added",
 ]
 
 ACTION_TYPES = [
-    "send_message",
-    "assign_to_agent",
-    "create_ticket",
-    "add_label",
-    "remove_label",
-    "flag_chat",
-    "archive_chat",
-    "activate_ai",
-    "send_note",
-    "escalate",
+    "send_message", "assign_to_agent", "create_ticket", "add_label",
+    "remove_label", "flag_chat", "archive_chat", "activate_ai", "send_note", "escalate",
 ]
 
-# Criteria operators supported in condition objects:
-# {"field": "message", "op": "contains", "value": "refund"}
 _OPERATORS = ("contains", "not_contains", "equals", "not_equals",
               "starts_with", "ends_with", "regex", "in")
 
 
 async def fire_trigger(trigger_type: str, context: dict[str, Any]) -> None:
-    """Run automation rules in a fresh DB session — safe for BackgroundTasks."""
     from app.db.session import SessionLocal
-
     db = SessionLocal()
     try:
         await AutomationService(db).run_rules(trigger_type, context)
@@ -95,7 +76,6 @@ class AutomationService:
         return True
 
     async def run_rules(self, trigger_type: str, context: dict[str, Any]) -> list[str]:
-        """Evaluate and execute matching rules. Returns list of actions taken."""
         rules = self.get_active_rules(trigger_type)
         actions_taken: list[str] = []
         for rule in rules:
@@ -114,14 +94,12 @@ class AutomationService:
                     )
         return actions_taken
 
-    # ── Criteria matching ─────────────────────────────────────────────────────
+    # ── Criteria matching ──────────────────────────────────────────────────
 
     def _matches_criteria(self, rule: AutomationRule, context: dict[str, Any]) -> bool:
         criteria = rule.criteria or {}
         if not criteria:
             return True
-
-        # Structured form: {"match": "all"|"any", "conditions": [{field, op, value}, ...]}
         conditions = criteria.get("conditions")
         if isinstance(conditions, list):
             match_mode = str(criteria.get("match", "all")).lower()
@@ -129,8 +107,6 @@ class AutomationService:
             if not results:
                 return True
             return any(results) if match_mode == "any" else all(results)
-
-        # Keyword shorthand: {"keywords": ["refund", "cancel"]} — any keyword in message
         keywords = criteria.get("keywords")
         if isinstance(keywords, list):
             message = str(context.get("message", "")).lower()
@@ -138,8 +114,6 @@ class AutomationService:
                 return False
             rest = {k: v for k, v in criteria.items() if k != "keywords"}
             return self._legacy_match(rest, context)
-
-        # Legacy form: {key: expected} — substring for strings, equality otherwise
         return self._legacy_match(criteria, context)
 
     def _legacy_match(self, criteria: dict[str, Any], context: dict[str, Any]) -> bool:
@@ -157,15 +131,12 @@ class AutomationService:
         op = str(cond.get("op", "contains")).lower()
         expected = cond.get("value")
         actual = context.get(field)
-
         if op == "in":
             options = expected if isinstance(expected, list) else [expected]
             return actual in options or str(actual) in [str(o) for o in options]
-
         a = "" if actual is None else str(actual)
         e = "" if expected is None else str(expected)
         al, el = a.lower(), e.lower()
-
         if op == "contains":
             return el in al
         if op == "not_contains":
@@ -183,10 +154,9 @@ class AutomationService:
                 return re.search(e, a, re.IGNORECASE) is not None
             except re.error:
                 return False
-        logger.warning("Unknown automation operator '%s'", op)
         return False
 
-    # ── Actions ───────────────────────────────────────────────────────────────
+    # ── Actions ───────────────────────────────────────────────────────────
 
     async def _execute_actions(self, rule: AutomationRule, context: dict[str, Any]) -> list[str]:
         actions_taken: list[str] = []
@@ -205,9 +175,9 @@ class AutomationService:
         action: dict[str, Any], context: dict[str, Any],
     ) -> str | None:
         chat_id = context.get("chat_id")
-        chat: Chat | None = (
-            self.db.query(Chat).filter(Chat.id == chat_id).first() if chat_id else None
-        )
+        from app.services.mongo_chat_service import MongoInboxService
+        inbox = MongoInboxService()
+        chat: dict | None = await inbox.get_chat_by_id(chat_id) if chat_id else None
 
         if action_type == "send_message":
             if not chat:
@@ -223,13 +193,12 @@ class AutomationService:
                 return None
             agent_id = action.get("agent_id")
             if agent_id in ("round_robin", None, ""):
-                agent_id = self._round_robin_agent()
+                agent_id = await self._round_robin_agent()
             if not agent_id:
                 return None
-            chat.assigned_to = int(agent_id)
-            self.db.commit()
+            await inbox.update_chat(chat["id"], assigned_to=int(agent_id))
             from app.core.ws_manager import ws_manager
-            await ws_manager.emit_chat_updated(chat.id, {"assigned_to": chat.assigned_to})
+            await ws_manager.emit_chat_updated(chat["id"], {"assigned_to": int(agent_id)})
             return f"assigned_agent:{agent_id}"
 
         if action_type == "create_ticket":
@@ -240,7 +209,7 @@ class AutomationService:
                 chat, context,
             )
             ticket = Ticket(
-                chat_id=chat.id,
+                chat_id=chat["id"],
                 title=title[:500] or "Automated ticket",
                 description=str(context.get("message", ""))[:2000],
                 priority=self._parse_priority(action.get("priority")),
@@ -249,7 +218,7 @@ class AutomationService:
             self.db.add(ticket)
             self.db.commit()
             from app.core.ws_manager import ws_manager
-            await ws_manager.emit_ticket_event("ticket_created", ticket.id, {"chat_id": chat.id})
+            await ws_manager.emit_ticket_event("ticket_created", ticket.id, {"chat_id": chat["id"]})
             return f"ticket_created:{ticket.id}"
 
         if action_type in ("add_label", "remove_label"):
@@ -258,44 +227,32 @@ class AutomationService:
             label_id = self._resolve_label(action)
             if not label_id:
                 return None
-            existing = (
-                self.db.query(ChatLabel)
-                .filter(ChatLabel.chat_id == chat.id, ChatLabel.label_id == label_id)
-                .first()
-            )
-            if action_type == "add_label" and not existing:
-                self.db.add(ChatLabel(chat_id=chat.id, label_id=label_id))
-                self.db.commit()
+            if action_type == "add_label":
+                await inbox.add_label_to_chat(chat["id"], label_id)
                 await self.run_rules("label_added", {
-                    "chat_id": chat.id, "label_id": label_id, "source": "automation",
+                    "chat_id": chat["id"], "label_id": label_id, "source": "automation",
                 })
                 return f"label_added:{label_id}"
-            if action_type == "remove_label" and existing:
-                self.db.delete(existing)
-                self.db.commit()
+            else:
+                await inbox.remove_label_from_chat(chat["id"], label_id)
                 return f"label_removed:{label_id}"
-            return None
 
         if action_type == "flag_chat":
             if not chat:
                 return None
-            chat.is_flagged = True
-            self.db.commit()
+            await inbox.update_chat(chat["id"], is_flagged=True)
             return "chat_flagged"
 
         if action_type == "archive_chat":
             if not chat:
                 return None
-            chat.is_archived = True
-            self.db.commit()
+            await inbox.update_chat(chat["id"], is_archived=True)
             return "chat_archived"
 
         if action_type == "activate_ai":
             if not chat:
                 return None
-            chat.ai_active = True
-            chat.ai_state = "ACTIVE"
-            self.db.commit()
+            await inbox.update_chat(chat["id"], ai_active=True, ai_state="ACTIVE")
             return "ai_activated"
 
         if action_type == "send_note":
@@ -304,7 +261,7 @@ class AutomationService:
             content = self._render_template(str(action.get("message", "")), chat, context)
             if not content:
                 return None
-            self.db.add(Note(chat_id=chat.id, agent_id=action.get("agent_id"), content=content))
+            self.db.add(Note(chat_id=chat["id"], agent_id=action.get("agent_id"), content=content))
             self.db.commit()
             return "note_added"
 
@@ -315,17 +272,16 @@ class AutomationService:
                 chat, context,
             )
             await ws_manager.broadcast("escalation", {
-                "chat_id": chat.id if chat else None,
+                "chat_id": chat["id"] if chat else None,
                 "rule": rule.name,
                 "reason": reason,
                 "message": context.get("message", ""),
             })
             if chat:
-                chat.is_flagged = True
-                self.db.commit()
+                await inbox.update_chat(chat["id"], is_flagged=True)
             log_activity(
                 self.db, "escalation", entity_type="chat",
-                entity_id=chat.id if chat else None,
+                entity_id=chat["id"] if chat else None,
                 description=reason,
             )
             return "escalated"
@@ -333,10 +289,10 @@ class AutomationService:
         logger.warning("Unknown automation action '%s'", action_type)
         return None
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _round_robin_agent(self) -> int | None:
-        """Distribute chats to the active agent with the fewest assigned open chats."""
+    async def _round_robin_agent(self) -> int | None:
+        from app.services.mongo_chat_service import MongoInboxService
         agents = (
             self.db.query(Agent)
             .filter(Agent.is_active == True, Agent.role != AgentRole.VIEWER)
@@ -344,12 +300,12 @@ class AutomationService:
         )
         if not agents:
             return None
-        counts = {
-            a.id: self.db.query(Chat).filter(
-                Chat.assigned_to == a.id, Chat.is_archived == False
-            ).count()
-            for a in agents
-        }
+        inbox = MongoInboxService()
+        counts: dict[int, int] = {}
+        for a in agents:
+            counts[a.id] = await inbox.db.chats.count_documents(
+                {"assigned_to": a.id, "is_archived": False}
+            )
         return min(counts, key=counts.get)
 
     def _resolve_label(self, action: dict[str, Any]) -> int | None:
@@ -373,32 +329,32 @@ class AutomationService:
         except (ValueError, AttributeError):
             return TicketPriority.MEDIUM
 
-    def _render_template(self, text: str, chat: Chat | None, context: dict[str, Any]) -> str:
-        """Replace {{name}}, {{message}}, {{chat_name}} variables in action text."""
+    def _render_template(self, text: str, chat: dict | None, context: dict[str, Any]) -> str:
         if not text:
             return text
         values = {
-            "name": (chat.name if chat else "") or "",
-            "chat_name": (chat.name if chat else "") or "",
+            "name": (chat.get("name") if chat else "") or "",
+            "chat_name": (chat.get("name") if chat else "") or "",
             "message": str(context.get("message", "")),
         }
         for key, val in values.items():
             text = text.replace("{{" + key + "}}", val).replace("{{ " + key + " }}", val)
         return text
 
-    async def _send_whatsapp(self, chat: Chat, text: str) -> None:
+    async def _send_whatsapp(self, chat: dict, text: str) -> None:
         from app.models.phone import Phone
-        from app.services.inbox_service import InboxService
+        from app.services.mongo_chat_service import MongoInboxService
         from app.services.waha_service import WAHAService
         from datetime import datetime
 
-        phone = self.db.query(Phone).filter(Phone.id == chat.phone_id).first()
+        phone = self.db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
         if not phone:
             return
         waha = WAHAService.from_phone(phone)
-        result = await waha.send_text(chat.chat_wid, text)
-        InboxService(self.db).upsert_message({
-            "chat_id": chat.id,
+        result = await waha.send_text(chat["chat_wid"], text)
+        await MongoInboxService().upsert_message({
+            "chat_id": chat["id"],
+            "chat_wid": chat["chat_wid"],
             "phone_id": phone.id,
             "message_wid": result.message_id or f"auto_{datetime.utcnow().timestamp()}",
             "from_me": True,

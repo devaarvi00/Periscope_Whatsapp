@@ -5,10 +5,10 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent, AgentRole
-from app.models.chat import Chat
 from app.models.property_definition import PropertyDefinition
 from app.models.ticket import Ticket
 from app.services.activity_service import log_activity
+from app.services.mongo_chat_service import MongoInboxService
 
 router = APIRouter(prefix="/properties", tags=["custom-properties"])
 
@@ -156,23 +156,25 @@ def _validate_values(db: Session, entity: str, values: dict) -> dict:
 
 
 @router.put("/chat/{chat_id}")
-def set_chat_values(chat_id: int, req: ValueUpdate, db: Session = Depends(get_db)):
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+async def set_chat_values(chat_id: int, req: ValueUpdate, db: Session = Depends(get_db)):
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
-    current = dict(chat.custom_properties or {})
+    current = dict(chat.get("custom_properties") or {})
     current.update(_validate_values(db, "chat", req.values))
-    chat.custom_properties = {k: v for k, v in current.items() if v is not None}
-    db.commit()
-    return {"chat_id": chat_id, "custom_properties": chat.custom_properties}
+    new_props = {k: v for k, v in current.items() if v is not None}
+    await inbox.update_chat(chat_id, custom_properties=new_props)
+    return {"chat_id": chat_id, "custom_properties": new_props}
 
 
 @router.get("/chat/{chat_id}")
-def get_chat_values(chat_id: int, db: Session = Depends(get_db)):
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+async def get_chat_values(chat_id: int, db: Session = Depends(get_db)):
+    inbox = MongoInboxService()
+    chat = await inbox.get_chat_by_id(chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
-    return {"chat_id": chat_id, "custom_properties": chat.custom_properties or {}}
+    return {"chat_id": chat_id, "custom_properties": chat.get("custom_properties") or {}}
 
 
 @router.put("/ticket/{ticket_id}")

@@ -76,6 +76,8 @@ async def _configure_waha_webhook() -> None:
 async def lifespan(_: FastAPI):
     configure_logging()
     init_db()
+    from app.db.mongo import init_mongo_indexes
+    await init_mongo_indexes()
     await http_client.startup()
     await _configure_waha_webhook()
 

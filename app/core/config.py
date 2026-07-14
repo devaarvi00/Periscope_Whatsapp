@@ -17,6 +17,10 @@ class Settings(BaseSettings):
         "mysql+pymysql://root:password@localhost:3306/whatsapp_periscope",
     )
 
+    # MongoDB — stores chats and messages (per-phone isolated)
+    mongodb_url: str = "mongodb://localhost:27017"
+    mongodb_db_name: str = "hyperscope"
+
     # WAHA WhatsApp provider
     waha_base_url: str = "http://localhost:3000"
     waha_api_key: str = ""
