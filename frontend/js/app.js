@@ -3204,19 +3204,15 @@ async function renderSettings() {
 }
 
 function showAddPhoneModal() {
-  // First phone uses the pre-configured WAHA session (WAHA_SESSION_NAME from env).
-  // Additional phones auto-generate new WAHA sessions (hyperscope_2, hyperscope_3, …).
-  const isFirstPhone = !(State.phones && State.phones.length > 0);
-
-  showModal('Add WhatsApp Number', `
+  showModal('Connect WhatsApp', `
     <div class="form-group">
       <label>Display Name *</label>
-      <input type="text" id="add-ph-name" placeholder="e.g. Marketing, Sales, Support" autofocus>
-      <small class="text-muted">${isFirstPhone ? 'Will connect to your configured WAHA session' : 'A new WAHA session will be created automatically'}</small>
+      <input type="text" id="add-ph-name" placeholder="e.g. Sales, Support" autofocus>
+      <small class="text-muted">Uses the WAHA session configured in your server environment</small>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="add-ph-save">Save & Connect</button>
+      <button class="btn btn-primary" id="add-ph-save">Connect</button>
     </div>
   `);
 
@@ -3229,26 +3225,17 @@ function showAddPhoneModal() {
     btn.textContent = 'Connecting…';
 
     try {
-      let phoneId;
-      if (isFirstPhone) {
-        // Use the WAHA_SESSION_NAME from env (e.g. whats_app_hyperscope)
-        const res = await Api.phones.connect(name);
-        phoneId = res.phone_id;
-      } else {
-        // Auto-create a new WAHA session (hyperscope_2, hyperscope_3, …)
-        const res = await Api.phones.create({ name });
-        phoneId = res.id;
-      }
+      const res = await Api.phones.connect(name);
       closeModal();
-      toast(`"${name}" connecting — scan QR to link WhatsApp`, 'success');
+      toast(`Connecting — scan the QR code to link WhatsApp`, 'success');
       await loadSettingsTab('phones');
       loadPhones();
-      const connectBtn = document.querySelector(`.phone-btn-connect[data-pid="${phoneId}"]`);
+      const connectBtn = document.querySelector(`.phone-btn-connect[data-pid="${res.phone_id}"]`);
       if (connectBtn) connectBtn.click();
     } catch(e) {
       toast(e.message, 'error');
       btn.disabled = false;
-      btn.textContent = 'Save & Connect';
+      btn.textContent = 'Connect';
     }
   });
 }
@@ -3270,10 +3257,10 @@ async function loadSettingsTab(tab) {
         <div class="flex-col gap-4">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid var(--border-light)">
             <div>
-              <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">WhatsApp Sessions</h3>
-              <p style="margin:0;font-size:12.5px;color:var(--text-3)">Configure and connect multiple WhatsApp numbers to Hyperscope</p>
+              <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">WhatsApp Session</h3>
+              <p style="margin:0;font-size:12.5px;color:var(--text-3)">Connect your WhatsApp number to Hyperscope</p>
             </div>
-            <button class="btn btn-primary btn-sm" id="btn-add-phone">+ Add WhatsApp Number</button>
+            ${!phones.length ? `<button class="btn btn-primary btn-sm" id="btn-add-phone">+ Connect WhatsApp</button>` : ''}
           </div>
           
           <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:1rem">

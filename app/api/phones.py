@@ -5,7 +5,7 @@ from sqlalchemy import delete
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.phone import Phone
-from app.schemas.inbox import PhoneCreate, PhoneOut
+from app.schemas.inbox import PhoneOut
 from app.services.waha_service import WAHAService
 from app.services.mongo_chat_service import MongoInboxService
 
@@ -24,46 +24,6 @@ def list_phones(db: Session = Depends(get_db), agent=Depends(_current_agent)):
     return q.all()
 
 
-@router.post("", response_model=PhoneOut, status_code=201)
-async def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
-    import re as _re
-
-    # Auto-generate unique session name: hyperscope_1, hyperscope_2, …
-    prefix = settings.waha_session_prefix
-    existing_nums: list[int] = []
-    for (sname,) in db.query(Phone.session_name).filter(
-        Phone.session_name.like(f"{prefix}_%")
-    ).all():
-        m = _re.match(rf"^{_re.escape(prefix)}_(\d+)$", sname)
-        if m:
-            existing_nums.append(int(m.group(1)))
-    next_num = max(existing_nums, default=0) + 1
-    session_name = f"{prefix}_{next_num}"
-
-    phone = Phone(
-        name=req.name,
-        phone_number=f"pending_{session_name}",
-        session_name=session_name,
-        waha_status="STOPPED",
-        is_active=True,
-        is_default=req.is_default,
-    )
-    db.add(phone)
-    db.commit()
-    db.refresh(phone)
-
-    waha = WAHAService.from_phone(phone)
-    try:
-        await waha.ensure_session_exists(settings.waha_webhook_url, settings.waha_webhook_secret)
-        await waha.start_session()
-        await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
-        phone.waha_status = "SCAN_QR_CODE"
-        db.commit()
-    except Exception as exc:
-        from app.api.webhooks import logger
-        logger.warning("Could not start WAHA session %s after creation: %s", session_name, exc)
-
-    return phone
 
 
 def _delete_phone_relations(db: Session, phone_id: int) -> None:
@@ -250,7 +210,7 @@ async def auto_connect(
     phone = db.query(Phone).filter(Phone.session_name == session_name).first()
     if not phone:
         phone = Phone(name=display_name, phone_number=f"pending_{session_name}", session_name=session_name,
-                      waha_status="STOPPED", is_default=True, is_active=True)
+                      waha_status="STOPPED", is_active=True)
         db.add(phone)
         db.commit()
         db.refresh(phone)
@@ -334,7 +294,7 @@ def update_phone(phone_id: int, req: dict, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    allowed = {"name", "waha_base_url", "waha_api_key", "is_default"}
+    allowed = {"name", "waha_base_url", "waha_api_key"}
     for k, v in req.items():
         if k in allowed and hasattr(phone, k):
             setattr(phone, k, v or None)

@@ -65,9 +65,7 @@ async def public_send_message(
     if chat:
         phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
     if not phone:
-        phone = db.query(Phone).filter(
-            Phone.is_active == True
-        ).order_by(Phone.is_default.desc()).first()
+        phone = db.query(Phone).filter(Phone.is_active == True).first()
     if not phone:
         raise HTTPException(503, "No active WhatsApp number connected")
 
