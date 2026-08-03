@@ -68,6 +68,7 @@ async def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
 
 def _delete_phone_relations(db: Session, phone_id: int) -> None:
     """Delete all MySQL rows that FK-reference a phone before deleting it."""
+    from sqlalchemy import text
     from app.models.agent_phone import AgentPhone as _AP
     from app.models.bulk_message_job import BulkMessageJob, BulkMessageLog
     from app.models.scheduled_message import ScheduledMessage
@@ -78,6 +79,14 @@ def _delete_phone_relations(db: Session, phone_id: int) -> None:
         db.execute(delete(BulkMessageLog).where(BulkMessageLog.job_id.in_(job_ids)))
         db.execute(delete(BulkMessageJob).where(BulkMessageJob.phone_id == phone_id))
     db.execute(delete(_AP).where(_AP.phone_id == phone_id))
+
+    # Legacy MySQL tables: chats (and messages/chat_labels) still exist on disk even
+    # though data has been migrated to MongoDB. MySQL still enforces the FK constraint
+    # chats.phone_id → phones.id, so we must delete these rows before deleting the phone.
+    pid = {"pid": phone_id}
+    db.execute(text("DELETE FROM messages WHERE phone_id = :pid"), pid)
+    db.execute(text("DELETE FROM chat_labels WHERE chat_id IN (SELECT id FROM chats WHERE phone_id = :pid)"), pid)
+    db.execute(text("DELETE FROM chats WHERE phone_id = :pid"), pid)
 
 
 @router.get("/{phone_id}/status")
@@ -351,23 +360,8 @@ async def delete_phone(phone_id: int, db: Session = Depends(get_db)):
     inbox = MongoInboxService()
     await inbox.delete_phone_data(phone_id)
 
-    # Clean up MySQL relational data (no chat/message FKs anymore)
-    from app.models.note import Note
-    from app.models.ticket import Ticket, TicketLabel
-    from app.models.bulk_message_job import BulkMessageJob, BulkMessageLog
-    from app.models.scheduled_message import ScheduledMessage
-    from app.models.task import Task
-    from app.models.agent_phone import AgentPhone
-
-    # Tickets and notes are keyed by chat_id (MongoDB integer ID) — delete any linked to this phone's chats
-    # We can't easily resolve these without querying MongoDB, so we null them out rather than cascade-delete
-    db.execute(delete(ScheduledMessage).where(ScheduledMessage.phone_id == phone_id))
-
-    job_ids = [r[0] for r in db.query(BulkMessageJob.id).filter(BulkMessageJob.phone_id == phone_id).all()]
-    if job_ids:
-        db.execute(delete(BulkMessageLog).where(BulkMessageLog.job_id.in_(job_ids)))
-        db.execute(delete(BulkMessageJob).where(BulkMessageJob.phone_id == phone_id))
-
-    db.execute(delete(AgentPhone).where(AgentPhone.phone_id == phone_id))
+    # Clean up all MySQL rows that FK-reference this phone (scheduled, bulk, agent, legacy chats)
+    _delete_phone_relations(db, phone_id)
+    db.flush()
     db.delete(phone)
     db.commit()
