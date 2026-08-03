@@ -4,7 +4,6 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import httpx
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse

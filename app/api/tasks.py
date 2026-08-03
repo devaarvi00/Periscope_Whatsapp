@@ -21,7 +21,7 @@ class TaskCreate(BaseModel):
     due_date: str | None = None      # ISO 8601
     reminder_at: str | None = None   # ISO 8601 — notify assignee at this time
     chat_id: int | None = None
-    message_id: int | None = None    # message this task was created from
+    message_wid: str | None = None
     assigned_to: int | None = None
 
 
@@ -41,7 +41,7 @@ def _serialize(t: Task, agent_names: dict[int, str]) -> dict:
         "status": t.status, "priority": t.priority,
         "due_date": t.due_date.isoformat() if t.due_date else None,
         "reminder_at": t.reminder_at.isoformat() if t.reminder_at else None,
-        "chat_id": t.chat_id, "message_id": t.message_id,
+        "chat_id": t.chat_id, "message_wid": t.message_wid,
         "assigned_to": t.assigned_to,
         "assignee_name": agent_names.get(t.assigned_to, ""),
         "created_by": t.created_by,
@@ -99,7 +99,7 @@ async def create_task(
         priority=req.priority if req.priority in ("low", "medium", "high") else "low",
         due_date=_parse(req.due_date, "due_date"),
         reminder_at=_parse(req.reminder_at, "reminder_at"),
-        chat_id=req.chat_id, message_id=req.message_id,
+        chat_id=req.chat_id, message_wid=req.message_wid,
         assigned_to=req.assigned_to, created_by=agent.id,
     )
     db.add(task)

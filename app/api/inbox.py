@@ -366,13 +366,7 @@ async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
     inbox = MongoInboxService()
     synced = 0
 
-    _media_labels = {
-        "image": "📷 Photo", "photo": "📷 Photo", "video": "🎬 Video",
-        "audio": "🎤 Voice message", "voice": "🎤 Voice message", "ptt": "🎤 Voice message",
-        "document": "📄 Document", "pdf": "📄 Document",
-        "sticker": "🖼 Sticker", "location": "📍 Location",
-        "contact": "👤 Contact", "vcard": "👤 Contact",
-    }
+    from app.api.webhooks import _MEDIA_LABELS as _media_labels
 
     for c in chats:
         cid = c.get("id") or c.get("chatId") or c.get("_serialized") or ""

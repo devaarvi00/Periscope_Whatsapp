@@ -3,7 +3,6 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
-from sqlalchemy import delete
 
 from app.core.config import settings
 from app.db.session import SessionLocal
@@ -28,6 +27,8 @@ _SYSTEM_LABELS = {
     "revoke": "🗑 Message deleted",
     "call_log": "📞 Call",
     "e2e_notification": "🔒 Encrypted notification",
+    "notification_template": "📋 Notification",
+    "protocol": "🔄 System message",
     "order": "🛒 Order",
     "product": "📦 Product",
     "list": "📋 List message",

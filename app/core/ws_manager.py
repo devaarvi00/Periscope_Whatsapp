@@ -92,16 +92,5 @@ class ConnectionManager:
     async def emit_ticket_event(self, event: str, ticket_id: int, fields: dict) -> None:
         await self.broadcast(event, {"ticket_id": ticket_id, **fields})
 
-    async def emit_typing(self, chat_id: int, is_typing: bool) -> None:
-        await self.broadcast("typing", {"chat_id": chat_id, "is_typing": is_typing})
-
-    @property
-    def online_count(self) -> int:
-        return sum(len(c) for c in self._connections.values())
-
-    @property
-    def online_agent_ids(self) -> list[int]:
-        return list(self._connections.keys())
-
 
 ws_manager = ConnectionManager()

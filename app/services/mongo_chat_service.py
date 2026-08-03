@@ -19,17 +19,6 @@ from app.db.mongo import get_mongo_db, next_id
 
 logger = logging.getLogger(__name__)
 
-_MEDIA_LABELS: dict[str, str] = {
-    "image": "📷 Photo", "photo": "📷 Photo",
-    "video": "🎬 Video",
-    "audio": "🎤 Voice message", "voice": "🎤 Voice message", "ptt": "🎤 Voice message",
-    "document": "📄 Document", "pdf": "📄 Document",
-    "sticker": "🖼 Sticker", "gif": "🎞 GIF",
-    "location": "📍 Location",
-    "contact": "👤 Contact", "vcard": "👤 Contact",
-}
-
-
 def _serialize_chat(doc: dict) -> dict:
     """Convert a raw MongoDB chat document into a clean API dict."""
     if not doc:
@@ -55,22 +44,7 @@ def _serialize_chat(doc: dict) -> dict:
     }
 
 
-_SYSTEM_LABELS: dict[str, str] = {
-    "revoke": "🗑 Message deleted",
-    "call_log": "📞 Call",
-    "e2e_notification": "🔒 Encrypted notification",
-    "notification_template": "📋 Notification",
-    "protocol": "🔄 System message",
-    "order": "🛒 Order",
-    "product": "📦 Product",
-    "list": "📋 List message",
-    "list_response": "📋 List response",
-    "buttons_response": "📋 Button response",
-    "template_button_reply": "📋 Template reply",
-    "interactive": "📋 Interactive message",
-    "poll_creation": "📊 Poll",
-    "poll_update": "📊 Poll response",
-}
+from app.api.webhooks import _MEDIA_LABELS, _SYSTEM_LABELS  # single source of truth
 
 
 def _body_for_display(doc: dict) -> str:
@@ -259,12 +233,6 @@ class MongoInboxService:
             {"id": chat_id},
             {"$pull": {"label_ids": label_id}, "$set": {"updated_at": datetime.utcnow()}},
         )
-
-    async def get_chat_label_ids(self, chat_id: int) -> list[int]:
-        doc = await self.db.chats.find_one({"id": chat_id}, {"label_ids": 1})
-        if not doc:
-            return []
-        return doc.get("label_ids") or []
 
     # ── Messages ────────────────────────────────────────────────────────── #
 

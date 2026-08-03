@@ -1,6 +1,6 @@
 import logging
 
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from app.db.session import engine
 from app.models.base import Base
