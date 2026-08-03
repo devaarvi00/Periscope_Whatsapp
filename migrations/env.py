@@ -16,19 +16,7 @@ if database_url:
 
 # Import all models so Base.metadata knows all tables
 from app.models.base import Base
-import app.models.agent
-import app.models.phone
-import app.models.label
-import app.models.contact
-import app.models.chat
-import app.models.message
-import app.models.ticket
-import app.models.note
-import app.models.quick_reply
-import app.models.automation_rule
-import app.models.knowledge_item
-import app.models.bulk_message_job
-import app.models.activity_log
+import app.models  # noqa: F401 — registers all active models with Base
 
 target_metadata = Base.metadata
 

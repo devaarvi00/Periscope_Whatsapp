@@ -18,19 +18,7 @@ from app.core.config import settings
 
 # Import all models so their metadata is registered
 from app.models.base import Base
-import app.models.agent
-import app.models.phone
-import app.models.label
-import app.models.contact
-import app.models.chat
-import app.models.message
-import app.models.ticket
-import app.models.note
-import app.models.quick_reply
-import app.models.automation_rule
-import app.models.knowledge_item
-import app.models.bulk_message_job
-import app.models.activity_log
+import app.models  # noqa: F401 — registers all active models with Base
 
 EXPECTED_TABLES = [
     "agents",
@@ -38,9 +26,6 @@ EXPECTED_TABLES = [
     "labels",
     "contacts",
     "contact_labels",
-    "chats",
-    "chat_labels",
-    "messages",
     "tickets",
     "ticket_labels",
     "notes",
