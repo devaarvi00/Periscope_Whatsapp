@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import delete
 
@@ -232,19 +232,28 @@ async def clear_phone_data(phone_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/connect")
-async def auto_connect(db: Session = Depends(get_db)):
+async def auto_connect(
+    req: dict = Body(default={}),
+    db: Session = Depends(get_db),
+):
     session_name = settings.waha_session_name
+    display_name = str(req.get("name") or "").strip() or "My WhatsApp"
     phone = db.query(Phone).filter(Phone.session_name == session_name).first()
     if not phone:
-        phone = Phone(name="My WhatsApp", phone_number=f"pending_{session_name}", session_name=session_name,
+        phone = Phone(name=display_name, phone_number=f"pending_{session_name}", session_name=session_name,
                       waha_status="STOPPED", is_default=True, is_active=True)
         db.add(phone)
         db.commit()
         db.refresh(phone)
     elif not phone.is_active:
         phone.is_active = True
+        if display_name and display_name != "My WhatsApp" and phone.name in ("My WhatsApp", ""):
+            phone.name = display_name
         db.commit()
         db.refresh(phone)
+    elif display_name and display_name != "My WhatsApp" and phone.name in ("My WhatsApp", ""):
+        phone.name = display_name
+        db.commit()
 
     waha = WAHAService.from_phone(phone)
     try:

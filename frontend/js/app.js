@@ -3204,11 +3204,15 @@ async function renderSettings() {
 }
 
 function showAddPhoneModal() {
+  // First phone uses the pre-configured WAHA session (WAHA_SESSION_NAME from env).
+  // Additional phones auto-generate new WAHA sessions (hyperscope_2, hyperscope_3, …).
+  const isFirstPhone = !(State.phones && State.phones.length > 0);
+
   showModal('Add WhatsApp Number', `
     <div class="form-group">
       <label>Display Name *</label>
       <input type="text" id="add-ph-name" placeholder="e.g. Marketing, Sales, Support" autofocus>
-      <small class="text-muted">A session will be created automatically</small>
+      <small class="text-muted">${isFirstPhone ? 'Will connect to your configured WAHA session' : 'A new WAHA session will be created automatically'}</small>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
@@ -3222,16 +3226,24 @@ function showAddPhoneModal() {
 
     const btn = document.getElementById('add-ph-save');
     btn.disabled = true;
-    btn.textContent = 'Creating…';
+    btn.textContent = 'Connecting…';
 
     try {
-      const res = await Api.phones.create({ name });
+      let phoneId;
+      if (isFirstPhone) {
+        // Use the WAHA_SESSION_NAME from env (e.g. whats_app_hyperscope)
+        const res = await Api.phones.connect(name);
+        phoneId = res.phone_id;
+      } else {
+        // Auto-create a new WAHA session (hyperscope_2, hyperscope_3, …)
+        const res = await Api.phones.create({ name });
+        phoneId = res.id;
+      }
       closeModal();
-      toast(`"${name}" session created — scan QR to connect`, 'success');
-      // Reload and auto-open QR flow
+      toast(`"${name}" connecting — scan QR to link WhatsApp`, 'success');
       await loadSettingsTab('phones');
       loadPhones();
-      const connectBtn = document.querySelector(`.phone-btn-connect[data-pid="${res.id}"]`);
+      const connectBtn = document.querySelector(`.phone-btn-connect[data-pid="${phoneId}"]`);
       if (connectBtn) connectBtn.click();
     } catch(e) {
       toast(e.message, 'error');
