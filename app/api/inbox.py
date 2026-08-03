@@ -149,7 +149,7 @@ async def _store_waha_messages(
     chat: dict,
     phone: Any,
 ) -> None:
-    from app.api.webhooks import _MEDIA_TYPES as _media_types, _MEDIA_LABELS as _media_labels, _SYSTEM_LABELS as _system_labels
+    from app.core.message_labels import _MEDIA_TYPES as _media_types, _MEDIA_LABELS as _media_labels, _SYSTEM_LABELS as _system_labels
     from datetime import timezone
     for m in waha_msgs:
         raw_id = m.get("id") or {}
@@ -366,7 +366,7 @@ async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
     inbox = MongoInboxService()
     synced = 0
 
-    from app.api.webhooks import _MEDIA_LABELS as _media_labels
+    from app.core.message_labels import _MEDIA_LABELS as _media_labels
 
     for c in chats:
         cid = c.get("id") or c.get("chatId") or c.get("_serialized") or ""

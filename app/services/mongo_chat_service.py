@@ -44,7 +44,7 @@ def _serialize_chat(doc: dict) -> dict:
     }
 
 
-from app.api.webhooks import _MEDIA_LABELS, _SYSTEM_LABELS  # single source of truth
+from app.core.message_labels import _MEDIA_LABELS, _SYSTEM_LABELS
 
 
 def _body_for_display(doc: dict) -> str:
