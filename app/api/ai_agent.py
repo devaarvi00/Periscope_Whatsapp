@@ -7,7 +7,7 @@ from app.db.session import get_db
 from app.models.agent import Agent
 from app.services.ai_agent_service import AIAgentService
 from app.services.gemini_service import GeminiService
-from app.services.mongo_chat_service import MongoInboxService, _serialize_message
+from app.services.mongo_chat_service import MongoInboxService
 
 router = APIRouter(prefix="/ai", tags=["ai-agent"])
 

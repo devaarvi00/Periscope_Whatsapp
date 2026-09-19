@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import delete
 
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.phone import Phone
-from app.schemas.inbox import PhoneCreate, PhoneOut
+from app.schemas.inbox import PhoneOut
 from app.services.waha_service import WAHAService
 from app.services.mongo_chat_service import MongoInboxService
 
@@ -24,50 +24,11 @@ def list_phones(db: Session = Depends(get_db), agent=Depends(_current_agent)):
     return q.all()
 
 
-@router.post("", response_model=PhoneOut, status_code=201)
-async def add_phone(req: PhoneCreate, db: Session = Depends(get_db)):
-    import re as _re
-
-    # Auto-generate unique session name: hyperscope_1, hyperscope_2, …
-    prefix = settings.waha_session_prefix
-    existing_nums: list[int] = []
-    for (sname,) in db.query(Phone.session_name).filter(
-        Phone.session_name.like(f"{prefix}_%")
-    ).all():
-        m = _re.match(rf"^{_re.escape(prefix)}_(\d+)$", sname)
-        if m:
-            existing_nums.append(int(m.group(1)))
-    next_num = max(existing_nums, default=0) + 1
-    session_name = f"{prefix}_{next_num}"
-
-    phone = Phone(
-        name=req.name,
-        phone_number=f"pending_{session_name}",
-        session_name=session_name,
-        waha_status="STOPPED",
-        is_active=True,
-        is_default=req.is_default,
-    )
-    db.add(phone)
-    db.commit()
-    db.refresh(phone)
-
-    waha = WAHAService.from_phone(phone)
-    try:
-        await waha.ensure_session_exists(settings.waha_webhook_url, settings.waha_webhook_secret)
-        await waha.start_session()
-        await waha.configure_webhook(settings.waha_webhook_url, settings.waha_webhook_secret)
-        phone.waha_status = "SCAN_QR_CODE"
-        db.commit()
-    except Exception as exc:
-        from app.api.webhooks import logger
-        logger.warning("Could not start WAHA session %s after creation: %s", session_name, exc)
-
-    return phone
 
 
 def _delete_phone_relations(db: Session, phone_id: int) -> None:
     """Delete all MySQL rows that FK-reference a phone before deleting it."""
+    from sqlalchemy import text
     from app.models.agent_phone import AgentPhone as _AP
     from app.models.bulk_message_job import BulkMessageJob, BulkMessageLog
     from app.models.scheduled_message import ScheduledMessage
@@ -78,6 +39,14 @@ def _delete_phone_relations(db: Session, phone_id: int) -> None:
         db.execute(delete(BulkMessageLog).where(BulkMessageLog.job_id.in_(job_ids)))
         db.execute(delete(BulkMessageJob).where(BulkMessageJob.phone_id == phone_id))
     db.execute(delete(_AP).where(_AP.phone_id == phone_id))
+
+    # Legacy MySQL tables: chats (and messages/chat_labels) still exist on disk even
+    # though data has been migrated to MongoDB. MySQL still enforces the FK constraint
+    # chats.phone_id → phones.id, so we must delete these rows before deleting the phone.
+    pid = {"pid": phone_id}
+    db.execute(text("DELETE FROM messages WHERE phone_id = :pid"), pid)
+    db.execute(text("DELETE FROM chat_labels WHERE chat_id IN (SELECT id FROM chats WHERE phone_id = :pid)"), pid)
+    db.execute(text("DELETE FROM chats WHERE phone_id = :pid"), pid)
 
 
 @router.get("/{phone_id}/status")
@@ -232,19 +201,28 @@ async def clear_phone_data(phone_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/connect")
-async def auto_connect(db: Session = Depends(get_db)):
+async def auto_connect(
+    req: dict = Body(default={}),
+    db: Session = Depends(get_db),
+):
     session_name = settings.waha_session_name
+    display_name = str(req.get("name") or "").strip() or "My WhatsApp"
     phone = db.query(Phone).filter(Phone.session_name == session_name).first()
     if not phone:
-        phone = Phone(name="My WhatsApp", phone_number=f"pending_{session_name}", session_name=session_name,
-                      waha_status="STOPPED", is_default=True, is_active=True)
+        phone = Phone(name=display_name, phone_number=f"pending_{session_name}", session_name=session_name,
+                      waha_status="STOPPED", is_active=True)
         db.add(phone)
         db.commit()
         db.refresh(phone)
     elif not phone.is_active:
         phone.is_active = True
+        if display_name and display_name != "My WhatsApp" and phone.name in ("My WhatsApp", ""):
+            phone.name = display_name
         db.commit()
         db.refresh(phone)
+    elif display_name and display_name != "My WhatsApp" and phone.name in ("My WhatsApp", ""):
+        phone.name = display_name
+        db.commit()
 
     waha = WAHAService.from_phone(phone)
     try:
@@ -316,7 +294,7 @@ def update_phone(phone_id: int, req: dict, db: Session = Depends(get_db)):
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    allowed = {"name", "waha_base_url", "waha_api_key", "is_default"}
+    allowed = {"name", "waha_base_url", "waha_api_key"}
     for k, v in req.items():
         if k in allowed and hasattr(phone, k):
             setattr(phone, k, v or None)
@@ -342,23 +320,8 @@ async def delete_phone(phone_id: int, db: Session = Depends(get_db)):
     inbox = MongoInboxService()
     await inbox.delete_phone_data(phone_id)
 
-    # Clean up MySQL relational data (no chat/message FKs anymore)
-    from app.models.note import Note
-    from app.models.ticket import Ticket, TicketLabel
-    from app.models.bulk_message_job import BulkMessageJob, BulkMessageLog
-    from app.models.scheduled_message import ScheduledMessage
-    from app.models.task import Task
-    from app.models.agent_phone import AgentPhone
-
-    # Tickets and notes are keyed by chat_id (MongoDB integer ID) — delete any linked to this phone's chats
-    # We can't easily resolve these without querying MongoDB, so we null them out rather than cascade-delete
-    db.execute(delete(ScheduledMessage).where(ScheduledMessage.phone_id == phone_id))
-
-    job_ids = [r[0] for r in db.query(BulkMessageJob.id).filter(BulkMessageJob.phone_id == phone_id).all()]
-    if job_ids:
-        db.execute(delete(BulkMessageLog).where(BulkMessageLog.job_id.in_(job_ids)))
-        db.execute(delete(BulkMessageJob).where(BulkMessageJob.phone_id == phone_id))
-
-    db.execute(delete(AgentPhone).where(AgentPhone.phone_id == phone_id))
+    # Clean up all MySQL rows that FK-reference this phone (scheduled, bulk, agent, legacy chats)
+    _delete_phone_relations(db, phone_id)
+    db.flush()
     db.delete(phone)
     db.commit()

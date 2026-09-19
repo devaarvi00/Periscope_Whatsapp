@@ -119,9 +119,8 @@ const Api = (() => {
   // Phones
   const phones = {
     list:       ()       => get('/phones'),
-    create:     (b)      => post('/phones', b),
     update:     (id, b)  => req('PATCH', `/phones/${id}`, b),
-    connect:    ()       => post('/phones/connect', {}),
+    connect:    (name)   => post('/phones/connect', name ? { name } : {}),
     syncNumber: (id)     => post(`/phones/${id}/sync-number`, {}),
     status:     (id)     => get(`/phones/${id}/status`),
     qr:         (id)     => get(`/phones/${id}/qr`),

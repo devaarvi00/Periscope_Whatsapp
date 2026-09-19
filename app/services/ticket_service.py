@@ -65,9 +65,3 @@ class TicketService:
         self.db.commit()
         return True
 
-    def count_by_status(self) -> dict[str, int]:
-        rows = self.db.query(Ticket.status, Ticket.id).all()
-        result: dict[str, int] = {}
-        for status, _ in rows:
-            result[status] = result.get(status, 0) + 1
-        return result

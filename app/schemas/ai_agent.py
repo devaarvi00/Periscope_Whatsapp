@@ -72,15 +72,6 @@ class NoteCreate(BaseModel):
     content: str
 
 
-class NoteOut(BaseModel):
-    id: int
-    chat_id: int
-    agent_id: int
-    content: str
-
-    model_config = {"from_attributes": True}
-
-
 class BulkJobCreate(BaseModel):
     name: str
     message: str

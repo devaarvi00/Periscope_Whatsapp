@@ -23,10 +23,6 @@ ACTION_TYPES = [
     "remove_label", "flag_chat", "archive_chat", "activate_ai", "send_note", "escalate",
 ]
 
-_OPERATORS = ("contains", "not_contains", "equals", "not_equals",
-              "starts_with", "ends_with", "regex", "in")
-
-
 async def fire_trigger(trigger_type: str, context: dict[str, Any]) -> None:
     from app.db.session import SessionLocal
     db = SessionLocal()

@@ -169,10 +169,6 @@ class WAHAService:
 
     # ── Groups ────────────────────────────────────────────────────────────────
 
-    async def get_group_participants(self, group_id: str) -> list[dict[str, Any]]:
-        raw, _ = await self.get_group_participants_with_status(group_id)
-        return raw
-
     async def get_group_participants_with_status(self, group_id: str) -> tuple[list[dict[str, Any]], bool]:
         """Returns (participants_list, api_available). api_available=False when WAHA returned an error."""
         from app.core.http_client import get_http_client

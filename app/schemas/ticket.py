@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 class TicketCreate(BaseModel):
     chat_id: int
-    message_id: int | None = None
+    message_wid: str | None = None
     title: str
     description: str = ""
     status: str = "open"
@@ -26,7 +26,7 @@ class TicketUpdate(BaseModel):
 class TicketOut(BaseModel):
     id: int
     chat_id: int
-    message_id: int | None
+    message_wid: str | None
     title: str
     description: str
     status: str
