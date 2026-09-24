@@ -5,10 +5,22 @@ from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.schemas.ai_agent import AutomationRuleCreate, AutomationRuleOut
+from app.services.access import require_admin
 from app.services.activity_service import log_activity
-from app.services.automation_service import ACTION_TYPES, TRIGGER_TYPES, AutomationService
+from app.services.automation_service import (
+    ACTION_TYPES, TRIGGER_TYPES, AutomationService, validate_rule_definition,
+)
 
 router = APIRouter(prefix="/automation", tags=["automation"])
+
+
+def _validate(req: AutomationRuleCreate) -> None:
+    if req.trigger_type not in TRIGGER_TYPES:
+        raise HTTPException(400, f"trigger_type must be one of {TRIGGER_TYPES}")
+    try:
+        validate_rule_definition(req.criteria, req.actions)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @router.get("/action-types")
@@ -33,7 +45,9 @@ def create_rule(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    rule = AutomationService(db).create_rule(**req.model_dump())
+    require_admin(agent, "Only admins can create automation rules")
+    _validate(req)
+    rule = AutomationService(db).create_rule(**req.model_dump(), created_by=agent.id)
     log_activity(
         db, "automation_rule_created", entity_type="automation_rule", entity_id=rule.id,
         agent_id=agent.id, description=f"Rule '{rule.name}' created ({rule.trigger_type})",
@@ -48,6 +62,8 @@ def update_rule(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
+    require_admin(agent, "Only admins can edit automation rules")
+    _validate(req)
     rule = AutomationService(db).update_rule(rule_id, **req.model_dump())
     if not rule:
         raise HTTPException(404, "Rule not found")
@@ -64,6 +80,7 @@ def delete_rule(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
+    require_admin(agent, "Only admins can delete automation rules")
     if not AutomationService(db).delete_rule(rule_id):
         raise HTTPException(404, "Rule not found")
     log_activity(

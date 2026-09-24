@@ -1,6 +1,9 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# Hex colour (#rgb, #rgba, #rrggbb, #rrggbbaa) — rendered straight into CSS
+LABEL_COLOR_PATTERN = r"^#[0-9a-fA-F]{3,8}$"
 
 
 class KnowledgeItemCreate(BaseModel):
@@ -55,8 +58,8 @@ class QuickReplyOut(BaseModel):
 
 
 class LabelCreate(BaseModel):
-    name: str
-    color: str = "#0D8C7C"
+    name: str = Field(min_length=1, max_length=100)
+    color: str = Field("#0D8C7C", pattern=LABEL_COLOR_PATTERN)
 
 
 class LabelOut(BaseModel):
