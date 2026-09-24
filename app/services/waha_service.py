@@ -276,14 +276,85 @@ class WAHAService:
 
     async def get_group_info(self, group_id: str) -> dict[str, Any]:
         from app.core.http_client import get_http_client
-        url = f"{self.base}/api/{self.session}/groups/{group_id}"
+        url = f"{self.base}/api/{self.session}/groups/{self._gid(group_id)}"
         try:
             resp = await get_http_client().get(url, headers=self._headers)
             if resp.is_success:
-                return resp.json()
+                data = resp.json()
+                return data if isinstance(data, dict) else {}
         except Exception as exc:
             logger.warning("WAHA get_group_info error: %s", exc)
         return {}
+
+    async def get_group_participants_v2(self, group_id: str) -> list[dict[str, Any]] | None:
+        """`[{id, pn, role}]` — role is participant/admin/superadmin and `pn`
+        carries the phone number even in LID-addressed groups. None on error."""
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/groups/{self._gid(group_id)}/participants/v2"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                data = resp.json()
+                return data if isinstance(data, list) else None
+            logger.warning("WAHA participants/v2 returned %s for %s", resp.status_code, group_id)
+        except Exception as exc:
+            logger.warning("WAHA participants/v2 error: %s", exc)
+        return None
+
+    async def get_contact_picture(self, contact_id: str) -> str | None:
+        """Profile picture URL of any contact (WhatsApp CDN), None when hidden."""
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/contacts/profile-picture"
+        try:
+            resp = await get_http_client().get(
+                url, headers=self._headers,
+                params={"contactId": contact_id, "session": self.session},
+            )
+            if resp.is_success:
+                data = resp.json()
+                return (data or {}).get("profilePictureURL") if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.warning("WAHA get_contact_picture error: %s", exc)
+        return None
+
+    # Group administration — each raises WAHAError when WhatsApp refuses
+    # (e.g. our number is not an admin of the group).
+    _PARTICIPANT_ACTIONS = {
+        "add": "participants/add", "remove": "participants/remove",
+        "promote": "admin/promote", "demote": "admin/demote",
+    }
+
+    async def group_participants_action(self, group_id: str, action: str, ids: list[str]) -> dict[str, Any]:
+        path = self._PARTICIPANT_ACTIONS[action]
+        res = await self._request(
+            "POST", f"/api/{self.session}/groups/{self._gid(group_id)}/{path}",
+            {"participants": [{"id": i} for i in ids]},
+        )
+        return res if isinstance(res, dict) else {"result": res}
+
+    async def get_group_invite_code(self, group_id: str) -> str:
+        res = await self._request("GET", f"/api/{self.session}/groups/{self._gid(group_id)}/invite-code")
+        if isinstance(res, dict):
+            res = res.get("code") or res.get("inviteCode") or ""
+        return str(res or "").strip().strip('"')
+
+    async def set_group_subject(self, group_id: str, subject: str) -> None:
+        await self._request("PUT", f"/api/{self.session}/groups/{self._gid(group_id)}/subject", {"subject": subject})
+
+    async def set_group_description(self, group_id: str, description: str) -> None:
+        await self._request("PUT", f"/api/{self.session}/groups/{self._gid(group_id)}/description",
+                            {"description": description})
+
+    async def set_group_admin_only(self, group_id: str, setting: str, admins_only: bool) -> None:
+        """setting: 'messages' (who can send) or 'info' (who can edit group info)."""
+        path = {"messages": "messages-admin-only", "info": "info-admin-only"}[setting]
+        await self._request("PUT", f"/api/{self.session}/groups/{self._gid(group_id)}/settings/security/{path}",
+                            {"adminsOnly": bool(admins_only)})
+
+    @staticmethod
+    def _gid(group_id: str) -> str:
+        from urllib.parse import quote
+        return quote(group_id, safe="@.")
 
     # ── Sending ────────────────────────────────────────────────────────────────
 
@@ -371,6 +442,35 @@ class WAHAService:
             await self._post("/api/stopTyping", payload)
         except Exception:
             pass
+
+    async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        """JSON request that raises WAHAError on failure; returns the parsed body."""
+        from app.core.http_client import get_http_client
+        try:
+            resp = await get_http_client().request(
+                method, f"{self.base}{path}", headers=self._headers,
+                json=payload if payload is not None else None,
+            )
+        except httpx.TimeoutException as exc:
+            raise WAHAError("TIMEOUT", "WhatsApp API timed out") from exc
+        except httpx.HTTPError as exc:
+            raise WAHAError("TRANSPORT", "WhatsApp API unreachable") from exc
+        if resp.status_code == 401:
+            raise WAHAError("AUTH", "WhatsApp API auth failed", 401)
+        if not resp.is_success:
+            detail = ""
+            try:
+                body = resp.json()
+                detail = str(body.get("message") or body.get("error") or "") if isinstance(body, dict) else ""
+            except Exception:
+                detail = resp.text[:200]
+            raise WAHAError("API_ERROR", detail[:200] or f"WhatsApp API error {resp.status_code}", resp.status_code)
+        if not resp.content:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return resp.text
 
     async def _post(self, path: str, payload: dict[str, Any]) -> SendResult:
         from app.core.http_client import get_http_client
