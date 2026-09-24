@@ -1028,6 +1028,7 @@ function handleWSEvent(data) {
     const ph = State.phones.find(p => p.id === d.phone_id);
     if (ph) ph.waha_status = d.status;
     updatePhoneBadge();
+    if (State.currentView === 'dashboard') _dashSetPhoneStatus(d.phone_id, d.status);
     // If phone became WORKING and we're on inbox, reload chats
     if (d.status === 'WORKING' && State.currentView === 'inbox') {
       _chatAutoSynced = false;
@@ -1071,33 +1072,28 @@ function updatePhoneBadge() {
   const badge = document.getElementById('topbar-phone-count');
   const num = document.getElementById('topbar-phone-num');
   const total = document.getElementById('topbar-phone-total');
-  const dot = badge ? badge.querySelector('.phone-dot') : null;
-  if (badge && num) {
-    const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
-    num.textContent = working;
-    if (total) total.textContent = State.phones.length;
-    badge.style.display = State.phones.length ? 'flex' : 'none';
-    if (dot) {
-      const totalCount = State.phones.length;
-      if (working === 0) {
-        dot.style.background = '#ef4444';
-        badge.style.background = '#fef2f2';
-        badge.style.borderColor = '#fecaca';
-        badge.style.color = '#991b1b';
-      } else if (working < totalCount) {
-        dot.style.background = '#f59e0b';
-        badge.style.background = '#fffbeb';
-        badge.style.borderColor = '#fde68a';
-        badge.style.color = '#92400e';
-      } else {
-        dot.style.background = '#10b981';
-        badge.style.background = '#f0fdf4';
-        badge.style.borderColor = '#bbf7d0';
-        badge.style.color = '#166534';
-      }
-    }
-  }
+  if (!badge || !num) return;
+  const totalCount = State.phones.length;
+  const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
+  num.textContent = working;
+  if (total) total.textContent = totalCount;
+  badge.style.display = State.agent ? 'flex' : 'none';
+  // Colour lives in CSS (dashboard.css) so the dark theme applies
+  badge.classList.toggle('state-none', working === 0);
+  badge.classList.toggle('state-partial', working > 0 && working < totalCount);
+  badge.classList.toggle('state-ok', totalCount > 0 && working === totalCount);
+  badge.title = `${working} of ${totalCount} phone${totalCount === 1 ? '' : 's'} connected — manage in Settings`;
 }
+
+// ── Topbar actions (home, refresh, help, phones badge) ────────── //
+document.getElementById('topbar-home')?.addEventListener('click', () => navigateTo('dashboard'));
+document.getElementById('topbar-refresh')?.addEventListener('click', () => {
+  loadPhones();
+  navigateTo(State.currentView || 'dashboard');
+});
+document.getElementById('topbar-help')?.addEventListener('click', () => showHelpModal());
+document.getElementById('topbar-phone-count')?.addEventListener('click', () => navigateTo('settings'));
+
 async function loadPhones() {
   try {
     State.phones = await Api.phones.list();
@@ -4318,6 +4314,16 @@ async function loadSettingsTab(tab) {
 
 
 // ── DASHBOARD VIEW ──────────────────────────────────────────────── //
+// Show/hide the dashboard connection panel (QR / status) for one phone
+function _dashShowPanel(phoneId, show) {
+  const panel = document.getElementById('dash-waha-panel');
+  if (!panel) return;
+  panel.hidden = !show;
+  const title = document.getElementById('dash-waha-title');
+  const ph = State.phones.find(p => p.id === phoneId);
+  if (title) title.textContent = ph ? ph.name : 'WhatsApp';
+}
+
 function _stopDashWahaPoller() {
   if (_dashWahaTimer) { clearInterval(_dashWahaTimer); _dashWahaTimer = null; }
 }
@@ -4346,25 +4352,17 @@ async function _updateDashWaha(phoneId) {
       status = (r.status || 'UNKNOWN').toUpperCase();
     } catch(_) { status = 'UNKNOWN'; }
 
+    _dashSetPhoneStatus(phoneId, status);
+    _dashShowPanel(phoneId, status !== 'WORKING');
+
     if (status === 'WORKING') {
-      if (_dashWahaPrevStatus !== 'WORKING') {
-        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem">
-          <div style="width:64px;height:64px;border-radius:50%;background:#dcfce7;display:flex;align-items:center;justify-content:center">
-            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#15803d" stroke-width="2.2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-          </div>
-          <span style="font-size:12px;font-weight:600;color:#15803d;background:#dcfce7;padding:.25rem .75rem;border-radius:20px">Connected</span>
-        </div>`;
-        label.innerHTML = `<strong style="font-size:13px">WhatsApp</strong><br><span style="font-size:11px;color:var(--text-3)">Session active</span>`;
-        actions.innerHTML = isAdmin() ? `
-          <button class="btn btn-danger btn-sm" id="dash-btn-stop">Disconnect</button>
-          <button class="btn btn-primary btn-sm" id="dash-btn-restart">Restart</button>` : '';
-        _bindDashWahaButtons(phoneId);
-      }
+      // Connected: the phone card already shows it, so the panel is hidden
+      if (_dashWahaPrevStatus !== 'WORKING') { box.innerHTML = ''; label.innerHTML = ''; actions.innerHTML = ''; }
 
     } else if (status === 'SCAN_QR_CODE') {
       if (_dashWahaPrevStatus !== 'SCAN_QR_CODE') {
         box.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%">
-          <div style="width:28px;height:28px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+          <div style="width:28px;height:28px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
         </div>`;
         label.innerHTML = `Loading QR code…`;
         actions.innerHTML = isAdmin() ? `<button class="btn btn-secondary btn-sm" id="dash-btn-restart">Reconnect</button>` : '';
@@ -4383,7 +4381,7 @@ async function _updateDashWaha(phoneId) {
     } else if (status === 'STARTING') {
       if (_dashWahaPrevStatus !== 'STARTING') {
         box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.75rem;padding:1.5rem 0">
-          <div style="width:40px;height:40px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+          <div style="width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
           <span style="font-size:12px;color:var(--text-3)">Connecting…</span>
         </div>`;
         label.innerHTML = `Starting WhatsApp session`;
@@ -4393,10 +4391,10 @@ async function _updateDashWaha(phoneId) {
     } else if (status === 'STOPPED') {
       if (_dashWahaPrevStatus !== 'STOPPED') {
         box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
-          <div style="width:64px;height:64px;border-radius:50%;background:#fee2e2;display:flex;align-items:center;justify-content:center">
+          <div style="width:64px;height:64px;border-radius:50%;background:var(--danger-bg);display:flex;align-items:center;justify-content:center">
             <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
           </div>
-          <span style="font-size:12px;font-weight:600;color:#dc2626;background:#fee2e2;padding:.25rem .75rem;border-radius:20px">Disconnected</span>
+          <span style="font-size:12px;font-weight:600;color:#dc2626;background:var(--danger-bg);padding:.25rem .75rem;border-radius:20px">Disconnected</span>
         </div>`;
         label.innerHTML = `Session is stopped`;
         actions.innerHTML = isAdmin() ? `<button class="btn btn-primary btn-sm" id="dash-btn-start">Scan QR to Connect</button>` : '';
@@ -4406,8 +4404,8 @@ async function _updateDashWaha(phoneId) {
     } else {
       if (_dashWahaPrevStatus !== status) {
         box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
-          <div style="width:64px;height:64px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center">
-            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <div style="width:64px;height:64px;border-radius:50%;background:var(--surface-3);display:flex;align-items:center;justify-content:center">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
           </div>
           <span style="font-size:12px;color:var(--text-3)">${esc(status)}</span>
         </div>`;
@@ -4427,7 +4425,8 @@ async function _dashShowQR(phoneId) {
   const box = document.getElementById('dash-waha-box');
   const lbl = document.getElementById('dash-waha-label');
   const act = document.getElementById('dash-waha-actions');
-  if (box) box.innerHTML = `<div style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>`;
+  _dashShowPanel(phoneId, true);
+  if (box) box.innerHTML = `<div style="width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>`;
   if (lbl) lbl.innerHTML = 'Clearing session…';
   if (act) act.innerHTML = '';
 
@@ -4460,6 +4459,7 @@ async function _dashShowQR(phoneId) {
         try { await Api.inbox.sync(phoneId); } catch(_) {}
         await loadPhones();
         if (State.currentView === 'inbox') loadChats();
+        _dashRenderPhoneCards(State.phones);
         _dashWahaPrevStatus = '';
         _startDashWahaPoller(phoneId);
         return;
@@ -4529,167 +4529,350 @@ function _startDashWahaPoller(phoneId) {
 
 async function renderDashboard() {
   _stopDashWahaPoller();
+  _stopDashQrPoll();
   const main = document.getElementById('main-content');
+  if (!State.org) await loadOrg();
+  const org = State.org || { name: 'Hyperscope', uid: '' };
+  const admin = isAdmin();
 
-  const cards = [
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`, title: 'Bulk Messages', desc: 'Send personalized broadcast messages to multiple contacts at once.', action: 'bulk', label: 'Send Now' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>`, title: 'Manage Team', desc: 'Invite agents and assign roles to manage customer conversations.', action: 'settings', label: 'Invite Agents' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`, title: 'WhatsApp', desc: 'Connect your WhatsApp via QR code to start receiving messages.', action: 'settings', label: 'Connect' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>`, title: 'Manage Tickets', desc: 'Track and resolve customer support tickets from your inbox.', action: 'tickets', label: 'View Tickets' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>`, title: 'AI Agent', desc: 'Set up your Gemini AI agent to auto-handle conversations.', action: 'ai-agent', label: 'Configure AI' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`, title: 'Automation Rules', desc: 'Create rules to auto-assign, label and respond to messages.', action: 'automation', label: 'Create Rule' },
-  ];
-
-  const wsName = 'Hyperscope';
   main.innerHTML = `
-  <div class="dashboard-wrap" style="overflow-y:auto">
-    <div class="dashboard-inner" style="max-width:1240px">
-
-      <div class="dash-workspace">
-        <div class="ws-logo">H</div>
-        <div>
-          <h2>${wsName}</h2>
-          <div class="ws-sub">${esc(State.agent?.email || 'workspace')}</div>
+  <div class="dsh-wrap">
+    <div class="dsh-inner">
+      <header class="dsh-head">
+        <div class="dsh-ws-avatar" aria-hidden="true">${esc(wsInitial(org.name))}</div>
+        <div class="dsh-ws-meta">
+          <h1 class="dsh-ws-name">${esc(org.name)}</h1>
+          ${org.uid ? `<button class="dsh-ws-uid" id="dsh-ws-uid" title="Copy workspace ID">${esc(org.uid)}</button>` : ''}
         </div>
+      </header>
+
+      <div class="dsh-grid">
+        <div class="dsh-main">
+          <div class="dsh-stats">
+            <div class="dsh-card dsh-stat">
+              <div class="dsh-stat-label">${_DSH_ICONS.chat}All chats</div>
+              <div class="dsh-stat-num" id="ds-total">—</div>
+            </div>
+            <div class="dsh-card dsh-stat">
+              <div class="dsh-stat-label">${_DSH_ICONS.unread}Unread chats</div>
+              <div class="dsh-stat-num" id="ds-unread">—</div>
+            </div>
+            <div class="dsh-card dsh-stat dsh-stat-flagged">
+              <div class="dsh-stat-label">${_DSH_ICONS.flag}Flagged chats</div>
+              <div class="dsh-stat-num" id="ds-flagged">—</div>
+            </div>
+          </div>
+
+          <div class="dsh-duo">
+            <section class="dsh-card dsh-panel">
+              <div class="dsh-panel-head">${_DSH_ICONS.team}Team</div>
+              <div class="dsh-panel-body">
+                <div class="dsh-muted" id="ds-online">—</div>
+                <div class="dsh-avatars" id="ds-team-avatars"></div>
+              </div>
+            </section>
+            <section class="dsh-card dsh-panel">
+              <div class="dsh-panel-head">${_DSH_ICONS.ticket}Tickets</div>
+              <div class="dsh-panel-body dsh-ticket-cols">
+                <button class="dsh-ticket-col" data-dsh-go="tickets">
+                  <span class="dsh-ticket-label"><span class="dsh-ring" aria-hidden="true"></span>Open</span>
+                  <span class="dsh-ticket-num" id="ds-tickets">—</span>
+                </button>
+                <button class="dsh-ticket-col" data-dsh-go="tickets">
+                  <span class="dsh-ticket-label">${_DSH_ICONS.userCircle}Assigned to me</span>
+                  <span class="dsh-ticket-num" id="ds-tickets-mine">—</span>
+                </button>
+              </div>
+            </section>
+          </div>
+
+          <h2 class="dsh-section-title">Quick links</h2>
+          <div class="dsh-links">
+            ${_dashQuickLinks().map((l, i) => `
+              <div class="dsh-link">
+                <button class="dsh-link-title" data-dsh-link="${i}" data-dsh-act="0" ${l.actions[0].disabled ? 'disabled' : ''}>
+                  ${l.icon}<span>${esc(l.title)}</span>${_DSH_ICONS.arrow}
+                </button>
+                <p>${esc(l.desc)}</p>
+                <div class="dsh-link-actions">
+                  ${l.actions.map((a, j) => `<button class="dsh-btn" data-dsh-link="${i}" data-dsh-act="${j}"
+                      ${a.disabled ? `disabled title="${esc(a.why || 'Not available')}"` : ''}>${esc(a.label)}</button>`).join('')}
+                </div>
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <aside class="dsh-side">
+          <div class="dsh-side-head">
+            <h2 class="dsh-section-title">Phone status</h2>
+            ${admin ? `<button class="dsh-btn" id="dsh-add-phone">Add phone ${_DSH_ICONS.phone}</button>` : ''}
+          </div>
+          <div class="dsh-phones" id="dash-phone-cards">
+            <div class="dsh-card dsh-phone dsh-muted">Loading phones…</div>
+          </div>
+          <div class="dsh-card dsh-connect" id="dash-waha-panel" hidden>
+            <div class="dsh-connect-title" id="dash-waha-title"></div>
+            <div class="gs-qr-box dsh-qr" id="dash-waha-box"></div>
+            <div class="dsh-connect-label" id="dash-waha-label"></div>
+            <div class="dsh-connect-actions" id="dash-waha-actions"></div>
+          </div>
+        </aside>
       </div>
-
-      <div class="dash-grid">
-        <div class="dash-main">
-
-          <div class="stat-cards">
-            <div class="stat-card">
-              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>All chats</div>
-              <div class="sc-num" id="ds-total">—</div>
-            </div>
-            <div class="stat-card">
-              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Unread chats</div>
-              <div class="sc-num" id="ds-unread">—</div>
-            </div>
-            <div class="stat-card flagged">
-              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Flagged chats</div>
-              <div class="sc-num" id="ds-flagged">—</div>
-            </div>
-          </div>
-
-          <div class="dash-duo">
-            <div class="dash-panel">
-              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Team</div>
-              <div class="dp-body">
-                <div style="font-size:12.5px;color:var(--text-2);margin-bottom:.5rem"><span id="ds-online">—</span> online</div>
-                <div id="ds-team-avatars" style="display:flex;gap:.35rem"></div>
-              </div>
-            </div>
-            <div class="dash-panel">
-              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2z"/></svg>Tickets</div>
-              <div class="dp-body" style="display:flex;gap:2.5rem">
-                <div>
-                  <div style="font-size:12.5px;color:var(--text-3);display:flex;align-items:center;gap:.35rem"><span style="width:8px;height:8px;border-radius:50%;border:2px solid var(--danger);display:inline-block"></span>Open</div>
-                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets">—</div>
-                </div>
-                <div>
-                  <div style="font-size:12.5px;color:var(--text-3)">Assigned to me</div>
-                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-mine">—</div>
-                </div>
-                <div>
-                  <div style="font-size:12.5px;color:var(--text-3)">In progress</div>
-                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-prog">—</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="quick-links-title">Quick links</div>
-          <div class="quick-links">
-            ${cards.map(c => `<div class="ql-card">
-              <h3>${c.icon} ${c.title}</h3>
-              <p>${c.desc}</p>
-              <div class="ql-actions">
-                <button class="btn btn-secondary btn-sm" onclick="switchView('${c.action}')">${c.label}</button>
-              </div>
-            </div>`).join('')}
-          </div>
-
-        </div>
-
-        <div class="dash-side">
-          <div class="phone-status-head">
-            <h3>WhatsApp</h3>
-          </div>
-          <div id="dash-phone-cards"></div>
-          <div class="dash-panel" style="margin-top:.4rem">
-            <div class="dp-body" style="display:flex;flex-direction:column;align-items:center;gap:.5rem">
-              <div class="gs-qr-box" id="dash-waha-box" style="display:flex;align-items:center;justify-content:center;">
-                <div class="waha-spinner" style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
-              </div>
-              <div class="gs-qr-label" id="dash-waha-label" style="font-size:12px;color:var(--text-3)">Checking connection…</div>
-              <div class="gs-qr-actions" id="dash-waha-actions" style="display:flex;gap:.5rem;justify-content:center"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
     </div>
   </div>`;
 
-  // Load quick stats asynchronously
-  try {
-    const phones = State.phones.length ? State.phones : await Api.phones.list().catch(() => []);
-    const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+  _bindDashboard();
 
-    const [dash, tkt, agents] = await Promise.all([
-      Api.analytics.dashboard(),
-      Api.analytics.tickets(),
-      Api.auth.agents().catch(() => []),
-    ]);
-    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-    // Only show real chat counts when WhatsApp is connected
-    set('ds-total', phoneConnected ? (dash.total_chats ?? 0) : 0);
-    set('ds-unread', phoneConnected ? (dash.unread_chats ?? 0) : 0);
-    set('ds-flagged', phoneConnected ? (dash.flagged_chats ?? 0) : 0);
-    set('ds-tickets', tkt.open ?? 0);
-    set('ds-tickets-prog', tkt.in_progress ?? 0);
-    set('ds-tickets-mine', '-');
-    set('ds-online', `${dash.online_agents ?? agents.length} of ${agents.length || (dash.online_agents ?? 0)}`);
-    const avEl = document.getElementById('ds-team-avatars');
-    if (avEl) avEl.innerHTML = agents.slice(0, 8).map(a =>
-      `<div class="agent-avatar" title="${esc(a.name)}" style="background:${avatarColor(a.name)};width:28px;height:28px;font-size:11px">${initials(a.name)}</div>`
-    ).join('');
-    try {
-      const mine = await Api.tickets.list({ assigned_to: State.agent?.id, status: 'open' });
-      set('ds-tickets-mine', mine.length);
-    } catch(_) {}
+  let sum;
+  try { sum = await Api.analytics.summary(); }
+  catch (e) { toast(e.message || 'Could not load dashboard', 'error'); return; }
+  if (State.currentView !== 'dashboard' || !document.getElementById('ds-total')) return;
 
-  } catch(_) {}
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  const phones = sum.phones || [];
+  // Match the inbox: chats are hidden while no number is connected
+  const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+  set('ds-total', phoneConnected ? (sum.chats?.total ?? 0) : 0);
+  set('ds-unread', phoneConnected ? (sum.chats?.unread ?? 0) : 0);
+  set('ds-flagged', phoneConnected ? (sum.chats?.flagged ?? 0) : 0);
+  set('ds-tickets', sum.tickets?.open ?? 0);
+  set('ds-tickets-mine', sum.tickets?.assigned_to_me ?? 0);
 
-  // Phone status cards + live WAHA poller
-  try {
-    const phones = await Api.phones.list();
-    const cardsEl = document.getElementById('dash-phone-cards');
-    if (cardsEl) cardsEl.innerHTML = phones.map(p => {
-      const ok = p.waha_status === 'WORKING';
-      return `<div class="phone-card">
-        <div class="pc-avatar" style="background:${ok?'#dcfce7':'#f3f4f6'};color:${ok?'#15803d':'#6b7280'}">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
-        </div>
-        <div class="pc-meta">
-          <div class="pc-number">WhatsApp</div>
-        </div>
-        <div class="pc-status ${ok ? 'connected' : 'offline'}"><span class="dot"></span>${ok ? 'Connected' : esc(p.waha_status || 'Offline')}</div>
-        <button class="pc-menu-btn" title="Manage in Settings" onclick="switchView('settings')">⋯</button>
-      </div>`;
-    }).join('') || '';
+  const online = sum.team?.online || [];
+  set('ds-online', `${online.length} of ${sum.team?.total ?? 0} online`);
+  const avEl = document.getElementById('ds-team-avatars');
+  if (avEl) avEl.innerHTML = online.slice(0, 12).map(a => `
+    <span class="dsh-avatar" title="${esc(a.name)}" style="background:${esc(a.avatar_color || avatarColor(a.name))}">
+      ${esc(initials(a.name))}<span class="dsh-online-dot" aria-label="online"></span>
+    </span>`).join('') + (online.length > 12 ? `<span class="dsh-muted">+${online.length - 12}</span>` : '');
 
-    if (phones && phones.length > 0) {
-      _startDashWahaPoller(phones[0].id);
-    } else {
-      const box = document.getElementById('dash-waha-box');
-      const lbl = document.getElementById('dash-waha-label');
-      const act = document.getElementById('dash-waha-actions');
-      if (box) box.innerHTML = `<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="7" y="7" width="3" height="3" fill="#d1d5db" stroke="none"/><rect x="14" y="14" width="3" height="3" fill="#d1d5db" stroke="none"/></svg>`;
-      if (lbl) lbl.innerHTML = `Scan QR to connect WhatsApp`;
-      if (act) act.innerHTML = `<button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect WhatsApp</button>`;
+  State.phones = phones;
+  updatePhoneBadge();
+  _dashRenderPhoneCards(phones);
+
+  // Live connection panel for the first number that needs attention
+  const target = phones.find(p => p.waha_status !== 'WORKING') || phones[0];
+  if (target) _startDashWahaPoller(target.id);
+}
+
+const _DSH_ICONS = {
+  chat:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`,
+  unread: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12v3a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h9"/><circle cx="19" cy="5" r="3"/></svg>`,
+  flag:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`,
+  team:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+  ticket: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2z"/></svg>`,
+  userCircle: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M6.17 18.34a7 7 0 0 1 11.66 0"/></svg>`,
+  arrow:  `<svg class="dsh-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg>`,
+  phone:  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`,
+  send:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`,
+  plug:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22v-5"/><path d="M9 8V2M15 8V2"/><path d="M18 8v5a6 6 0 0 1-12 0V8z"/></svg>`,
+  code:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>`,
+  more:   `<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>`,
+};
+
+// Navigate to a view and, once it has rendered, click one of its buttons
+function _dashGo(view, clickId) {
+  navigateTo(view);
+  if (!clickId) return;
+  const started = Date.now();
+  (function waitFor() {
+    const b = document.getElementById(clickId);
+    if (b) return b.click();
+    if (State.currentView === view && Date.now() - started < 5000) setTimeout(waitFor, 100);
+  })();
+}
+
+function _dashGoSettings(tab) {
+  navigateTo('settings');
+  if (tab && tab !== 'phones') document.querySelector(`#settings-tabs .tab[data-tab="${tab}"]`)?.click();
+}
+
+function _dashAddPhone() {
+  if (!isAdmin()) return toast('Only admins can add phones', 'error');
+  // The add-phone modal continues into Settings → WhatsApp to show the QR
+  navigateTo('settings');
+  showAddPhoneModal();
+}
+
+function _dashQuickLinks() {
+  const admin = isAdmin();
+  const adminOnly = 'Only admins can do this';
+  return [
+    { icon: _DSH_ICONS.send, title: 'Bulk messages',
+      desc: 'Send personalised broadcasts to many contacts at once and track delivery.',
+      actions: [{ label: 'Open', fn: () => _dashGo('bulk') },
+                { label: 'New campaign', fn: () => _dashGo('bulk', 'new-bulk-btn') }] },
+    { icon: _DSH_ICONS.team, title: 'Manage team',
+      desc: 'Invite agents, set roles and choose which numbers each agent can use.',
+      actions: [{ label: 'Open', fn: () => _dashGoSettings('agents') },
+                { label: 'Invite', fn: openInviteTeam, disabled: !admin, why: adminOnly }] },
+    { icon: _DSH_ICONS.phone, title: 'Add phones',
+      desc: 'Connect more WhatsApp numbers and manage their sessions.',
+      actions: [{ label: 'Open', fn: () => _dashGoSettings('phones') },
+                { label: 'Add phone', fn: _dashAddPhone, disabled: !admin, why: adminOnly }] },
+    { icon: _DSH_ICONS.ticket, title: 'Manage tickets',
+      desc: 'Track customer issues raised from chats through to resolution.',
+      actions: [{ label: 'Open', fn: () => _dashGo('tickets') },
+                { label: 'New ticket', fn: () => _dashGo('tickets', 'new-ticket-btn') }] },
+    { icon: _DSH_ICONS.plug, title: 'Integrate your tools',
+      desc: 'Let the AI agent answer chats and automate routing with rules.',
+      actions: [{ label: 'AI agent', fn: () => _dashGo('ai-agent') },
+                { label: 'Automation', fn: () => _dashGo('automation') }] },
+    { icon: _DSH_ICONS.code, title: 'APIs & Webhooks',
+      desc: 'Programmatic access with API keys and outbound webhooks via the developer API.',
+      actions: [{ label: 'API keys', disabled: true, why: 'Not available in the app yet' },
+                { label: 'Webhooks', disabled: true, why: 'Not available in the app yet' }] },
+  ];
+}
+
+function _bindDashboard() {
+  const root = document.querySelector('.dsh-wrap');
+  if (!root) return;
+  const links = _dashQuickLinks();
+  root.addEventListener('click', e => {
+    const linkBtn = e.target.closest('[data-dsh-link]');
+    if (linkBtn && !linkBtn.disabled) {
+      const a = links[+linkBtn.dataset.dshLink]?.actions[+linkBtn.dataset.dshAct];
+      if (a && !a.disabled && a.fn) a.fn();
+      return;
     }
-  } catch(_) {}
+    const go = e.target.closest('[data-dsh-go]');
+    if (go) return navigateTo(go.dataset.dshGo);
+  });
+  document.getElementById('dsh-add-phone')?.addEventListener('click', _dashAddPhone);
+  document.getElementById('dsh-ws-uid')?.addEventListener('click', async () => {
+    const uid = State.org?.uid;
+    if (!uid) return;
+    try { await navigator.clipboard.writeText(uid); toast('Workspace ID copied', 'success'); }
+    catch (_) { toast(uid); }
+  });
+}
+
+// "919510715498" → "+91 95107 15498"
+function _dashFmtPhone(num) {
+  const d = String(num || '').replace(/\D/g, '');
+  if (!d || String(num).startsWith('pending')) return '';
+  if (d.length === 12 && d.startsWith('91')) return `+91 ${d.slice(2, 7)} ${d.slice(7)}`;
+  if (d.length === 11 && d.startsWith('1')) return `+1 ${d.slice(1, 4)} ${d.slice(4, 7)} ${d.slice(7)}`;
+  return '+' + d;
+}
+
+function _dashStatusInfo(status) {
+  const s = String(status || '').toUpperCase();
+  if (s === 'WORKING') return { cls: 'ok', label: 'Connected' };
+  if (s === 'STARTING') return { cls: 'wait', label: 'Connecting' };
+  if (s === 'SCAN_QR_CODE') return { cls: 'wait', label: 'Waiting for QR scan' };
+  return { cls: 'off', label: 'Disconnected' };
+}
+
+function _dashRenderPhoneCards(phones) {
+  const el = document.getElementById('dash-phone-cards');
+  if (!el) return;
+  const admin = isAdmin();
+  if (!phones.length) {
+    el.innerHTML = `<div class="dsh-card dsh-phone dsh-phone-empty">
+      <span class="dsh-muted">No WhatsApp number connected yet.</span>
+      ${admin ? `<button class="dsh-btn" id="dsh-empty-add">Add phone</button>` : ''}
+    </div>`;
+    document.getElementById('dsh-empty-add')?.addEventListener('click', _dashAddPhone);
+    return;
+  }
+  el.innerHTML = phones.map(p => {
+    const st = _dashStatusInfo(p.waha_status);
+    const number = _dashFmtPhone(p.phone_number);
+    return `<div class="dsh-card dsh-phone" data-pid="${p.id}">
+      <div class="dsh-phone-avatar" style="background:${avatarColor(p.name)}">${esc(initials(p.name))}</div>
+      <div class="dsh-phone-meta">
+        <div class="dsh-phone-num">${number ? esc(number) : '<span class="dsh-muted">Pending connection</span>'}</div>
+        <div class="dsh-phone-name">${esc(p.name)}</div>
+      </div>
+      <div class="dsh-phone-status">
+        <span class="dsh-status-dot ${st.cls}" title="${esc(st.label)}" aria-label="${esc(st.label)}"></span>
+        ${admin ? `<button class="dsh-restart" data-dsh-restart="${p.id}">Restart</button>` : ''}
+      </div>
+      ${admin ? `<div class="dsh-menu-wrap">
+        <button class="dsh-menu-btn" data-dsh-menu="${p.id}" aria-haspopup="menu" aria-expanded="false" title="More actions">${_DSH_ICONS.more}</button>
+        <div class="dsh-menu" role="menu" hidden>
+          <button role="menuitem" data-dsh-phone-act="qr">${p.waha_status === 'WORKING' ? 'Reconnect / QR' : 'Scan QR to connect'}</button>
+          <button role="menuitem" data-dsh-phone-act="logout">Log out</button>
+          <button role="menuitem" class="danger" data-dsh-phone-act="clear">Clear data</button>
+          <button role="menuitem" class="danger" data-dsh-phone-act="delete">Delete</button>
+        </div>
+      </div>` : ''}
+    </div>`;
+  }).join('');
+
+  el.querySelectorAll('[data-dsh-restart]').forEach(btn => btn.addEventListener('click', async () => {
+    const pid = +btn.dataset.dshRestart;
+    btn.disabled = true; btn.textContent = 'Restarting…';
+    try { await Api.phones.restart(pid); toast('Session restarting…', 'success'); }
+    catch (e) { toast(e.message, 'error'); }
+    _dashSetPhoneStatus(pid, 'STARTING');
+    setTimeout(() => { if (State.currentView === 'dashboard') _startDashWahaPoller(pid); }, 2000);
+  }));
+
+  el.querySelectorAll('[data-dsh-menu]').forEach(btn => btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const menu = btn.nextElementSibling;
+    const open = menu.hidden;
+    _dashCloseMenus();
+    menu.hidden = !open;
+    btn.setAttribute('aria-expanded', String(open));
+    if (open) menu.querySelector('button')?.focus();
+  }));
+
+  el.querySelectorAll('[data-dsh-phone-act]').forEach(item => item.addEventListener('click', () => {
+    const pid = +item.closest('[data-pid]').dataset.pid;
+    _dashCloseMenus();
+    _dashPhoneAction(pid, item.dataset.dshPhoneAct);
+  }));
+}
+
+function _dashCloseMenus() {
+  document.querySelectorAll('.dsh-menu').forEach(m => { m.hidden = true; });
+  document.querySelectorAll('[data-dsh-menu]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+document.addEventListener('click', e => { if (!e.target.closest?.('.dsh-menu-wrap')) _dashCloseMenus(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') _dashCloseMenus(); });
+
+async function _dashPhoneAction(pid, act) {
+  const phone = State.phones.find(p => p.id === pid);
+  const reload = () => (State.currentView === 'dashboard' ? renderDashboard() : loadPhones());
+  try {
+    if (act === 'qr') {
+      if (phone?.waha_status === 'WORKING' &&
+          !confirm('Reconnect this number? The current session will be logged out and a new QR code shown.')) return;
+      _stopDashWahaPoller();
+      await _dashShowQR(pid);
+    } else if (act === 'logout') {
+      if (!confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
+      await Api.phones.logout(pid);
+      toast('Disconnected — scan QR to reconnect', 'success');
+      await reload();
+    } else if (act === 'clear') {
+      if (!confirm('WARNING: This will permanently delete all synced chats, messages, and associated tasks/tickets for this phone from the database. Proceed?')) return;
+      await Api.phones.clearData(pid);
+      toast('Data cleared successfully!', 'success');
+      await reload();
+    } else if (act === 'delete') {
+      if (!confirm('Remove this phone session from Hyperscope? This will deactivate the session.')) return;
+      await Api.phones.del(pid);
+      toast('Phone session removed', 'success');
+      await reload();
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// Keep a phone card's status dot in sync with the live poller
+function _dashSetPhoneStatus(pid, status) {
+  const ph = State.phones.find(p => p.id === pid);
+  if (ph && ph.waha_status !== status && status !== 'UNKNOWN') { ph.waha_status = status; updatePhoneBadge(); }
+  const dot = document.querySelector(`.dsh-phone[data-pid="${pid}"] .dsh-status-dot`);
+  if (!dot) return;
+  const st = _dashStatusInfo(status);
+  dot.className = `dsh-status-dot ${st.cls}`;
+  dot.title = st.label;
+  dot.setAttribute('aria-label', st.label);
 }
 
 // ── COMMUNITIES VIEW ────────────────────────────────────────────── //

@@ -147,6 +147,8 @@ const Api = (() => {
     messages:  (d)    => get('/analytics/messages', { days: d }),
     tickets:   ()     => get('/analytics/tickets'),
     agents:    (d)    => get('/analytics/agents', { days: d }),
+    // Dashboard home: chats/team/tickets/phones in one call (phone-scoped)
+    summary:   ()     => get('/dashboard/summary'),
   };
 
   // Automation
