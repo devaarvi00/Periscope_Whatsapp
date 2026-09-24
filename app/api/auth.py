@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,6 +15,56 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 _bearer = HTTPBearer(auto_error=True)
+
+# ── Failed-login lockout ─────────────────────────────────────────── #
+# In-memory and per-process: correct only because the app runs a single
+# uvicorn worker. Moving to multiple workers/replicas needs a shared store
+# (e.g. Redis). State is lost on restart, which is acceptable here.
+MAX_FAILED_LOGINS = 5
+FAILED_LOGIN_WINDOW_SECONDS = 15 * 60
+LOCKOUT_SECONDS = 15 * 60
+_MAX_TRACKED_EMAILS = 10_000
+
+_login_lock = threading.Lock()
+# email -> (failure_count, first_failure_ts, locked_until_ts)
+_failed_logins: dict[str, tuple[int, float, float]] = {}
+
+
+def _lockout_remaining(email: str) -> int:
+    """Seconds left on an active lockout for this email, else 0."""
+    now = time.monotonic()
+    with _login_lock:
+        entry = _failed_logins.get(email)
+        if not entry:
+            return 0
+        count, first_ts, locked_until = entry
+        if locked_until > now:
+            return int(locked_until - now) + 1
+        if locked_until or now - first_ts > FAILED_LOGIN_WINDOW_SECONDS:
+            # Lock expired or failure window elapsed — start fresh
+            _failed_logins.pop(email, None)
+        return 0
+
+
+def _record_failed_login(email: str) -> None:
+    now = time.monotonic()
+    with _login_lock:
+        if len(_failed_logins) > _MAX_TRACKED_EMAILS:
+            # Bound memory under credential-spraying: drop stale entries
+            for key, (_, f_ts, l_until) in list(_failed_logins.items()):
+                if l_until <= now and now - f_ts > FAILED_LOGIN_WINDOW_SECONDS:
+                    del _failed_logins[key]
+        count, first_ts, _ = _failed_logins.get(email, (0, now, 0.0))
+        count += 1
+        locked_until = now + LOCKOUT_SECONDS if count >= MAX_FAILED_LOGINS else 0.0
+        _failed_logins[email] = (count, first_ts, locked_until)
+    if locked_until:
+        logger.warning("Login locked for %s after %d failed attempts", email, count)
+
+
+def _reset_failed_logins(email: str) -> None:
+    with _login_lock:
+        _failed_logins.pop(email, None)
 
 
 def get_current_agent(
@@ -35,11 +87,21 @@ def get_current_agent(
 
 @router.post("/login", response_model=TokenResponse)
 def login(req: LoginRequest, db: Session = Depends(get_db)):
+    email_key = str(req.email).strip().lower()
+    remaining = _lockout_remaining(email_key)
+    if remaining:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Try again later.",
+            headers={"Retry-After": str(remaining)},
+        )
     agent = db.query(Agent).filter(Agent.email == req.email).first()
     if not agent or not verify_password(req.password, agent.password_hash):
+        _record_failed_login(email_key)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not agent.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
+    _reset_failed_logins(email_key)
     token = create_access_token({"sub": str(agent.id), "email": agent.email, "role": agent.role.value})
     return TokenResponse(
         access_token=token,
@@ -63,10 +125,14 @@ def register(
     existing = db.query(Agent).filter(Agent.email == req.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
+    try:
+        password_hash = hash_password(req.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     agent = Agent(
         email=req.email,
         name=req.name,
-        password_hash=hash_password(req.password),
+        password_hash=password_hash,
         role=req.role,
     )
     db.add(agent)

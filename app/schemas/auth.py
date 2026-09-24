@@ -1,4 +1,9 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
+
+# bcrypt only hashes the first 72 bytes (bcrypt>=5 raises beyond that);
+# hash_password() also enforces the byte limit for multi-byte characters.
+PASSWORD_MIN_LENGTH = 8
+PASSWORD_MAX_LENGTH = 72
 
 
 class LoginRequest(BaseModel):
@@ -18,7 +23,7 @@ class TokenResponse(BaseModel):
 class AgentCreate(BaseModel):
     email: EmailStr
     name: str
-    password: str
+    password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
     role: str = "agent"
 
 
