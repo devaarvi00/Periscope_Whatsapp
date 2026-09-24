@@ -945,6 +945,8 @@ function handleWSEvent(data) {
         // New chat not yet in state — full refresh
         refreshChatList();
       }
+    } else if (!d.from_me) {
+      _updateUnreadBadge();   // keep the sidebar count live on other pages
     }
 
     // Show toast/notify for inbound messages (toast only when user is on another view)
