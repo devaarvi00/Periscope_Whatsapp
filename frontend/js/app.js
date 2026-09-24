@@ -264,8 +264,8 @@ function showApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app-shell').style.display = 'flex';
   renderAgent();
-  const hashView = decodeURIComponent(location.hash.replace('#', ''));
-  navigateTo(VIEW_LABELS[hashView] ? hashView : 'dashboard');
+  const hashRoute = decodeURIComponent(location.hash.replace('#', ''));
+  navigateTo(_parseRoute(hashRoute) ? hashRoute : 'dashboard');
   loadOrg();
   refreshUnreadBadge();
   loadLabels();
@@ -755,20 +755,34 @@ const VIEW_LABELS = {
   media: 'Media',
 };
 
-function navigateTo(view) {
-  if (!VIEW_LABELS[view]) view = 'dashboard';
-  if (location.hash !== '#' + view) history.pushState(null, '', '#' + view);
+// Routes are "view" or "view/sub" (only analytics has sub-pages, e.g. #analytics/team)
+function _parseRoute(route) {
+  const [view, sub] = String(route || '').split('/');
+  if (!VIEW_LABELS[view]) return null;
+  return { view, sub: view === 'analytics' && AN_PAGES[sub] ? sub : null };
+}
+
+function navigateTo(route) {
+  const r = _parseRoute(route) || { view: 'dashboard', sub: null };
+  const view = r.view;
+  const full = r.sub ? `${view}/${r.sub}` : view;
+  if (location.hash !== '#' + full) history.pushState(null, '', '#' + full);
   _stopDashWahaPoller();
   _stopDashQrPoll();
   _stopAllPhoneQrFlows();
+  // Switching analytics sub-pages keeps the analytics shell (sub-nav) in place
+  const keepShell = view === 'analytics' && State.currentView === 'analytics' && document.getElementById('an-shell');
+  if (view !== 'analytics' && State.currentView === 'analytics') _anDestroyCharts();
   State.currentView = view;
+  State.currentRoute = full;
   document.querySelectorAll('.nav-item[data-view]').forEach(el => {
     el.classList.toggle('active', el.dataset.view === view);
   });
   const bc = document.getElementById('app-breadcrumb');
   if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS[view] || view)}</strong>`;
   const main = document.getElementById('main-content');
-  main.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  if (!keepShell) main.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  if (view === 'analytics') return renderAnalytics(r.sub);
   ({
     dashboard:        renderDashboard,
     inbox:            renderInbox,
@@ -796,7 +810,7 @@ document.querySelectorAll('.nav-item[data-view]').forEach(el => {
 window.addEventListener('popstate', () => {
   if (!State.agent) return;
   const v = decodeURIComponent(location.hash.replace('#', ''));
-  if (VIEW_LABELS[v] && v !== State.currentView) navigateTo(v);
+  if (_parseRoute(v) && v !== (State.currentRoute || State.currentView)) navigateTo(v);
 });
 
 // ── WebSocket ──────────────────────────────────────────────────── //
@@ -1106,7 +1120,7 @@ function updatePhoneBadge() {
 document.getElementById('topbar-home')?.addEventListener('click', () => navigateTo('dashboard'));
 document.getElementById('topbar-refresh')?.addEventListener('click', () => {
   loadPhones();
-  navigateTo(State.currentView || 'dashboard');
+  navigateTo(State.currentRoute || State.currentView || 'dashboard');
 });
 document.getElementById('topbar-help')?.addEventListener('click', () => showHelpModal());
 document.getElementById('topbar-phone-count')?.addEventListener('click', () => navigateTo('settings'));
@@ -3785,95 +3799,913 @@ function showContactModal(contact = null) {
 }
 
 // ── ANALYTICS VIEW ──────────────────────────────────────────────── //
-async function renderAnalytics() {
+// Sub-routes: #analytics/<page>. Range / chat / filters persist across pages (memory only).
+// Analytics icons: Font Awesome Free 6.7.2 solid (CC BY 4.0) — [viewBox width, path]
+const AN_ICONS = {
+  chart: [512, 'M64 64c0-17.7-14.3-32-32-32S0 46.3 0 64L0 400c0 44.2 35.8 80 80 80l400 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L80 416c-8.8 0-16-7.2-16-16L64 64zm406.6 86.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L320 210.7l-57.4-57.4c-12.5-12.5-32.8-12.5-45.3 0l-112 112c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L240 221.3l57.4 57.4c12.5 12.5 32.8 12.5 45.3 0l128-128z'],
+  team: [640, 'M144 0a80 80 0 1 1 0 160A80 80 0 1 1 144 0zM512 0a80 80 0 1 1 0 160A80 80 0 1 1 512 0zM0 298.7C0 239.8 47.8 192 106.7 192l42.7 0c15.9 0 31 3.5 44.6 9.7c-1.3 7.2-1.9 14.7-1.9 22.3c0 38.2 16.8 72.5 43.3 96c-.2 0-.4 0-.7 0L21.3 320C9.6 320 0 310.4 0 298.7zM405.3 320c-.2 0-.4 0-.7 0c26.6-23.5 43.3-57.8 43.3-96c0-7.6-.7-15-1.9-22.3c13.6-6.3 28.7-9.7 44.6-9.7l42.7 0C592.2 192 640 239.8 640 298.7c0 11.8-9.6 21.3-21.3 21.3l-213.3 0zM224 224a96 96 0 1 1 192 0 96 96 0 1 1 -192 0zM128 485.3C128 411.7 187.7 352 261.3 352l117.3 0C452.3 352 512 411.7 512 485.3c0 14.7-11.9 26.7-26.7 26.7l-330.7 0c-14.7 0-26.7-11.9-26.7-26.7z'],
+  phone: [384, 'M16 64C16 28.7 44.7 0 80 0L304 0c35.3 0 64 28.7 64 64l0 384c0 35.3-28.7 64-64 64L80 512c-35.3 0-64-28.7-64-64L16 64zM224 448a32 32 0 1 0 -64 0 32 32 0 1 0 64 0zM304 64L80 64l0 320 224 0 0-320z'],
+  chats: [640, 'M208 352c114.9 0 208-78.8 208-176S322.9 0 208 0S0 78.8 0 176c0 38.6 14.7 74.3 39.6 103.4c-3.5 9.4-8.7 17.7-14.2 24.7c-4.8 6.2-9.7 11-13.3 14.3c-1.8 1.6-3.3 2.9-4.3 3.7c-.5 .4-.9 .7-1.1 .8l-.2 .2s0 0 0 0s0 0 0 0C1 327.2-1.4 334.4 .8 340.9S9.1 352 16 352c21.8 0 43.8-5.6 62.1-12.5c9.2-3.5 17.8-7.4 25.2-11.4C134.1 343.3 169.8 352 208 352zM448 176c0 112.3-99.1 196.9-216.5 207C255.8 457.4 336.4 512 432 512c38.2 0 73.9-8.7 104.7-23.9c7.5 4 16 7.9 25.2 11.4c18.3 6.9 40.3 12.5 62.1 12.5c6.9 0 13.1-4.5 15.2-11.1c2.1-6.6-.2-13.8-5.8-17.9c0 0 0 0 0 0s0 0 0 0l-.2-.2c-.2-.2-.6-.4-1.1-.8c-1-.8-2.5-2-4.3-3.7c-3.6-3.3-8.5-8.1-13.3-14.3c-5.5-7-10.7-15.4-14.2-24.7c24.9-29 39.6-64.7 39.6-103.4c0-92.8-84.9-168.9-192.6-175.5c.4 5.1 .6 10.3 .6 15.5z'],
+  ticket: [576, 'M64 64C28.7 64 0 92.7 0 128l0 64c0 8.8 7.4 15.7 15.7 18.6C34.5 217.1 48 235 48 256s-13.5 38.9-32.3 45.4C7.4 304.3 0 311.2 0 320l0 64c0 35.3 28.7 64 64 64l448 0c35.3 0 64-28.7 64-64l0-64c0-8.8-7.4-15.7-15.7-18.6C541.5 294.9 528 277 528 256s13.5-38.9 32.3-45.4c8.3-2.9 15.7-9.8 15.7-18.6l0-64c0-35.3-28.7-64-64-64L64 64zm64 112l0 160c0 8.8 7.2 16 16 16l288 0c8.8 0 16-7.2 16-16l0-160c0-8.8-7.2-16-16-16l-288 0c-8.8 0-16 7.2-16 16zM96 160c0-17.7 14.3-32 32-32l320 0c17.7 0 32 14.3 32 32l0 192c0 17.7-14.3 32-32 32l-320 0c-17.7 0-32-14.3-32-32l0-192z'],
+  message: [512, 'M64 0C28.7 0 0 28.7 0 64L0 352c0 35.3 28.7 64 64 64l96 0 0 80c0 6.1 3.4 11.6 8.8 14.3s11.9 2.1 16.8-1.5L309.3 416 448 416c35.3 0 64-28.7 64-64l0-288c0-35.3-28.7-64-64-64L64 0z'],
+  members: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM609.3 512l-137.8 0c5.4-9.4 8.6-20.3 8.6-32l0-8c0-60.7-27.1-115.2-69.8-151.8c2.4-.1 4.7-.2 7.1-.2l61.4 0C567.8 320 640 392.2 640 481.3c0 17-13.8 30.7-30.7 30.7zM432 256c-31 0-59-12.6-79.3-32.9C372.4 196.5 384 163.6 384 128c0-26.8-6.6-52.1-18.3-74.3C384.3 40.1 407.2 32 432 32c61.9 0 112 50.1 112 112s-50.1 112-112 112z'],
+  export: [576, 'M0 64C0 28.7 28.7 0 64 0L224 0l0 128c0 17.7 14.3 32 32 32l128 0 0 128-168 0c-13.3 0-24 10.7-24 24s10.7 24 24 24l168 0 0 112c0 35.3-28.7 64-64 64L64 512c-35.3 0-64-28.7-64-64L0 64zM384 336l0-48 110.1 0-39-39c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l80 80c9.4 9.4 9.4 24.6 0 33.9l-80 80c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l39-39L384 336zm0-208l-128 0L256 0 384 128z'],
+  info: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM216 336l24 0 0-64-24 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l48 0c13.3 0 24 10.7 24 24l0 88 8 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-80 0c-13.3 0-24-10.7-24-24s10.7-24 24-24zm40-208a32 32 0 1 1 0 64 32 32 0 1 1 0-64z'],
+  refresh: [512, 'M463.5 224l8.5 0c13.3 0 24-10.7 24-24l0-128c0-9.7-5.8-18.5-14.8-22.2s-19.3-1.7-26.2 5.2L413.4 96.6c-87.6-86.5-228.7-86.2-315.8 1c-87.5 87.5-87.5 229.3 0 316.8s229.3 87.5 316.8 0c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0c-62.5 62.5-163.8 62.5-226.3 0s-62.5-163.8 0-226.3c62.2-62.2 162.7-62.5 225.3-1L327 183c-6.9 6.9-8.9 17.2-5.2 26.2s12.5 14.8 22.2 14.8l119.5 0z'],
+  upload: [448, 'M246.6 9.4c-12.5-12.5-32.8-12.5-45.3 0l-128 128c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 109.3 192 320c0 17.7 14.3 32 32 32s32-14.3 32-32l0-210.7 73.4 73.4c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3l-128-128zM64 352c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64c0 53 43 96 96 96l256 0c53 0 96-43 96-96l0-64c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64c0 17.7-14.3 32-32 32L96 448c-17.7 0-32-14.3-32-32l0-64z'],
+  filter: [512, 'M3.9 54.9C10.5 40.9 24.5 32 40 32l432 0c15.5 0 29.5 8.9 36.1 22.9s4.6 30.5-5.2 42.5L320 320.9 320 448c0 12.1-6.8 23.2-17.7 28.6s-23.8 4.3-33.5-3l-64-48c-8.1-6-12.8-15.5-12.8-25.6l0-79.1L9 97.3C-.7 85.4-2.8 68.8 3.9 54.9z'],
+  down: [512, 'M233.4 406.6c12.5 12.5 32.8 12.5 45.3 0l192-192c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L256 338.7 86.6 169.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l192 192z'],
+  right: [320, 'M310.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-192 192c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L242.7 256 73.4 86.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l192 192z'],
+  calendar: [448, 'M96 32l0 32L48 64C21.5 64 0 85.5 0 112l0 48 448 0 0-48c0-26.5-21.5-48-48-48l-48 0 0-32c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 32L160 64l0-32c0-17.7-14.3-32-32-32S96 14.3 96 32zM448 192L0 192 0 464c0 26.5 21.5 48 48 48l352 0c26.5 0 48-21.5 48-48l0-272z'],
+  search: [512, 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
+  clock: [512, 'M256 0a256 256 0 1 1 0 512A256 256 0 1 1 256 0zM232 120l0 136c0 8 4 15.5 10.7 20l96 64c11 7.4 25.9 4.4 33.3-6.7s4.4-25.9-6.7-33.3L280 243.2 280 120c0-13.3-10.7-24-24-24s-24 10.7-24 24z'],
+  check: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM369 209L241 337c-9.4 9.4-24.6 9.4-33.9 0l-64-64c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l47 47L335 175c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9z'],
+  unassigned: [640, 'M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L353.3 251.6C407.9 237 448 187.2 448 128C448 57.3 390.7 0 320 0C250.2 0 193.5 55.8 192 125.2L38.8 5.1zM264.3 304.3C170.5 309.4 96 387.2 96 482.3c0 16.4 13.3 29.7 29.7 29.7l388.6 0c3.9 0 7.6-.7 11-2.1l-261-205.6z'],
+  hourglass: [384, 'M32 0C14.3 0 0 14.3 0 32S14.3 64 32 64l0 11c0 42.4 16.9 83.1 46.9 113.1L146.7 256 78.9 323.9C48.9 353.9 32 394.6 32 437l0 11c-17.7 0-32 14.3-32 32s14.3 32 32 32l32 0 256 0 32 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l0-11c0-42.4-16.9-83.1-46.9-113.1L237.3 256l67.9-67.9c30-30 46.9-70.7 46.9-113.1l0-11c17.7 0 32-14.3 32-32s-14.3-32-32-32L320 0 64 0 32 0zM96 75l0-11 192 0 0 11c0 19-5.6 37.4-16 53L112 128c-10.3-15.6-16-34-16-53zm16 309c3.5-5.3 7.6-10.3 12.1-14.9L192 301.3l67.9 67.9c4.6 4.6 8.6 9.6 12.1 14.9L112 384z'],
+  userPlus: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM504 312l0-64-64 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l64 0 0-64c0-13.3 10.7-24 24-24s24 10.7 24 24l0 64 64 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-64 0 0 64c0 13.3-10.7 24-24 24s-24-10.7-24-24z'],
+  userMinus: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM472 200l144 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-144 0c-13.3 0-24-10.7-24-24s10.7-24 24-24z'],
+  userX: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM471 143c9.4-9.4 24.6-9.4 33.9 0l47 47 47-47c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9l-47 47 47 47c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0l-47-47-47 47c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l47-47-47-47c-9.4-9.4-9.4-24.6 0-33.9z'],
+  out: [384, 'M214.6 41.4c-12.5-12.5-32.8-12.5-45.3 0l-160 160c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L160 141.2 160 448c0 17.7 14.3 32 32 32s32-14.3 32-32l0-306.7L329.4 246.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3l-160-160z'],
+  in: [384, 'M169.4 470.6c12.5 12.5 32.8 12.5 45.3 0l160-160c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L224 370.8 224 64c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 306.7L54.6 265.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l160 160z'],
+  flag: [448, 'M64 32C64 14.3 49.7 0 32 0S0 14.3 0 32L0 64 0 368 0 480c0 17.7 14.3 32 32 32s32-14.3 32-32l0-128 64.3-16.1c41.1-10.3 84.6-5.5 122.5 13.4c44.2 22.1 95.5 24.8 141.7 7.4l34.7-13c12.5-4.7 20.8-16.6 20.8-30l0-247.7c0-23-24.2-38-44.8-27.7l-9.6 4.8c-46.3 23.2-100.8 23.2-147.1 0c-35.1-17.6-75.4-22-113.5-12.5L64 48l0-16z'],
+  stopwatch: [448, 'M176 0c-17.7 0-32 14.3-32 32s14.3 32 32 32l16 0 0 34.4C92.3 113.8 16 200 16 304c0 114.9 93.1 208 208 208s208-93.1 208-208c0-41.8-12.3-80.7-33.5-113.2l24.1-24.1c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L355.7 143c-28.1-23-62.2-38.8-99.7-44.6L256 64l16 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L224 0 176 0zm72 192l0 128c0 13.3-10.7 24-24 24s-24-10.7-24-24l0-128c0-13.3 10.7-24 24-24s24 10.7 24 24z'],
+  note: [448, 'M64 32C28.7 32 0 60.7 0 96L0 416c0 35.3 28.7 64 64 64l224 0 0-112c0-26.5 21.5-48 48-48l112 0 0-224c0-35.3-28.7-64-64-64L64 32zM448 352l-45.3 0L336 352c-8.8 0-16 7.2-16 16l0 66.7 0 45.3 32-32 64-64 32-32z'],
+  logs: [512, 'M75 75L41 41C25.9 25.9 0 36.6 0 57.9L0 168c0 13.3 10.7 24 24 24l110.1 0c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24l0 104c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65 0-94.1c0-13.3-10.7-24-24-24z'],
+  contacts: [512, 'M96 0C60.7 0 32 28.7 32 64l0 384c0 35.3 28.7 64 64 64l288 0c35.3 0 64-28.7 64-64l0-384c0-35.3-28.7-64-64-64L96 0zM208 288l64 0c44.2 0 80 35.8 80 80c0 8.8-7.2 16-16 16l-192 0c-8.8 0-16-7.2-16-16c0-44.2 35.8-80 80-80zm-32-96a64 64 0 1 1 128 0 64 64 0 1 1 -128 0zM512 80c0-8.8-7.2-16-16-16s-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64zM496 192c-8.8 0-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64c0-8.8-7.2-16-16-16zm16 144c0-8.8-7.2-16-16-16s-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64z'],
+  actions: [512, 'M32 96l320 0 0-64c0-12.9 7.8-24.6 19.8-29.6s25.7-2.2 34.9 6.9l96 96c6 6 9.4 14.1 9.4 22.6s-3.4 16.6-9.4 22.6l-96 96c-9.2 9.2-22.9 11.9-34.9 6.9s-19.8-16.6-19.8-29.6l0-64L32 160c-17.7 0-32-14.3-32-32s14.3-32 32-32zM480 352c17.7 0 32 14.3 32 32s-14.3 32-32 32l-320 0 0 64c0 12.9-7.8 24.6-19.8 29.6s-25.7 2.2-34.9-6.9l-96-96c-6-6-9.4-14.1-9.4-22.6s3.4-16.6 9.4-22.6l96-96c9.2-9.2 22.9-11.9 34.9-6.9s19.8 16.6 19.8 29.6l0 64 320 0z'],
+  close: [384, 'M342.6 150.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L192 210.7 86.6 105.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L146.7 256 41.4 361.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 301.3 297.4 406.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L237.3 256 342.6 150.6z'],
+  comment: [512, 'M512 240c0 114.9-114.6 208-256 208c-37.1 0-72.3-6.4-104.1-17.9c-11.9 8.7-31.3 20.6-54.3 30.6C73.6 471.1 44.7 480 16 480c-6.5 0-12.3-3.9-14.8-9.9c-2.5-6-1.1-12.8 3.4-17.4c0 0 0 0 0 0s0 0 0 0s0 0 0 0c0 0 0 0 0 0l.3-.3c.3-.3 .7-.7 1.3-1.4c1.1-1.2 2.8-3.1 4.9-5.7c4.1-5 9.6-12.4 15.2-21.6c10-16.6 19.5-38.4 21.4-62.9C17.7 326.8 0 285.1 0 240C0 125.1 114.6 32 256 32s256 93.1 256 208z'],
+  user: [448, 'M224 256A128 128 0 1 0 224 0a128 128 0 1 0 0 256zm-45.7 48C79.8 304 0 383.8 0 482.3C0 498.7 13.3 512 29.7 512l388.6 0c16.4 0 29.7-13.3 29.7-29.7C448 383.8 368.2 304 269.7 304l-91.4 0z'],
+  group: [640, 'M72 88a56 56 0 1 1 112 0A56 56 0 1 1 72 88zM64 245.7C54 256.9 48 271.8 48 288s6 31.1 16 42.3l0-84.7zm144.4-49.3C178.7 222.7 160 261.2 160 304c0 34.3 12 65.8 32 90.5l0 21.5c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32l0-26.8C26.2 371.2 0 332.7 0 288c0-61.9 50.1-112 112-112l32 0c24 0 46.2 7.5 64.4 20.3zM448 416l0-21.5c20-24.7 32-56.2 32-90.5c0-42.8-18.7-81.3-48.4-107.7C449.8 183.5 472 176 496 176l32 0c61.9 0 112 50.1 112 112c0 44.7-26.2 83.2-64 101.2l0 26.8c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32zm8-328a56 56 0 1 1 112 0A56 56 0 1 1 456 88zM576 245.7l0 84.7c10-11.3 16-26.1 16-42.3s-6-31.1-16-42.3zM320 32a64 64 0 1 1 0 128 64 64 0 1 1 0-128zM240 304c0 16.2 6 31 16 42.3l0-84.7c-10 11.3-16 26.1-16 42.3zm144-42.3l0 84.7c10-11.3 16-26.1 16-42.3s-6-31.1-16-42.3zM448 304c0 44.7-26.2 83.2-64 101.2l0 42.8c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32l0-42.8c-37.8-18-64-56.5-64-101.2c0-61.9 50.1-112 112-112l32 0c61.9 0 112 50.1 112 112z'],
+  download: [512, 'M288 32c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 242.7-73.4-73.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l128 128c12.5 12.5 32.8 12.5 45.3 0l128-128c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L288 274.7 288 32zM64 352c-35.3 0-64 28.7-64 64l0 32c0 35.3 28.7 64 64 64l384 0c35.3 0 64-28.7 64-64l0-32c0-35.3-28.7-64-64-64l-101.5 0-45.3 45.3c-25 25-65.5 25-90.5 0L165.5 352 64 352zm368 56a24 24 0 1 1 0 48 24 24 0 1 1 0-48z'],
+};
+
+function anIcon(name, cls = '') {
+  const ic = AN_ICONS[name];
+  if (!ic) return '';
+  return `<svg class="an-ic ${cls}" viewBox="0 0 ${ic[0]} 512" fill="currentColor" aria-hidden="true"><path d="${ic[1]}"/></svg>`;
+}
+
+const AN_PAGES = {
+  team:     { nav: 'Team analytics',  title: 'Team analytics',  icon: 'team',    agentFilter: true,
+              info: 'Activity per team member for the selected range. Only messages sent from Hyperscope are attributed to a member; messages sent from the phone itself, bulk jobs, automations or the AI agent count in Total only.' },
+  phones:   { nav: 'Phone metrics',   title: 'Phone analytics', icon: 'phone',
+              info: 'Activity per connected WhatsApp number for the selected range.' },
+  chats:    { nav: 'Chat metrics',    title: 'Chat metrics',    icon: 'chats',
+              info: 'New chats are chats that first reached Hyperscope in the selected range (including chats imported when a phone is connected).' },
+  tickets:  { nav: 'Ticket metrics',  title: 'Ticket metrics',  icon: 'ticket',
+              info: 'Tickets created in the selected range, grouped by assignee. Unresolved age buckets count open tickets by how long ago they were created.' },
+  messages: { nav: 'Message metrics', title: 'Message metrics', icon: 'message', agentFilter: true,
+              info: 'Incoming and outgoing messages in the selected range. With a member filter, outgoing counts only messages that member sent from Hyperscope.' },
+  members:  { nav: 'Member metrics',  title: 'Member metrics',  icon: 'members',
+              info: 'Group membership changes: joins (including members added by an admin), leaves and removals.' },
+  exports:  { nav: 'Data exports',    title: 'Data exports',    icon: 'export', group: 'exports' },
+};
+
+const AN = {
+  sub: 'team',
+  range: null,            // { preset, from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' } (local dates, inclusive)
+  chat: null,             // { id, name }
+  phoneIds: [], agentIds: [],
+  data: null, charts: [], seq: 0,
+  agents: null,
+};
+
+const _AN_MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function _anYmd(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+function _anParseYmd(s) { const [y, m, d] = String(s).split('-').map(Number); return new Date(y, m - 1, d); }
+function _anAddDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function _anShortDate(d) { return `${String(d.getDate()).padStart(2, '0')}-${_AN_MON[d.getMonth()]}-${String(d.getFullYear()).slice(-2)}`; }
+
+function _anPresetRange(preset) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const r = { preset };
+  if (preset === 'today') { r.from = r.to = _anYmd(today); }
+  else if (preset === 'yesterday') { r.from = r.to = _anYmd(_anAddDays(today, -1)); }
+  else if (preset === '7d') { r.from = _anYmd(_anAddDays(today, -6)); r.to = _anYmd(today); }
+  else if (preset === '30d') { r.from = _anYmd(_anAddDays(today, -29)); r.to = _anYmd(today); }
+  else if (preset === 'month') { r.from = _anYmd(new Date(today.getFullYear(), today.getMonth(), 1)); r.to = _anYmd(today); }
+  else { r.preset = 'default'; r.from = _anYmd(_anAddDays(today, -1)); r.to = _anYmd(today); }
+  return r;
+}
+
+function _anQuery() {
+  if (!AN.range) AN.range = _anPresetRange('default');
+  const from = _anParseYmd(AN.range.from);
+  const end = _anAddDays(_anParseYmd(AN.range.to), 1);
+  const to = end > new Date() ? new Date() : end;
+  const q = { from: from.toISOString(), to: to.toISOString() };
+  try { q.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) { q.tz = 'UTC'; }
+  q.tz_offset = -from.getTimezoneOffset();  // fallback when the server lacks that zone name
+  if (AN.chat) q.chat_id = AN.chat.id;
+  if (AN.phoneIds.length) q.phone_ids = AN.phoneIds.join(',');
+  if (AN.agentIds.length && AN_PAGES[AN.sub]?.agentFilter) q.agent_ids = AN.agentIds.join(',');
+  return q;
+}
+
+function _anRangeLabel() {
+  if (!AN.range) AN.range = _anPresetRange('default');
+  return `${_anShortDate(_anParseYmd(AN.range.from))} to ${_anShortDate(_anParseYmd(AN.range.to))}`;
+}
+
+// Numbers / durations. null / undefined → "--" (not computable), with an optional tooltip.
+function _anNum(v, tip) {
+  if (v == null) return `<span class="an-na"${tip ? ` data-tip="${esc(tip)}"` : ''}>--</span>`;
+  return Number(v).toLocaleString('en-IN');
+}
+function _anDurText(sec) {
+  if (sec == null) return '--';
+  sec = Math.round(sec);
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+  if (d) return `${d}d ${h % 24}h`;
+  if (h) return `${h}h ${m % 60}m`;
+  return `${m}m ${sec % 60}s`;
+}
+function _anDur(sec, tip) {
+  if (sec == null) return _anNum(null, tip);
+  return _anDurText(sec);
+}
+
+function _anDestroyCharts() {
+  AN.charts.forEach(c => { try { c.destroy(); } catch (_) {} });
+  AN.charts = [];
+}
+
+function _anShellHTML() {
+  const item = (key) => {
+    const p = AN_PAGES[key];
+    return `<a href="#analytics/${key}" class="an-nav-item" data-an="${key}">${anIcon(p.icon)}<span>${esc(p.nav)}</span></a>`;
+  };
+  return `
+    <div class="an-shell" id="an-shell">
+      <nav class="an-nav" aria-label="Analytics">
+        <div class="an-nav-group">${anIcon('chart')}<span>Analytics</span></div>
+        ${['team', 'phones', 'chats', 'tickets', 'messages', 'members'].map(item).join('')}
+        <div class="an-nav-group an-nav-group-2">${anIcon('export')}<span>Exports</span></div>
+        ${item('exports')}
+      </nav>
+      <div class="an-main" id="an-main"></div>
+    </div>
+    <div class="an-tooltip" id="an-tooltip" role="tooltip"></div>`;
+}
+
+async function renderAnalytics(sub) {
+  sub = AN_PAGES[sub] ? sub : (AN.sub || 'team');
+  AN.sub = sub;
+  _anSyncRoute(sub);
   const main = document.getElementById('main-content');
-  main.innerHTML = `
-    <div class="flex-col h-full" style="overflow-y:auto">
-      <div class="section-header"><h2>Analytics</h2></div>
-      <div id="analytics-body">
-        <div class="loading-center"><div class="spinner"></div></div>
+  if (!document.getElementById('an-shell')) {
+    main.innerHTML = _anShellHTML();
+    main.querySelectorAll('.an-nav-item').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      navigateTo('analytics/' + a.dataset.an);
+    }));
+    _anBindTooltips(main);
+  }
+  main.querySelectorAll('.an-nav-item').forEach(a => {
+    const on = a.dataset.an === sub;
+    a.classList.toggle('active', on);
+    on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current');
+  });
+  _anDestroyCharts();
+  AN.data = null;
+  const host = document.getElementById('an-main');
+  host.scrollTop = 0;
+  if (sub === 'exports') { _anRenderExports(host); return; }
+  host.innerHTML = _anPageHTML(sub);
+  _anBindToolbar(host);
+  _anLoad();
+}
+
+// Keep the hash / breadcrumb on the concrete sub-page (e.g. after clicking "Analytics" in the sidebar)
+function _anSyncRoute(sub) {
+  const route = 'analytics/' + sub;
+  State.currentRoute = route;
+  if (location.hash !== '#' + route) history.replaceState(null, '', '#' + route);
+  const bc = document.getElementById('app-breadcrumb');
+  if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS.analytics)}</strong><span class="bc-sep" aria-hidden="true">&gt;</span><strong>${esc(sub)}</strong>`;
+}
+
+function _anPageHTML(sub) {
+  const p = AN_PAGES[sub];
+  const nFilters = AN.phoneIds.length + (p.agentFilter ? AN.agentIds.length : 0);
+  return `
+    <div class="an-page">
+      <div class="an-title">${anIcon(p.icon, 'an-title-ic')}<h1>${esc(p.title)}</h1></div>
+      <div class="an-toolbar">
+        <div class="an-pop-wrap">
+          <button class="an-btn" id="an-range-btn" aria-haspopup="true" aria-expanded="false">
+            ${anIcon('calendar', 'an-btn-lead')}<span id="an-range-label">${esc(_anRangeLabel())}</span>${anIcon('down', 'an-caret')}
+          </button>
+        </div>
+        <div class="an-chatpick${AN.chat ? ' has-chat' : ''}" id="an-chatpick">
+          ${anIcon('search', 'an-chatpick-ic')}
+          <input id="an-chat-input" type="text" autocomplete="off" placeholder="Select a chat..."
+                 aria-label="Filter by chat" value="${esc(AN.chat ? AN.chat.name : '')}">
+          <button class="an-chat-clear" id="an-chat-clear" title="Clear chat" aria-label="Clear chat">${anIcon('close')}</button>
+        </div>
+        <div class="an-pop-wrap">
+          <button class="an-btn" id="an-filter-btn" aria-haspopup="true" aria-expanded="false">
+            ${anIcon('filter', 'an-btn-lead')}<span>Filter</span>${nFilters ? `<span class="an-count">${nFilters}</span>` : ''}
+          </button>
+        </div>
+        <div class="an-spacer"></div>
+        <span class="an-info" tabindex="0" data-tip="${esc(p.info || '')}" aria-label="About this page">${anIcon('info')}</span>
+        <button class="an-btn" id="an-refresh">${anIcon('refresh', 'an-btn-lead')}<span>Refresh</span></button>
+        <button class="an-btn" id="an-export">${anIcon('upload', 'an-btn-lead')}<span>Export</span></button>
+      </div>
+      <div id="an-body" class="an-body"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>`;
+}
+
+function _anClosePops() {
+  document.querySelectorAll('.an-pop').forEach(p => p.remove());
+  document.querySelectorAll('.an-btn[aria-expanded="true"]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.an-pop, .an-pop-wrap, .an-chatpick')) {
+    _anClosePops();
+    document.getElementById('an-chat-list')?.remove();
+  }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.querySelector('.an-pop, #an-chat-list')) {
+    _anClosePops();
+    document.getElementById('an-chat-list')?.remove();
+  }
+});
+
+function _anBindToolbar(host) {
+  host.querySelector('#an-range-btn').addEventListener('click', e => _anOpenRange(e.currentTarget));
+  host.querySelector('#an-filter-btn').addEventListener('click', e => _anOpenFilter(e.currentTarget));
+  host.querySelector('#an-refresh').addEventListener('click', () => _anLoad());
+  host.querySelector('#an-export').addEventListener('click', () => _anExportCsv());
+  _anBindChatPicker(host);
+}
+
+function _anOpenRange(btn) {
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  _anClosePops();
+  if (open) return;
+  btn.setAttribute('aria-expanded', 'true');
+  const presets = [['today', 'Today'], ['yesterday', 'Yesterday'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['month', 'This month']];
+  const pop = document.createElement('div');
+  pop.className = 'an-pop an-range-pop';
+  pop.innerHTML = `
+    ${presets.map(([k, l]) => `<button class="an-pop-item${AN.range?.preset === k ? ' active' : ''}" data-preset="${k}">${l}${AN.range?.preset === k ? anIcon('check', 'an-pop-check') : ''}</button>`).join('')}
+    <div class="an-pop-sep"></div>
+    <div class="an-pop-label">Custom</div>
+    <div class="an-custom">
+      <label>From<input type="date" id="an-from" value="${esc(AN.range.from)}" max="${_anYmd(new Date())}"></label>
+      <label>To<input type="date" id="an-to" value="${esc(AN.range.to)}" max="${_anYmd(new Date())}"></label>
+    </div>
+    <button class="btn btn-primary btn-sm an-apply" id="an-range-apply">Apply</button>`;
+  btn.parentElement.appendChild(pop);
+  pop.querySelectorAll('[data-preset]').forEach(b => b.addEventListener('click', () => {
+    AN.range = _anPresetRange(b.dataset.preset);
+    _anClosePops(); _anRangeChanged();
+  }));
+  pop.querySelector('#an-range-apply').addEventListener('click', () => {
+    const f = pop.querySelector('#an-from').value, t = pop.querySelector('#an-to').value;
+    if (!f || !t) return toast('Pick both dates', 'error');
+    if (f > t) return toast('"From" must be on or before "To"', 'error');
+    if ((_anParseYmd(t) - _anParseYmd(f)) / 86400000 > 365) return toast('Pick at most 366 days', 'error');
+    AN.range = { preset: 'custom', from: f, to: t };
+    _anClosePops(); _anRangeChanged();
+  });
+}
+
+function _anRangeChanged() {
+  const l = document.getElementById('an-range-label');
+  if (l) l.textContent = _anRangeLabel();
+  _anLoad();
+}
+
+async function _anOpenFilter(btn) {
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  _anClosePops();
+  if (open) return;
+  btn.setAttribute('aria-expanded', 'true');
+  const withAgents = !!AN_PAGES[AN.sub]?.agentFilter;
+  const pop = document.createElement('div');
+  pop.className = 'an-pop an-filter-pop';
+  pop.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  btn.parentElement.appendChild(pop);
+  let phones = State.phones || [];
+  try { if (!phones.length) phones = State.phones = await Api.phones.list(); } catch (_) {}
+  if (withAgents && !AN.agents) { try { AN.agents = await Api.auth.agents(); } catch (_) { AN.agents = []; } }
+  if (!pop.isConnected) return;
+  const opt = (kind, id, label, sub, checked) => `
+    <label class="an-check"><input type="checkbox" data-kind="${kind}" value="${id}"${checked ? ' checked' : ''}>
+      <span class="an-check-text"><span>${esc(label)}</span>${sub ? `<small>${esc(sub)}</small>` : ''}</span></label>`;
+  pop.innerHTML = `
+    <div class="an-pop-label">Phones</div>
+    <div class="an-check-list">${phones.map(p => opt('phone', p.id, p.name || 'Phone', _dashFmtPhone(p.phone_number), AN.phoneIds.includes(p.id))).join('') || '<div class="an-pop-empty">No phones connected</div>'}</div>
+    ${withAgents ? `<div class="an-pop-sep"></div><div class="an-pop-label">Members</div>
+      <div class="an-check-list">${(AN.agents || []).map(a => opt('agent', a.id, a.name, a.email, AN.agentIds.includes(a.id))).join('') || '<div class="an-pop-empty">No members</div>'}</div>` : ''}
+    <div class="an-pop-foot">
+      <button class="btn btn-secondary btn-sm" id="an-filter-clear">Clear</button>
+      <button class="btn btn-primary btn-sm" id="an-filter-apply">Apply</button>
+    </div>`;
+  pop.querySelector('#an-filter-clear').addEventListener('click', () => {
+    AN.phoneIds = []; if (withAgents) AN.agentIds = [];
+    _anClosePops(); _anFiltersChanged();
+  });
+  pop.querySelector('#an-filter-apply').addEventListener('click', () => {
+    const vals = kind => [...pop.querySelectorAll(`input[data-kind="${kind}"]:checked`)].map(i => Number(i.value));
+    AN.phoneIds = vals('phone');
+    if (withAgents) AN.agentIds = vals('agent');
+    _anClosePops(); _anFiltersChanged();
+  });
+}
+
+function _anFiltersChanged() {
+  const btn = document.getElementById('an-filter-btn');
+  if (btn) {
+    btn.querySelector('.an-count')?.remove();
+    const n = AN.phoneIds.length + (AN_PAGES[AN.sub]?.agentFilter ? AN.agentIds.length : 0);
+    if (n) btn.insertAdjacentHTML('beforeend', `<span class="an-count">${n}</span>`);
+  }
+  _anLoad();
+}
+
+function _anBindChatPicker(host) {
+  const wrap = host.querySelector('#an-chatpick');
+  const input = host.querySelector('#an-chat-input');
+  let timer = null, seq = 0;
+  const close = () => document.getElementById('an-chat-list')?.remove();
+  const show = async () => {
+    const my = ++seq;
+    let list = [];
+    try { list = await Api.analytics.chatOptions(input.value.trim()); } catch (_) {}
+    if (my !== seq || !input.isConnected) return;  // superseded, or blurred (blur bumps seq)
+    close();
+    const box = document.createElement('div');
+    box.id = 'an-chat-list';
+    box.className = 'an-pop an-chat-list';
+    box.setAttribute('role', 'listbox');
+    box.innerHTML = list.length ? list.map(c => `
+      <button class="an-pop-item an-chat-opt" role="option" data-id="${c.id}" data-name="${esc(displayName(c.name))}">
+        <span class="agent-avatar xs" style="background:${safeColor(avatarColor(c.name))}">${esc(initials(displayName(c.name)))}</span>
+        <span class="an-chat-name">${esc(displayName(c.name))}</span>${c.is_group ? '<small>Group</small>' : ''}
+      </button>`).join('') : '<div class="an-pop-empty">No chats found</div>';
+    wrap.appendChild(box);
+    box.querySelectorAll('.an-chat-opt').forEach(b => b.addEventListener('mousedown', e => {
+      e.preventDefault();
+      AN.chat = { id: Number(b.dataset.id), name: b.dataset.name };
+      input.value = AN.chat.name;
+      wrap.classList.add('has-chat');
+      close(); input.blur(); _anLoad();
+    }));
+  };
+  input.addEventListener('focus', () => { input.select(); show(); });
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(show, 200); });
+  input.addEventListener('blur', () => setTimeout(() => {
+    seq++;
+    close();
+    input.value = AN.chat ? AN.chat.name : '';
+  }, 150));
+  host.querySelector('#an-chat-clear').addEventListener('click', () => {
+    AN.chat = null; input.value = ''; wrap.classList.remove('has-chat'); _anLoad();
+  });
+}
+
+// Floating tooltip for any [data-tip] inside the analytics shell
+function _anBindTooltips(root) {
+  const tip = () => document.getElementById('an-tooltip');
+  const showTip = el => {
+    const t = tip(); const text = el.getAttribute('data-tip');
+    if (!t || !text) return;
+    t.textContent = text;
+    t.classList.add('show');
+    const r = el.getBoundingClientRect(), w = t.offsetWidth, h = t.offsetHeight;
+    let left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+    let top = r.bottom + 8;
+    if (top + h > window.innerHeight - 8) top = r.top - h - 8;
+    t.style.left = left + 'px'; t.style.top = top + 'px';
+  };
+  const hide = () => tip()?.classList.remove('show');
+  root.addEventListener('mouseover', e => { const el = e.target.closest('[data-tip]'); if (el) showTip(el); });
+  root.addEventListener('mouseout', e => { if (e.target.closest('[data-tip]')) hide(); });
+  root.addEventListener('focusin', e => { const el = e.target.closest('[data-tip]'); if (el) showTip(el); });
+  root.addEventListener('focusout', hide);
+}
+
+async function _anLoad() {
+  const sub = AN.sub;
+  const body = document.getElementById('an-body');
+  if (!body || sub === 'exports') return;
+  const my = ++AN.seq;
+  body.classList.add('is-loading');
+  if (!AN.data) body.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  try {
+    const data = await Api.analytics[sub](_anQuery());
+    if (my !== AN.seq || AN.sub !== sub || !document.getElementById('an-body')) return;
+    AN.data = data;
+    _anDestroyCharts();
+    body.innerHTML = _AN_RENDER[sub].html(data);
+    _AN_RENDER[sub].after?.(data, body);
+  } catch (e) {
+    if (my !== AN.seq) return;
+    if (e.message === 'Chat not found' && AN.chat) {
+      AN.chat = null;
+      const inp = document.getElementById('an-chat-input'); if (inp) inp.value = '';
+      document.getElementById('an-chatpick')?.classList.remove('has-chat');
+    }
+    body.innerHTML = `<div class="an-card an-error">Could not load analytics — ${esc(e.message || 'request failed')}</div>`;
+  } finally {
+    if (my === AN.seq) body.classList.remove('is-loading');
+  }
+}
+
+// ── Shared pieces ── //
+function _anStat(icon, tone, label, value, tip) {
+  return `
+    <div class="an-card an-stat">
+      <div class="an-stat-head">
+        <span class="an-stat-ic tone-${tone}">${anIcon(icon)}</span>
+        <span class="an-stat-label">${esc(label)}</span>
+        ${tip ? `<span class="an-i" tabindex="0" data-tip="${esc(tip)}">${anIcon('info')}</span>` : ''}
+      </div>
+      <div class="an-stat-val">${value}</div>
+    </div>`;
+}
+
+function _anAvatar(row, total) {
+  if (total) return `<span class="an-avatar an-avatar-total">${anIcon('team')}</span>`;
+  const bg = row.avatar_color ? safeColor(row.avatar_color) : safeColor(avatarColor(row.name));
+  return `<span class="an-avatar" style="background:${bg}">${esc(initials(row.name))}${row.online ? '<i class="an-dot" title="Online"></i>' : ''}</span>`;
+}
+
+function _anUserCell(row, total) {
+  if (total) return `<div class="an-user">${_anAvatar(null, true)}<div><div class="an-user-name">Total</div><div class="an-user-sub">All members</div></div></div>`;
+  return `<div class="an-user">${_anAvatar(row)}<div class="an-user-meta"><div class="an-user-name">${esc(row.name)}</div>${row.email ? `<div class="an-user-sub">${esc(row.email)}</div>` : ''}</div></div>`;
+}
+
+function _anTh(label, tip, cls = '') {
+  return `<th class="${cls}">${esc(label)}${tip ? ` <span class="an-i" tabindex="0" data-tip="${esc(tip)}">${anIcon('info')}</span>` : ''}</th>`;
+}
+
+function _anEmptyRow(cols) {
+  return `<tr class="an-empty-row"><td colspan="${cols}">No data available</td></tr>`;
+}
+
+function _anFrtTip(d) {
+  return d.frt_basis === 'all_inbound'
+    ? 'No incoming message in this range was flagged, so this is measured from any incoming message to the next reply.'
+    : 'Median time from a flagged incoming message to the next reply in that chat.';
+}
+const _AN_NO_FRT = 'No replies to measure in this range.';
+
+// ── Chart (Chart.js; colours re-read from CSS variables on every build) ── //
+function _anCss(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+function _anBucketLabel(iso, bucket) {
+  const d = new Date(iso);
+  const day = `${String(d.getDate()).padStart(2, '0')}-${_AN_MON[d.getMonth()]}`;
+  return bucket === 'hour' ? [day, `${String(d.getHours()).padStart(2, '0')}:00`] : [day];
+}
+
+function _anChartCard(id, title, series, opts = {}) {
+  return `
+    <div class="an-card an-chart-card${opts.cls ? ' ' + opts.cls : ''}">
+      <div class="an-card-title">${esc(title)}${opts.tip ? ` <span class="an-i" tabindex="0" data-tip="${esc(opts.tip)}">${anIcon('info')}</span>` : ''}</div>
+      <div class="an-chart-box"><canvas id="${id}" role="img" aria-label="${esc(title)} chart"></canvas></div>
+      <div class="an-legend" data-for="${id}">
+        ${series.map((s, i) => `
+          <button class="an-legend-item" data-i="${i}" aria-pressed="true">
+            <i class="an-legend-sq" style="background:var(${s.color})"></i>
+            <span class="an-legend-text"><span>${esc(s.label)}</span>${s.desc ? `<small>${esc(s.desc)}</small>` : ''}</span>
+          </button>`).join('')}
       </div>
     </div>`;
-  try {
-    const phones = await Api.phones.list().catch(() => []);
-    State.phones = phones;
-    const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+}
 
-    if (!phoneConnected) {
-      const body = document.getElementById('analytics-body');
-      if (body) {
-        body.innerHTML = `<div class="empty-state whatsapp-disconnected-thread" style="padding:4rem 2rem">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.25;color:var(--text-3)">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-            <path d="M2 2l20 20"/>
-          </svg>
-          <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0.5rem 0 0.25rem">WhatsApp Disconnected</p>
-          <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to see analytics data.</span>
-          <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
-        </div>`;
-      }
-      return;
-    }
-
-    const [dash, msg, tkt, agents] = await Promise.all([
-      Api.analytics.dashboard(),
-      Api.analytics.messages(30),
-      Api.analytics.tickets(),
-      Api.analytics.agents(30),
-    ]);
-    const body = document.getElementById('analytics-body');
-    body.innerHTML = `
-      <div class="metrics-grid">
-        <div class="metric-card metric-accent">
-          <div class="metric-label">Total Chats</div>
-          <div class="metric-value">${dash.total_chats ?? 0}</div>
-          <div class="metric-sub">All conversations</div>
-        </div>
-        <div class="metric-card metric-blue">
-          <div class="metric-label">Messages (30d)</div>
-          <div class="metric-value">${(msg.outgoing_messages ?? 0) + (msg.incoming_messages ?? 0)}</div>
-          <div class="metric-sub">${msg.outgoing_messages ?? 0} sent · ${msg.incoming_messages ?? 0} received</div>
-        </div>
-        <div class="metric-card metric-orange">
-          <div class="metric-label">Open Tickets</div>
-          <div class="metric-value">${tkt.open ?? 0}</div>
-          <div class="metric-sub">${tkt.in_progress ?? 0} in progress</div>
-        </div>
-        <div class="metric-card metric-green">
-          <div class="metric-label">Resolved Tickets</div>
-          <div class="metric-value">${tkt.resolved ?? 0}</div>
-          <div class="metric-sub">${tkt.sla_breached ?? 0} SLA breached</div>
-        </div>
-        <div class="metric-card metric-accent">
-          <div class="metric-label">Unread Chats</div>
-          <div class="metric-value">${dash.unread_chats ?? 0}</div>
-        </div>
-        <div class="metric-card metric-orange">
-          <div class="metric-label">Flagged Chats</div>
-          <div class="metric-value">${dash.flagged_chats ?? 0}</div>
-        </div>
-      </div>
-      <div class="analytics-section">
-        <div class="content-card">
-          <div class="card-header">Agent Performance (30d)</div>
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead><tr><th>Agent</th><th>Messages Sent</th><th>Chats Assigned</th><th>Open Tickets</th></tr></thead>
-              <tbody>${(agents||[]).map(a => `
-                <tr>
-                  <td style="font-weight:600">${esc(a.agent_name||'Agent '+a.agent_id)}</td>
-                  <td>${a.messages_sent ?? 0}</td>
-                  <td>${a.chats_assigned ?? 0}</td>
-                  <td>${a.open_tickets ?? 0}</td>
-                </tr>`).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--text-3);padding:1.5rem">No data yet</td></tr>'}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>`;
-  } catch(e) {
-    document.getElementById('analytics-body').innerHTML = `<div class="loading-center text-muted">Could not load analytics</div>`;
+function _anExternalTooltip(context) {
+  const { chart, tooltip } = context;
+  let el = chart.canvas.parentNode.querySelector('.an-chart-tip');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'an-chart-tip';
+    chart.canvas.parentNode.appendChild(el);
   }
+  if (tooltip.opacity === 0) { el.style.opacity = 0; return; }
+  const title = (tooltip.title || []).join(' ');
+  el.innerHTML = `<div class="an-chart-tip-title">${esc(title)}</div>` + (tooltip.dataPoints || []).map(p => `
+    <div class="an-chart-tip-row"><i style="background:${esc(p.dataset.borderColor)}"></i>
+      <span>${esc(p.dataset.label)}</span><b>${Number(p.raw).toLocaleString('en-IN')}</b></div>`).join('');
+  el.style.opacity = 1;
+  const box = chart.canvas.parentNode;
+  const w = el.offsetWidth;
+  let left = tooltip.caretX + 14;
+  if (left + w > box.clientWidth) left = tooltip.caretX - w - 14;
+  el.style.left = Math.max(0, left) + 'px';
+  el.style.top = Math.max(0, Math.min(tooltip.caretY - el.offsetHeight / 2, box.clientHeight - el.offsetHeight)) + 'px';
+}
+
+function _anBuildChart(id, series, labels, bucket) {
+  const canvas = document.getElementById(id);
+  if (!canvas || typeof Chart === 'undefined') return;
+  const grid = _anCss('--border', '#e5e7eb');
+  const tick = _anCss('--text-3', '#9ca3af');
+  const labelsFmt = labels.map(l => _anBucketLabel(l, bucket));
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: labelsFmt,
+      datasets: series.map(s => {
+        const c = _anCss(s.color, '#15803d');
+        return {
+          label: s.label, data: s.data, borderColor: c, backgroundColor: c,
+          borderWidth: 1.6, pointRadius: 0, pointHoverRadius: 3.5, pointHitRadius: 8, tension: 0.3, cubicInterpolationMode: 'monotone', fill: false,
+        };
+      }),
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: { enabled: false, external: _anExternalTooltip,
+                   callbacks: { title: items => (items[0]?.label || []).toString().replace(',', ' ') } },
+      },
+      scales: {
+        x: {
+          grid: { display: false }, border: { color: grid },
+          ticks: { color: tick, font: { family: 'Inter', size: 11 }, maxRotation: 0, autoSkip: true, autoSkipPadding: 18 },
+        },
+        y: {
+          beginAtZero: true, grid: { color: grid }, border: { display: false, dash: [4, 4] },
+          ticks: { color: tick, font: { family: 'Inter', size: 11 }, precision: 0, padding: 8 },
+        },
+      },
+    },
+  });
+  AN.charts.push(chart);
+  const legend = document.querySelector(`.an-legend[data-for="${id}"]`);
+  legend?.querySelectorAll('.an-legend-item').forEach(b => b.addEventListener('click', () => {
+    const i = Number(b.dataset.i);
+    const vis = chart.isDatasetVisible(i);
+    chart.setDatasetVisibility(i, !vis);
+    b.setAttribute('aria-pressed', String(!vis));
+    b.classList.toggle('off', vis);
+    chart.update();
+  }));
+}
+
+// Rebuild charts when the theme flips so they pick up the new CSS variable colours
+new MutationObserver(() => {
+  if (State.currentView === 'analytics' && AN.data && AN.charts.length) {
+    const body = document.getElementById('an-body');
+    if (body) { _anDestroyCharts(); body.innerHTML = _AN_RENDER[AN.sub].html(AN.data); _AN_RENDER[AN.sub].after?.(AN.data, body); }
+  }
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+// ── Page renderers ── //
+const _AN_UPTIME_TIP = 'Presence tracking has no data for this range (it records time with Hyperscope open).';
+
+const _AN_RENDER = {
+  team: {
+    html(d) {
+      const t = d.total || {};
+      const frtTip = _anFrtTip(d);
+      const unattr = t.unattributed_messages
+        ? `${t.unattributed_messages.toLocaleString('en-IN')} message(s) were sent from the phone, bulk jobs, automations or the AI agent — they count in Total but not for a member.`
+        : 'Outgoing messages. Only messages sent from Hyperscope are attributed to a member.';
+      const row = (r, total) => `
+        <tr class="${total ? 'an-total-row' : ''}">
+          <td>${_anUserCell(r, total)}</td>
+          <td>${_anNum(r.active_chats)}</td>
+          <td>${_anNum(r.messages_sent)}</td>
+          <td>${_anNum(r.chats_initiated)}</td>
+          <td>${_anNum(r.tickets_closed)}</td>
+          <td>${_anNum(r.responses_flagged)}</td>
+          <td>${_anDur(r.median_frt_seconds, _AN_NO_FRT)}</td>
+          <td>${_anDur(r.uptime_seconds, _AN_UPTIME_TIP)}</td>
+        </tr>`;
+      return `
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead><tr>
+              ${_anTh('User')}
+              ${_anTh('Active chats', 'Chats with at least one message in range (for a member: chats they sent a message in).')}
+              ${_anTh('Messages sent', unattr)}
+              ${_anTh('Chats initiated', 'Chats whose first message in range was outgoing.')}
+              ${_anTh('Tickets closed', 'Tickets moved to resolved or closed in range (per member: who closed them).')}
+              ${_anTh('Responses (to flagged messages)', 'Replies to flagged incoming messages.')}
+              ${_anTh('Median first response time', frtTip)}
+              ${_anTh('User uptime', 'Time with Hyperscope open (at least one live connection) in range.')}
+            </tr></thead>
+            <tbody>${row(t, true)}${(d.rows || []).map(r => row(r)).join('') || _anEmptyRow(8)}</tbody>
+          </table></div>
+        </div>`;
+    },
+  },
+
+  phones: {
+    html(d) {
+      const t = d.total || {};
+      const row = (r, total) => `
+        <tr class="${total ? 'an-total-row' : ''}">
+          <td>${total
+            ? `<div class="an-user"><span class="an-avatar an-avatar-total">${anIcon('phone')}</span><div><div class="an-user-name">Total</div><div class="an-user-sub">All phones</div></div></div>`
+            : `<div class="an-user"><span class="an-avatar an-avatar-phone">${anIcon('phone')}</span><div class="an-user-meta"><div class="an-user-name">${esc(r.name || 'Phone')}</div><div class="an-user-sub">${esc(_dashFmtPhone(r.phone_number) || r.phone_number || '')}</div></div></div>`}</td>
+          <td>${_anNum(r.new_chats)}</td>
+          <td>${_anNum(r.messages_sent)}</td>
+          <td>${_anNum(r.responses_flagged)}</td>
+          <td>${_anDur(r.median_frt_seconds, _AN_NO_FRT)}</td>
+        </tr>`;
+      return `
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead><tr>
+              ${_anTh('Phone')}
+              ${_anTh('New chats created', 'Chats that first reached Hyperscope in range.')}
+              ${_anTh('Messages sent', 'All outgoing messages from this number.')}
+              ${_anTh('Responses (to flagged messages)', 'Replies to flagged incoming messages.')}
+              ${_anTh('Median first response time', _anFrtTip(d))}
+            </tr></thead>
+            <tbody>${row(t, true)}${(d.rows || []).map(r => row(r)).join('') || _anEmptyRow(5)}</tbody>
+          </table></div>
+        </div>`;
+    },
+  },
+
+  chats: {
+    html(d) {
+      const t = d.total || {};
+      return `
+        <div class="an-split">
+          <div class="an-stack">
+            ${_anStat('chats', 'green', 'Total new chats', _anNum(t.new_chats), 'One-to-one chats and groups that first reached Hyperscope in range.')}
+            ${_anStat('comment', 'blue', 'New one-to-one chats', _anNum(t.new_individual), 'New chats with a single contact.')}
+            ${_anStat('group', 'navy', 'New groups', _anNum(t.new_groups), 'New group chats.')}
+          </div>
+          ${_anChartCard('an-chart', 'New chats created', [
+            { label: 'Individual chats', color: '--an-green' }, { label: 'Group chats', color: '--an-navy' }])}
+        </div>
+        <div class="an-card an-table-card">
+          <div class="an-card-title">Most active chats</div>
+          <div class="an-table-wrap"><table class="an-table an-table-compact">
+            <thead><tr>${_anTh('Chat name')}${_anTh('Total messages', '', 'num')}</tr></thead>
+            <tbody>${(d.most_active || []).map(c => `
+              <tr><td><div class="an-user"><span class="an-avatar sm" style="background:${safeColor(avatarColor(c.name))}">${esc(initials(displayName(c.name)))}</span>
+                <div class="an-user-name">${esc(displayName(c.name))}${c.is_group ? ' <small class="an-tag">Group</small>' : ''}</div></div></td>
+                <td class="num">${_anNum(c.messages)}</td></tr>`).join('') || _anEmptyRow(2)}</tbody>
+          </table></div>
+        </div>`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Individual chats', color: '--an-green', data: s.individual || [] },
+        { label: 'Group chats', color: '--an-navy', data: s.group || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+
+  tickets: {
+    html(d) {
+      const t = d.total || {};
+      const age = r => r.unresolved_age || {};
+      const row = (r, total) => `
+        <tr class="${total ? 'an-total-row' : ''}">
+          <td>${total ? _anUserCell(null, true) : _anUserCell(r)}</td>
+          <td>${_anNum(r.total)}</td>
+          <td>${_anNum(r.open)}</td>
+          <td>${_anNum(r.closed)}</td>
+          <td>${_anDur(r.avg_resolution_seconds, 'No tickets resolved yet.')}</td>
+          <td class="an-sep-l">${_anNum(age(r).lt_1h)}</td>
+          <td>${_anNum(age(r).lt_24h)}</td>
+          <td>${_anNum(age(r).lt_7d)}</td>
+          <td>${_anNum(age(r).gt_7d)}</td>
+        </tr>`;
+      const totalRow = { total: t.total, open: t.unresolved, closed: t.resolved,
+                         avg_resolution_seconds: t.avg_resolution_seconds, unresolved_age: t.unresolved_age };
+      return `
+        <div class="an-stats an-stats-5">
+          ${_anStat('ticket', 'navy', 'Total tickets', _anNum(t.total), 'Tickets created in range.')}
+          ${_anStat('clock', 'amber', 'Unresolved tickets', _anNum(t.unresolved), 'Tickets created in range that are still open or in progress.')}
+          ${_anStat('check', 'green', 'Resolved tickets', _anNum(t.resolved), 'Tickets created in range that are resolved or closed.')}
+          ${_anStat('unassigned', 'grey', 'Unassigned', _anNum(t.unassigned), 'Unresolved tickets created in range with no assignee.')}
+          ${_anStat('hourglass', 'blue', 'Average resolution time', _anDur(t.avg_resolution_seconds, 'No tickets resolved in this range.'), 'Average time from creation to resolution for tickets resolved in range.')}
+        </div>
+        ${_anChartCard('an-chart', 'Ticket history', [
+          { label: 'Unresolved', color: '--an-peach', desc: 'Open or in-progress tickets at the end of each period' },
+          { label: 'Created', color: '--an-red', desc: 'Tickets created in each period' },
+          { label: 'Closed', color: '--an-green', desc: 'Tickets resolved or closed in each period' }], { cls: 'an-chart-wide' })}
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead>
+              <tr class="an-group-head"><th colspan="5"></th><th colspan="4" class="an-sep-l">Unresolved tickets by age</th></tr>
+              <tr>
+                ${_anTh('User')}
+                ${_anTh('Total', 'Tickets created in range, by assignee.')}
+                ${_anTh('Open / In progress', '', 'h-amber')}
+                ${_anTh('Closed', '', 'h-green')}
+                ${_anTh('Avg. resolution time', '', 'h-blue')}
+                ${_anTh('< 1 hour', '', 'an-sep-l')}${_anTh('< 24 hours')}${_anTh('< 7 days')}${_anTh('> 7 days')}
+              </tr>
+            </thead>
+            <tbody>${row(totalRow, true)}${(d.rows || []).map(r => row(r)).join('') || _anEmptyRow(9)}</tbody>
+          </table></div>
+        </div>`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Unresolved', color: '--an-peach', data: s.unresolved || [] },
+        { label: 'Created', color: '--an-red', data: s.created || [] },
+        { label: 'Closed', color: '--an-green', data: s.closed || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+
+  messages: {
+    html(d) {
+      const t = d.total || {};
+      const frtTip = _anFrtTip(d);
+      const row = r => `
+        <tr>
+          <td>${_anUserCell(r)}</td>
+          <td>${_anNum(r.active_chats)}</td>
+          <td>${_anNum(r.messages_sent)}</td>
+          <td>${_anNum(r.responses_flagged)}</td>
+          <td>${_anDur(r.median_frt_seconds, _AN_NO_FRT)}</td>
+        </tr>`;
+      return `
+        <div class="an-stats an-stats-5">
+          ${_anStat('chats', 'green', 'Active chats', _anNum(t.active_chats), 'Chats with at least one message in range.')}
+          ${_anStat('out', 'blue', 'Outgoing messages', _anNum(t.outgoing), 'Messages sent from your numbers.')}
+          ${_anStat('in', 'navy', 'Incoming messages', _anNum(t.incoming), 'Messages received on your numbers.')}
+          ${_anStat('flag', 'red', 'Responses to flagged messages', _anNum(t.responses_flagged), 'Replies to flagged incoming messages.')}
+          ${_anStat('stopwatch', 'amber', 'Median first response time', _anDur(t.median_frt_seconds, _AN_NO_FRT), frtTip)}
+        </div>
+        ${_anChartCard('an-chart', 'Message metrics overview', [
+          { label: 'Active chats', color: '--an-green' }, { label: 'Outgoing messages', color: '--an-blue' },
+          { label: 'Incoming messages', color: '--an-navy' }, { label: 'Responses to flagged messages', color: '--an-red' }], { cls: 'an-chart-wide' })}
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead><tr>
+              ${_anTh('User')}
+              ${_anTh('# Active chats', 'Chats the member sent a message in.')}
+              ${_anTh('# Messages sent', 'Messages the member sent from Hyperscope.')}
+              ${_anTh('# Responses (to flagged messages)')}
+              ${_anTh('Median first response time (to flagged messages)', frtTip)}
+            </tr></thead>
+            <tbody>${(d.rows || []).map(row).join('') || _anEmptyRow(5)}</tbody>
+          </table></div>
+        </div>`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Active chats', color: '--an-green', data: s.active_chats || [] },
+        { label: 'Outgoing messages', color: '--an-blue', data: s.outgoing || [] },
+        { label: 'Incoming messages', color: '--an-navy', data: s.incoming || [] },
+        { label: 'Responses to flagged messages', color: '--an-red', data: s.responses_flagged || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+
+  members: {
+    html(d) {
+      const t = d.total || {};
+      return `
+        <div class="an-stats an-stats-3">
+          ${_anStat('userPlus', 'green', 'Members joined', _anNum(t.joined), 'Members who joined a group or were added to one.')}
+          ${_anStat('userMinus', 'navy', 'Members left', _anNum(t.left), 'Members who left a group.')}
+          ${_anStat('userX', 'red', 'Members removed', _anNum(t.removed), 'Members removed from a group by an admin.')}
+        </div>
+        ${_anChartCard('an-chart', 'Member activity', [
+          { label: 'Joins', color: '--an-green' }, { label: 'Leaves', color: '--an-navy' }, { label: 'Removes', color: '--an-red' }], { cls: 'an-chart-wide' })}`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Joins', color: '--an-green', data: s.joined || [] },
+        { label: 'Leaves', color: '--an-navy', data: s.left || [] },
+        { label: 'Removes', color: '--an-red', data: s.removed || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+};
+
+// ── Page CSV export (what the page shows) ── //
+function _anExportCsv() {
+  const d = AN.data;
+  if (!d) return toast('Nothing to export yet', 'error');
+  const sec = v => (v == null ? '' : Math.round(v));
+  const series = (s, cols) => [['Period start', ...cols.map(c => c[1])],
+    ...(s.buckets || []).map((b, i) => [new Date(b).toLocaleString('en-GB'), ...cols.map(c => (s[c[0]] || [])[i] ?? 0)])];
+  let rows;
+  if (AN.sub === 'team') {
+    const h = ['User', 'Email', 'Active chats', 'Messages sent', 'Chats initiated', 'Tickets closed', 'Responses (to flagged messages)', 'Median first response time (s)', 'User uptime (s)'];
+    const r = (x, name, email) => [name, email, x.active_chats, x.messages_sent, x.chats_initiated, x.tickets_closed, x.responses_flagged, sec(x.median_frt_seconds), sec(x.uptime_seconds)];
+    rows = [h, r(d.total, 'Total', 'All members'), ...d.rows.map(x => r(x, x.name, x.email))];
+  } else if (AN.sub === 'phones') {
+    const r = (x, name, num) => [name, num, x.new_chats, x.messages_sent, x.responses_flagged, sec(x.median_frt_seconds)];
+    rows = [['Phone', 'Number', 'New chats created', 'Messages sent', 'Responses (to flagged messages)', 'Median first response time (s)'],
+            r(d.total, 'Total', ''), ...d.rows.map(x => r(x, x.name, x.phone_number))];
+  } else if (AN.sub === 'chats') {
+    rows = [...series(d.series, [['individual', 'Individual chats'], ['group', 'Group chats']]), [],
+            ['Most active chats', 'Total messages'], ...d.most_active.map(c => [displayName(c.name), c.messages])];
+  } else if (AN.sub === 'tickets') {
+    const a = x => x.unresolved_age || {};
+    const r = (x, name) => [name, x.total, x.open, x.closed, sec(x.avg_resolution_seconds), a(x).lt_1h, a(x).lt_24h, a(x).lt_7d, a(x).gt_7d];
+    const t = d.total;
+    rows = [['User', 'Total', 'Open / In progress', 'Closed', 'Avg. resolution time (s)', 'Unresolved < 1 hour', '< 24 hours', '< 7 days', '> 7 days'],
+            r({ total: t.total, open: t.unresolved, closed: t.resolved, avg_resolution_seconds: t.avg_resolution_seconds, unresolved_age: t.unresolved_age }, 'Total'),
+            ...d.rows.map(x => r(x, x.name)), [],
+            ...series(d.series, [['unresolved', 'Unresolved'], ['created', 'Created'], ['closed', 'Closed']])];
+  } else if (AN.sub === 'messages') {
+    rows = [['User', 'Email', '# Active chats', '# Messages sent', '# Responses (to flagged messages)', 'Median first response time (s)'],
+            ...d.rows.map(x => [x.name, x.email, x.active_chats, x.messages_sent, x.responses_flagged, sec(x.median_frt_seconds)]), [],
+            ...series(d.series, [['active_chats', 'Active chats'], ['outgoing', 'Outgoing messages'], ['incoming', 'Incoming messages'], ['responses_flagged', 'Responses to flagged messages']])];
+  } else if (AN.sub === 'members') {
+    rows = series(d.series, [['joined', 'Joins'], ['left', 'Leaves'], ['removed', 'Removes']]);
+  } else return;
+  const csv = rows.map(csvRow).join('\r\n');
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = `${AN.sub}-analytics_${AN.range.from}_to_${AN.range.to}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ── Data exports ── //
+const AN_EXPORTS = [
+  { key: 'chats',       icon: 'chats',    title: 'Chats export',          desc: 'All chats with type, phone, assignee, labels and custom properties.', range: 'Last activity', rangeOptional: true },
+  { key: 'tickets',     icon: 'ticket',   title: 'Tickets export',        desc: 'Tickets with status, priority, assignee, labels and SLA details.', range: 'Created', rangeOptional: true },
+  { key: 'messages',    icon: 'message',  title: 'Messages export',       desc: 'Message history with direction, sender and the member who sent it.', range: 'Sent', flagged: true },
+  { key: 'notes',       icon: 'note',     title: 'Private notes export',  desc: 'Internal team notes left on chats, with author and time.', range: 'Created', rangeOptional: true },
+  { key: 'phones',      icon: 'phone',    title: 'Phones export',         desc: 'Connected WhatsApp numbers with their session and status.' },
+  { key: 'chatActions', icon: 'actions',  title: 'Chat actions export',   desc: 'Group membership events — joins, adds, leaves, removals and admin changes.', range: 'Happened' },
+  { key: 'contacts',    icon: 'contacts', title: 'Contacts export',       desc: 'Your contact book with labels and custom properties (masked numbers stay masked).' },
+  { key: 'logs',        icon: 'logs',     title: 'Activity logs export',  desc: 'Full audit trail of actions taken in the workspace.', range: 'Happened' },
+];
+
+function _anRenderExports(host) {
+  const admin = isAdmin();
+  host.innerHTML = `
+    <div class="an-page an-exports">
+      <div class="an-title">${anIcon('export', 'an-title-ic')}<h1>Data exports</h1></div>
+      <p class="an-exports-sub">Download your workspace data as CSV files.${admin ? '' : ' Only admins can export data.'}</p>
+      <div class="an-export-list">
+        ${AN_EXPORTS.map(x => `
+          <button class="an-card an-export-card" data-key="${x.key}"${admin ? '' : ' disabled aria-disabled="true"'}>
+            <span class="an-export-ic">${anIcon(x.icon)}</span>
+            <span class="an-export-text"><span class="an-export-title">${esc(x.title)}</span><span class="an-export-desc">${esc(x.desc)}</span></span>
+            ${anIcon('right', 'an-export-chev')}
+          </button>`).join('')}
+      </div>
+    </div>`;
+  if (!admin) return;
+  host.querySelectorAll('.an-export-card').forEach(b => b.addEventListener('click', () =>
+    _anExportModal(AN_EXPORTS.find(x => x.key === b.dataset.key))));
+}
+
+function _anExportModal(x) {
+  const today = new Date();
+  const from = _anYmd(_anAddDays(today, -29)), to = _anYmd(today);
+  const rangeHTML = x.range ? `
+    ${x.rangeOptional ? `<label class="an-check an-check-inline"><input type="checkbox" id="anx-all" checked><span>All time</span></label>` : ''}
+    <div class="an-custom an-modal-range" id="anx-range"${x.rangeOptional ? ' hidden' : ''}>
+      <label>${esc(x.range)} from<input type="date" id="anx-from" value="${from}" max="${to}"></label>
+      <label>To<input type="date" id="anx-to" value="${to}" max="${to}"></label>
+    </div>` : '<p class="an-modal-note">Exports every record — no date range needed.</p>';
+  showModal(x.title, `
+    <div class="an-modal">
+      <p class="an-modal-desc">${esc(x.desc)}</p>
+      ${rangeHTML}
+      ${x.flagged ? '<label class="an-check an-check-inline"><input type="checkbox" id="anx-flagged"><span>Flagged messages only</span></label>' : ''}
+      <div class="an-modal-foot">
+        <button class="btn btn-secondary btn-sm" id="anx-cancel">Cancel</button>
+        <button class="btn btn-primary btn-sm" id="anx-go">${anIcon('download')} Download CSV</button>
+      </div>
+    </div>`);
+  const all = document.getElementById('anx-all');
+  all?.addEventListener('change', () => { document.getElementById('anx-range').hidden = all.checked; });
+  document.getElementById('anx-cancel').addEventListener('click', () => closeModal());
+  document.getElementById('anx-go').addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    const q = {};
+    if (x.range && !(all && all.checked)) {
+      const f = document.getElementById('anx-from').value, t = document.getElementById('anx-to').value;
+      if (!f || !t || f > t) return toast('Pick a valid date range', 'error');
+      q.from = _anParseYmd(f).toISOString();
+      q.to = _anAddDays(_anParseYmd(t), 1).toISOString();
+    }
+    if (x.flagged && document.getElementById('anx-flagged').checked) q.flagged_only = 'true';
+    btn.disabled = true;
+    try { await Api.exports[x.key](q); toast('Export downloaded', 'success'); closeModal(); }
+    catch (err) { toast(err.message, 'error'); }
+    finally { btn.disabled = false; }
+  });
 }
 
 // ── AI AGENT VIEW ───────────────────────────────────────────────── //
@@ -4653,17 +5485,22 @@ async function renderSettings() {
         <div class="tab" data-tab="quickreplies">Quick Replies</div>
         <div class="tab" data-tab="agents">Agents</div>
         <div class="tab" data-tab="properties">Custom Properties</div>
-        ${isAdmin() ? '<div class="tab" data-tab="exports">Data Exports</div>' : ''}
+        ${isAdmin() ? '<a class="tab tab-link" href="#analytics/exports" id="settings-exports-link">Data exports ↗</a>' : ''}
       </div>
       <div class="scroll-area" id="settings-content"></div>
     </div>`;
 
-  document.querySelectorAll('.tab').forEach(t => {
+  const tabs = document.querySelectorAll('#settings-tabs .tab[data-tab]');
+  tabs.forEach(t => {
     t.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      tabs.forEach(x => x.classList.remove('active'));
       t.classList.add('active');
       loadSettingsTab(t.dataset.tab);
     });
+  });
+  document.getElementById('settings-exports-link')?.addEventListener('click', e => {
+    e.preventDefault();
+    navigateTo('analytics/exports');
   });
 
   loadSettingsTab('phones');
@@ -5249,32 +6086,6 @@ async function loadSettingsTab(tab) {
         });
       });
     } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
-  }
-
-
-
-  else if (tab === 'exports') {
-    el.innerHTML = `
-      <div class="settings-grid">
-        ${[
-          ['Chats', 'chats', 'All chats with status, labels and assignment'],
-          ['Messages (30d)', 'messages', 'Message history for the last 30 days'],
-          ['Tickets', 'tickets', 'Tickets with status, priority and SLA info'],
-          ['Contacts', 'contacts', 'Contact book (masked numbers stay masked)'],
-          ['Audit Logs (30d)', 'logs', 'Full audit trail — admin only'],
-        ].map(([label, key, desc]) => `
-          <div class="content-card">
-            <div class="card-header">${label}</div>
-            <div class="card-body">
-              <p class="text-muted" style="font-size:12.5px;margin-bottom:.7rem">${desc}</p>
-              <button class="btn btn-secondary btn-sm export-btn" data-key="${key}">Download CSV</button>
-            </div>
-          </div>`).join('')}
-      </div>`;
-    el.querySelectorAll('.export-btn').forEach(btn => btn.addEventListener('click', async () => {
-      try { await Api.exports[btn.dataset.key](); toast('Export downloaded', 'success'); }
-      catch(e) { toast(e.message, 'error'); }
-    }));
   }
 }
 

@@ -144,12 +144,16 @@ const Api = (() => {
     del:        (id)     => del(`/phones/${id}`),
   };
 
-  // Analytics
+  // Analytics — every page takes { from, to, tz, chat_id, phone_ids, agent_ids }
+  const _clean = q => Object.fromEntries(Object.entries(q || {}).filter(([, v]) => v != null && v !== ''));
   const analytics = {
-    dashboard: ()     => get('/analytics/dashboard'),
-    messages:  (d)    => get('/analytics/messages', { days: d }),
-    tickets:   ()     => get('/analytics/tickets'),
-    agents:    (d)    => get('/analytics/agents', { days: d }),
+    team:     (q) => get('/analytics/team', _clean(q)),
+    phones:   (q) => get('/analytics/phones', _clean(q)),
+    chats:    (q) => get('/analytics/chats', _clean(q)),
+    tickets:  (q) => get('/analytics/tickets', _clean(q)),
+    messages: (q) => get('/analytics/messages', _clean(q)),
+    members:  (q) => get('/analytics/members', _clean(q)),
+    chatOptions: (search) => get('/analytics/chat-options', { q: search || '' }),
     // Dashboard home: chats/team/tickets/phones in one call (phone-scoped)
     summary:   ()     => get('/dashboard/summary'),
   };
@@ -273,12 +277,21 @@ const Api = (() => {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   }
+  // Each export takes optional { from, to } (ISO); a number is the legacy "last N days"
+  const _exportQs = (q, extra) => {
+    const p = typeof q === 'number' ? { days: q } : _clean(q);
+    const qs = new URLSearchParams({ ...p, ...(extra || {}) }).toString();
+    return qs ? '?' + qs : '';
+  };
   const exportsApi = {
-    chats:    ()     => download('/exports/chats.csv', 'chats.csv'),
-    messages: (days) => download(`/exports/messages.csv?days=${days || 30}`, 'messages.csv'),
-    tickets:  ()     => download('/exports/tickets.csv', 'tickets.csv'),
-    contacts: ()     => download('/exports/contacts.csv', 'contacts.csv'),
-    logs:     (days) => download(`/exports/logs.csv?days=${days || 30}`, 'audit_logs.csv'),
+    chats:       (q) => download('/exports/chats.csv' + _exportQs(q), 'chats.csv'),
+    messages:    (q) => download('/exports/messages.csv' + _exportQs(q ?? 30), 'messages.csv'),
+    tickets:     (q) => download('/exports/tickets.csv' + _exportQs(q), 'tickets.csv'),
+    contacts:    ()  => download('/exports/contacts.csv', 'contacts.csv'),
+    logs:        (q) => download('/exports/logs.csv' + _exportQs(q ?? 30), 'audit_logs.csv'),
+    notes:       (q) => download('/exports/notes.csv' + _exportQs(q), 'private_notes.csv'),
+    phones:      ()  => download('/exports/phones.csv', 'phones.csv'),
+    chatActions: (q) => download('/exports/chat_actions.csv' + _exportQs(q ?? 30), 'chat_actions.csv'),
   };
 
   // Search

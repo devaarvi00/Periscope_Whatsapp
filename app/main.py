@@ -42,6 +42,7 @@ from app.core.logging import configure_logging
 from app.core.ws_manager import ws_manager
 from app.db.init_db import init_db
 from app.db.session import get_db
+from app.services.analytics_service import analytics_startup
 
 _FRONTEND = Path(__file__).parent.parent / "frontend"
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ async def lifespan(_: FastAPI):
     init_db()
     from app.db.mongo import init_mongo_indexes
     await init_mongo_indexes()
+    await analytics_startup()  # analytics indexes + agent presence tracking
     await http_client.startup()
     await _configure_waha_webhook()
 
