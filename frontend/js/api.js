@@ -86,6 +86,7 @@ const Api = (() => {
     getChat:       (id)   => get(`/inbox/chats/${id}`),
     activity:      (id)   => get(`/inbox/chats/${id}/activity`),
     picture:       (id)   => get(`/inbox/chats/${id}/picture`),
+    team:          (id)   => get(`/inbox/chats/${id}/team`),
   };
 
   // Tickets
@@ -209,7 +210,13 @@ const Api = (() => {
   // Groups
   const groups = {
     list:            (q)  => get('/groups', q),
-    participants:    (id) => get(`/groups/${id}/participants`),
+    participants:    (id, refresh) => get(`/groups/${id}/participants`, refresh ? { refresh: true } : undefined),
+    info:            (id, refresh) => get(`/groups/${id}/info`, refresh ? { refresh: true } : undefined),
+    memberPicture:   (id, pid) => get(`/groups/${id}/members/picture`, { id: pid }),
+    addMembers:      (id, numbers) => post(`/groups/${id}/members/add`, { numbers }),
+    memberAction:    (id, action, participants) => post(`/groups/${id}/members/${action}`, { participants }),
+    inviteLink:      (id) => post(`/groups/${id}/invite-link`),
+    updateSettings:  (id, b) => patch(`/groups/${id}/settings`, b),
     analytics:       (id, days) => get(`/groups/${id}/analytics`, { days: days || 30 }),
     addParticipants: (b)  => post('/groups/add-participants', b),
     analyticsRange:  (id, r) => get(`/groups/${id}/analytics`, { from: r.from, to: r.to }),

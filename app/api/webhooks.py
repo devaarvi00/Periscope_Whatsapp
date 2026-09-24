@@ -217,7 +217,8 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         _ai_cfg = _get_ai_cfg(db)
         _flag_on = settings.ai_auto_flag_enabled or _ai_cfg.flag_enabled
         _flag_criteria = _ai_cfg.flag_criteria or settings.ai_auto_flag_criteria
-        if not from_me and body and _flag_on:
+        # A chat can opt out of auto-flagging (Settings tab → "Allow AI Flagging")
+        if not from_me and body and _flag_on and chat.get("ai_flagging") is not False:
             try:
                 from app.services.gemini_service import GeminiService
                 if await GeminiService().flag_message(body, _flag_criteria):

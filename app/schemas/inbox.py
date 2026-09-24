@@ -19,6 +19,8 @@ class ChatUpdateRequest(BaseModel):
     is_archived: bool | None = None
     is_pinned: bool | None = None
     ai_active: bool | None = None
+    # Per-chat opt-out of AI auto-flagging (missing on a chat = allowed)
+    ai_flagging: bool | None = None
     assigned_to: int | None = None
     status: Literal["open", "resolved"] | None = None
 
