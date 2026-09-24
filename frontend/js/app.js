@@ -268,8 +268,8 @@ function showApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app-shell').style.display = 'flex';
   renderAgent();
-  const hashView = location.hash.replace('#','');
-  navigateTo(hashView || 'dashboard');
+  const hashView = decodeURIComponent(location.hash.replace('#', ''));
+  navigateTo(VIEW_LABELS[hashView] ? hashView : 'dashboard');
   loadLabels();
   loadPhones();
   connectWS();
@@ -297,11 +297,6 @@ function renderAgent() {
   if (dan) dan.textContent = a.name;
   if (dae) dae.textContent = a.email || '';
 }
-
-// ── Topbar: refresh current view ─────────────────────────────────
-document.getElementById('topbar-refresh')?.addEventListener('click', () => {
-  navigateTo(State.currentView || 'dashboard');
-});
 
 // ── Topbar: global search with dropdown results ──────────────────
 (() => {
@@ -460,6 +455,8 @@ const VIEW_LABELS = {
 };
 
 function navigateTo(view) {
+  if (!VIEW_LABELS[view]) view = 'dashboard';
+  if (location.hash !== '#' + view) history.pushState(null, '', '#' + view);
   _stopDashWahaPoller();
   _stopDashQrPoll();
   _stopAllPhoneQrFlows();
@@ -491,6 +488,13 @@ function navigateTo(view) {
 
 document.querySelectorAll('.nav-item').forEach(el => {
   el.addEventListener('click', e => { e.preventDefault(); navigateTo(el.dataset.view); });
+});
+
+// Back/forward between views (hash is set by navigateTo)
+window.addEventListener('popstate', () => {
+  if (!State.agent) return;
+  const v = decodeURIComponent(location.hash.replace('#', ''));
+  if (VIEW_LABELS[v] && v !== State.currentView) navigateTo(v);
 });
 
 // ── WebSocket ──────────────────────────────────────────────────── //
@@ -2109,7 +2113,7 @@ async function showTicketModal(opts) {
 
 // ── Full task modal (also used from message right-click) ─────────
 async function showTaskModal(opts) {
-  const { chatId, message } = opts || {};
+  const { chatId, message, onSaved } = opts || {};
   let agents = [];
   try { agents = await Api.auth.agents(); } catch(_) {}
   showModal('Create Task', `
@@ -2147,6 +2151,7 @@ async function showTaskModal(opts) {
         notes: document.getElementById('tkt-notes').value.trim() || null,
       });
       closeModal(); toast('Task created', 'success');
+      if (typeof onSaved === 'function') onSaved();
     } catch(e) { toast(e.message, 'error'); }
   });
 }
@@ -2190,30 +2195,50 @@ async function renderTickets() {
               <tbody id="tickets-tbody"><tr><td colspan="8" style="text-align:center;padding:2rem"><div class="spinner"></div></td></tr></tbody>
             </table>
           </div>
+          <div id="tickets-more-wrap" style="display:none;text-align:center;padding:.75rem 1rem">
+            <button class="btn btn-secondary btn-sm" id="tickets-more-btn">Load more</button>
+          </div>
         </div>
       </div>
     </div>`;
 
+  State.tickets.filter = '';
   await loadTickets();
 
   document.getElementById('ticket-filter').addEventListener('change', e => {
     loadTickets(e.target.value);
   });
+  document.getElementById('tickets-more-btn').addEventListener('click', () => loadTickets(undefined, true));
 
   document.getElementById('new-ticket-btn').addEventListener('click', () => showCreateTicketModal());
 }
 
-async function loadTickets(status = '') {
+const TICKET_PAGE = 50;
+let _ticketsSeq = 0;
+
+// loadTickets(status?, append?) — status undefined keeps the current filter;
+// append=true fetches the next page (limit/offset) and adds it to the table
+async function loadTickets(status, append = false) {
+  if (status !== undefined) State.tickets.filter = status;
+  const filter = State.tickets.filter && State.tickets.filter !== 'all' ? State.tickets.filter : '';
+  const seq = ++_ticketsSeq;
+  const moreBtn = document.getElementById('tickets-more-btn');
+  if (moreBtn) { moreBtn.disabled = true; moreBtn.textContent = 'Loading…'; }
   try {
-    const q = {};
-    if (status) q.status = status;
-    const [list, agents] = await Promise.all([
+    const q = { limit: TICKET_PAGE, offset: append ? State.tickets.list.length : 0 };
+    if (filter) q.status = filter;
+    const [page, agents] = await Promise.all([
       Api.tickets.list(q),
       Api.auth.agents().catch(() => []),
     ]);
+    if (seq !== _ticketsSeq) return;   // superseded by a newer load
     const agentMap = {};
     agents.forEach(a => { agentMap[a.id] = a.name; });
+    const list = append ? State.tickets.list.concat(page) : page;
     State.tickets.list = list;
+    const moreWrap = document.getElementById('tickets-more-wrap');
+    if (moreWrap) moreWrap.style.display = page.length === TICKET_PAGE ? 'block' : 'none';
+    if (moreBtn) { moreBtn.disabled = false; moreBtn.textContent = 'Load more'; }
     const tbody = document.getElementById('tickets-tbody');
     if (!tbody) return;
     if (!list.length) {
@@ -2244,7 +2269,13 @@ async function loadTickets(status = '') {
         catch(e) { toast(e.message, 'error'); }
       });
     });
-  } catch(e) { toast('Failed to load tickets', 'error'); }
+  } catch(e) {
+    if (seq !== _ticketsSeq) return;
+    if (moreBtn) { moreBtn.disabled = false; moreBtn.textContent = 'Load more'; }
+    const tbody = document.getElementById('tickets-tbody');
+    if (tbody && !append) tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:2rem;color:var(--text-3)">Could not load tickets</td></tr>`;
+    toast(e.message || 'Failed to load tickets', 'error');
+  }
 }
 
 async function showCreateTicketModal() {
@@ -2379,9 +2410,10 @@ async function renderContacts() {
     </div>`;
 
   await loadContacts();
+  const debouncedLoad = debounce(loadContacts, 300);
   document.getElementById('contact-search').addEventListener('input', e => {
     State.contacts.search = e.target.value;
-    debounce(loadContacts, 300)();
+    debouncedLoad();
   });
   document.getElementById('new-contact-btn').addEventListener('click', () => showContactModal());
 }
@@ -2390,11 +2422,14 @@ function debounce(fn, ms) {
   let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
+let _contactsSeq = 0;
 async function loadContacts() {
   const q = {};
   if (State.contacts.search) q.search = State.contacts.search;
+  const seq = ++_contactsSeq;
   try {
     const list = await Api.contacts.list(q);
+    if (seq !== _contactsSeq) return;   // a newer search already started
     State.contacts.list = list;
     const el = document.getElementById('contacts-list');
     if (!el) return;
@@ -2423,7 +2458,12 @@ async function loadContacts() {
         catch(err) { toast(err.message, 'error'); }
       });
     });
-  } catch(_) {}
+  } catch(e) {
+    if (seq !== _contactsSeq) return;
+    const el = document.getElementById('contacts-list');
+    if (el) el.innerHTML = `<div class="loading-center text-muted">Could not load contacts</div>`;
+    toast(e.message || 'Failed to load contacts', 'error');
+  }
 }
 
 function showContactModal(contact = null) {
@@ -2716,7 +2756,11 @@ async function loadRules() {
         catch(e) { toast(e.message, 'error'); }
       });
     });
-  } catch(_) {}
+  } catch(e) {
+    const el = document.getElementById('rules-list');
+    if (el) el.innerHTML = `<div class="loading-center text-muted">Could not load automation rules</div>`;
+    toast(e.message || 'Failed to load automation rules', 'error');
+  }
 }
 
 async function showRuleModal() {
@@ -3367,6 +3411,11 @@ function showAddPhoneModal() {
   });
 }
 
+function _settingsLoadFailed(el, what, e) {
+  if (el) el.innerHTML = `<div class="loading-center text-muted">Could not load ${esc(what)}</div>`;
+  toast(e?.message || `Failed to load ${what}`, 'error');
+}
+
 // Settings → WhatsApp QR flows: interval handles keyed by phone id
 const _phoneQrFlows = {};
 function _stopPhoneQrFlow(phoneId) {
@@ -3603,7 +3652,7 @@ async function loadSettingsTab(tab) {
       });
 
 
-    } catch(_) { el.innerHTML = '<div class="loading-center text-muted">Could not load WhatsApp status</div>'; }
+    } catch(e) { _settingsLoadFailed(el, 'WhatsApp status', e); }
   }
 
   else if (tab === 'labels') {
@@ -3668,7 +3717,7 @@ async function loadSettingsTab(tab) {
           catch(e) { toast(e.message, 'error'); }
         });
       });
-    } catch(_) {}
+    } catch(e) { _settingsLoadFailed(el, 'labels', e); }
   }
 
   else if (tab === 'quickreplies') {
@@ -3732,7 +3781,7 @@ async function loadSettingsTab(tab) {
           catch(e) { toast(e.message, 'error'); }
         });
       });
-    } catch(_) {}
+    } catch(e) { _settingsLoadFailed(el, 'quick replies', e); }
   }
 
   else if (tab === 'agents') {
@@ -3788,7 +3837,7 @@ async function loadSettingsTab(tab) {
         showModal('Invite Team Member', `
           <div class="form-group"><label>Full Name *</label><input type="text" id="inv-name"></div>
           <div class="form-group"><label>Email *</label><input type="email" id="inv-email"></div>
-          <div class="form-group"><label>Password *</label><input type="password" id="inv-pass"></div>
+          <div class="form-group"><label>Password * <small class="text-muted">(8–72 characters)</small></label><input type="password" id="inv-pass" minlength="8" maxlength="72" autocomplete="new-password"></div>
           <div class="form-group"><label>Role</label>
             <select id="inv-role"><option value="agent">Agent</option><option value="admin">Admin</option><option value="viewer">Viewer</option></select>
           </div>
@@ -3801,13 +3850,14 @@ async function loadSettingsTab(tab) {
           const email = document.getElementById('inv-email').value.trim();
           const pass = document.getElementById('inv-pass').value;
           if (!name || !email || !pass) return toast('All fields required', 'error');
+          if (pass.length < 8 || pass.length > 72) return toast('Password must be 8–72 characters', 'error');
           try {
             await Api.auth.register({ name, email, password: pass, role: document.getElementById('inv-role').value });
             closeModal(); toast('Agent created', 'success'); loadSettingsTab('agents');
           } catch(e) { toast(e.message, 'error'); }
         });
       });
-    } catch(_) {}
+    } catch(e) { _settingsLoadFailed(el, 'agents', e); }
   }
 
   else if (tab === 'properties') {
@@ -4970,13 +5020,8 @@ async function renderChatListView() {
   viewSel.addEventListener('change', loadTasks);
 
   document.getElementById('tasks-create-btn').addEventListener('click', () => {
-    // Full task modal (due date, reminder, assignee, priority, notes)
-    showTaskModal({});
-    // refresh the panel after the modal closes
-    const overlay = document.getElementById('modal-overlay');
-    const watcher = setInterval(() => {
-      if (overlay.style.display === 'none') { clearInterval(watcher); loadTasks(); }
-    }, 400);
+    // Full task modal (due date, reminder, assignee, priority, notes); refresh the panel once saved
+    showTaskModal({ onSaved: () => { if (panel.style.display !== 'none') loadTasks(); } });
   });
 })();
 
