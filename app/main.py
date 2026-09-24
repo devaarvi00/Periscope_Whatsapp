@@ -186,13 +186,6 @@ async def _receive_ws_auth_token(websocket: WebSocket) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
-async def _register_ws(websocket: WebSocket, agent_id: int) -> None:
-    """Register an already-accepted socket (ws_manager.connect() would accept again)."""
-    ws_manager._connections.setdefault(agent_id, []).append(websocket)
-    logger.info("WS connected: agent_id=%s  total_agents=%s", agent_id, len(ws_manager._connections))
-    await ws_manager._send(websocket, {"type": "connected", "agent_id": agent_id})
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = ""):
     """
@@ -236,7 +229,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
         await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Agent not found")
         return
 
-    await _register_ws(websocket, agent_id)
+    await ws_manager.connect(websocket, agent_id, accept=False)
 
     # ── Message loop with heartbeat ───────────────────────────────── #
     PING_INTERVAL = 25  # seconds
@@ -255,7 +248,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
 
             except asyncio.TimeoutError:
                 # No message received — send ping to check if client is alive
-                sent = await ws_manager._send(websocket, {"type": "ping"})
+                sent = await ws_manager.send(websocket, {"type": "ping"})
                 if not sent:
                     break
 
