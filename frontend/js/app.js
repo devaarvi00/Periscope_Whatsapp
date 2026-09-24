@@ -398,10 +398,36 @@ document.getElementById('login-form').addEventListener('submit', async e => {
   }
 });
 
-const logoutFn = () => {
-  if (State.ws) State.ws.close();
-  Api.clearToken(); State.agent = null; showLogin();
-};
+function logoutFn() {
+  disconnectWS();
+  _stopDashWahaPoller();
+  _stopDashQrPoll();
+  _stopAllPhoneQrFlows();
+  clearTimeout(_chatDebounce);
+  closeLabelPicker();
+  closeModal();
+  Api.clearToken();
+  // Reset in-memory state so the next login starts clean
+  Object.assign(State, {
+    agent: null,
+    currentView: 'inbox',
+    inbox: { chats: [], selectedChatId: null, messages: [], filter: 'all', search: '' },
+    tickets: { list: [], filter: 'all' },
+    contacts: { list: [], search: '' },
+    labels: [],
+    phones: [],
+    ws: null,
+  });
+  _chatAutoSynced = false;
+  ['tasks-panel', 'ai-panel', 'notif-popover', 'topbar-dropdown'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+  const main = document.getElementById('main-content');
+  if (main) main.innerHTML = '';
+  history.replaceState(null, '', location.pathname + location.search);
+  showLogin();
+}
 document.getElementById('logout-btn')?.addEventListener('click', logoutFn);
 document.getElementById('topbar-logout-btn')?.addEventListener('click', logoutFn);
 
@@ -430,6 +456,8 @@ const VIEW_LABELS = {
 
 function navigateTo(view) {
   _stopDashWahaPoller();
+  _stopDashQrPoll();
+  _stopAllPhoneQrFlows();
   State.currentView = view;
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.view === view);
@@ -467,7 +495,22 @@ const WS = {
   maxDelay: 30000,
   pongTimeout: null,
   alive: false,
+  retryTimer: null,
 };
+
+// Close the socket (connecting or open) and cancel any pending reconnect
+function disconnectWS() {
+  clearTimeout(WS.retryTimer);
+  WS.retryTimer = null;
+  if (WS.socket) {
+    WS.socket.onopen = WS.socket.onmessage = WS.socket.onerror = WS.socket.onclose = null;
+    try { WS.socket.close(); } catch(_) {}
+    WS.socket = null;
+  }
+  State.ws = null;
+  WS.alive = false;
+  WS.retryDelay = 1000;
+}
 
 function wsSetStatus(status, label) {
   const el = document.getElementById('ws-status');
@@ -481,22 +524,27 @@ function wsSetStatus(status, label) {
 function connectWS() {
   if (!State.agent || !Api.getToken()) return;
 
-  // Close any existing socket cleanly
+  // Close any existing socket cleanly (keeps the current backoff delay)
+  clearTimeout(WS.retryTimer);
+  WS.retryTimer = null;
   if (WS.socket) {
-    WS.socket.onclose = null;
-    WS.socket.close();
+    WS.socket.onopen = WS.socket.onmessage = WS.socket.onerror = WS.socket.onclose = null;
+    try { WS.socket.close(); } catch(_) {}
     WS.socket = null;
   }
 
   wsSetStatus('reconnecting', 'Connecting…');
 
+  // The JWT is sent as the first message, never in the URL (keeps it out of logs)
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws?token=${encodeURIComponent(Api.getToken())}`;
-  const ws = new WebSocket(url);
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
   WS.socket = ws;
   WS.alive = false;
 
   ws.onopen = () => {
+    const token = Api.getToken();
+    if (!token) { ws.close(); return; }
+    ws.send(JSON.stringify({ type: 'auth', token }));
     WS.retryDelay = 1000;   // reset backoff on success
     WS.alive = true;
     wsSetStatus('connected', 'Live');
@@ -530,16 +578,27 @@ function connectWS() {
     wsSetStatus('disconnected', 'Error');
   };
 
-  ws.onclose = () => {
+  ws.onclose = e => {
+    if (WS.socket !== ws) return;   // superseded by a newer socket
     WS.socket = null;
     State.ws = null;
     WS.alive = false;
+
+    // 4001 = token rejected/expired by the server → sign out, don't retry forever
+    if (e && e.code === 4001) {
+      wsSetStatus('disconnected', 'Signed out');
+      toast('Your session has expired — please sign in again', 'error');
+      logoutFn();
+      return;
+    }
+    if (!State.agent || !Api.getToken()) return;
+
     wsSetStatus('reconnecting', 'Reconnecting…');
 
     // Exponential backoff
     const delay = Math.min(WS.retryDelay, WS.maxDelay);
     WS.retryDelay = Math.min(WS.retryDelay * 2, WS.maxDelay);
-    setTimeout(connectWS, delay);
+    WS.retryTimer = setTimeout(connectWS, delay);
   };
 }
 
@@ -3303,9 +3362,22 @@ function showAddPhoneModal() {
   });
 }
 
+// Settings → WhatsApp QR flows: interval handles keyed by phone id
+const _phoneQrFlows = {};
+function _stopPhoneQrFlow(phoneId) {
+  const f = _phoneQrFlows[phoneId];
+  if (!f) return;
+  clearInterval(f.poll); clearInterval(f.sync);
+  delete _phoneQrFlows[phoneId];
+}
+function _stopAllPhoneQrFlows() {
+  Object.keys(_phoneQrFlows).forEach(_stopPhoneQrFlow);
+}
+
 async function loadSettingsTab(tab) {
   const el = document.getElementById('settings-content');
   if (!el) return;
+  _stopAllPhoneQrFlows();
   el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
 
   if (tab === 'phones') {
@@ -3397,11 +3469,15 @@ async function loadSettingsTab(tab) {
         const area = document.getElementById(`phone-qr-area-${phoneId}`);
         if (!area) return;
         area.innerHTML = `<div class="spinner" style="margin:.5rem auto"></div>`;
+        // One flow per phone: clear timers from an earlier Connect click first
+        _stopPhoneQrFlow(phoneId);
+        const flow = { poll: null, sync: null };
+        _phoneQrFlows[phoneId] = flow;
         let _syncTimer = null;
         let _pollTimer = null;
-        let attempt = 0;
         async function pollQr() {
-          if (!document.getElementById(`phone-qr-area-${phoneId}`)) { clearInterval(_pollTimer); clearInterval(_syncTimer); return; }
+          if (_phoneQrFlows[phoneId] !== flow) return;
+          if (!area.isConnected) { _stopPhoneQrFlow(phoneId); return; }
           try {
             const r = await Api.phones.qr(phoneId);
             if (r && r.qr) {
@@ -3409,11 +3485,11 @@ async function loadSettingsTab(tab) {
                 <img src="${safeImgSrc(r.qr)}" style="max-width:200px;border-radius:8px;border:1px solid var(--border);display:block;margin:0 auto">
                 <p style="font-size:11px;color:var(--text-2);margin:.6rem 0 0;text-align:center">Open WhatsApp → Linked Devices → Link a Device → Scan</p>`;
               if (!_syncTimer) {
-                _syncTimer = setInterval(async () => {
+                _syncTimer = flow.sync = setInterval(async () => {
                   try {
                     const s = await Api.phones.status(phoneId);
                     if (s.status === 'WORKING') {
-                      clearInterval(_syncTimer); clearInterval(_pollTimer);
+                      _stopPhoneQrFlow(phoneId);
                       await Api.phones.syncNumber(phoneId).catch(() => {});
                       toast('WhatsApp connected! Syncing chats…', 'success');
                       loadSettingsTab('phones'); loadPhones();
@@ -3429,7 +3505,7 @@ async function loadSettingsTab(tab) {
               try {
                 const s = await Api.phones.status(phoneId);
                 if (s.status === 'WORKING') {
-                  clearInterval(_pollTimer); clearInterval(_syncTimer);
+                  _stopPhoneQrFlow(phoneId);
                   await Api.phones.syncNumber(phoneId).catch(() => {});
                   toast('WhatsApp connected! Syncing chats…', 'success');
                   loadSettingsTab('phones'); loadPhones();
@@ -3442,9 +3518,8 @@ async function loadSettingsTab(tab) {
               area.innerHTML = `<p style="font-size:12px;color:var(--text-2);text-align:center">Waiting for QR…</p>`;
             }
           } catch(e) { area.innerHTML = `<p style="font-size:12px;color:var(--danger);text-align:center">${esc(e.message)}</p>`; }
-          attempt++;
         }
-        _pollTimer = setInterval(pollQr, 7000);
+        _pollTimer = flow.poll = setInterval(pollQr, 7000);
         await pollQr();
       }
 
@@ -3857,6 +3932,15 @@ function _stopDashWahaPoller() {
   if (_dashWahaTimer) { clearInterval(_dashWahaTimer); _dashWahaTimer = null; }
 }
 
+// pollDashQR() setTimeout chain: a token lets Cancel/navigation stop it
+let _dashQrTimer = null;
+let _dashQrToken = 0;
+function _stopDashQrPoll() {
+  _dashQrToken++;
+  clearTimeout(_dashQrTimer);
+  _dashQrTimer = null;
+}
+
 async function _updateDashWaha(phoneId) {
   if (_dashWahaUpdating) return;
   _dashWahaUpdating = true;
@@ -3957,20 +4041,28 @@ async function _dashShowQR(phoneId) {
   if (lbl) lbl.innerHTML = 'Clearing session…';
   if (act) act.innerHTML = '';
 
+  _stopDashQrPoll();
+  const token = _dashQrToken;
+  const cancelled = () => token !== _dashQrToken || !document.getElementById('dash-waha-box');
+
   await Api.phones.logout(phoneId).catch(() => {});
   await new Promise(r => setTimeout(r, 1500));
+  if (cancelled()) return;
   await Api.phones.start(phoneId).catch(() => {});
   await new Promise(r => setTimeout(r, 1500));
+  if (cancelled()) return;
 
   if (lbl) lbl.innerHTML = 'Loading QR…';
 
   let attempts = 0;
   async function pollDashQR() {
-    if (!document.getElementById('dash-waha-box')) return; // navigated away
+    if (cancelled()) return; // cancelled or navigated away
     try {
       const s = await Api.phones.status(phoneId);
+      if (cancelled()) return;
       const status = (s.status || '').toUpperCase();
       if (status === 'WORKING') {
+        _stopDashQrPoll();
         await Api.phones.syncNumber(phoneId).catch(() => {});
         toast('WhatsApp connected! Syncing chats…', 'success');
         // Sync chats from WAHA then refresh chat list
@@ -3983,6 +4075,7 @@ async function _dashShowQR(phoneId) {
         return;
       }
       const r = await Api.phones.qr(phoneId);
+      if (cancelled()) return;
       if (r && r.qr) {
         const b = document.getElementById('dash-waha-box');
         const l = document.getElementById('dash-waha-label');
@@ -3992,6 +4085,7 @@ async function _dashShowQR(phoneId) {
         if (a) {
           a.innerHTML = `<button class="btn btn-danger btn-sm" id="dash-btn-cancel-qr">Cancel</button>`;
           document.getElementById('dash-btn-cancel-qr')?.addEventListener('click', () => {
+            _stopDashQrPoll();
             Api.phones.stop(phoneId).catch(()=>{});
             _dashWahaPrevStatus = '';
             _startDashWahaPoller(phoneId);
@@ -4002,7 +4096,7 @@ async function _dashShowQR(phoneId) {
       }
     } catch(_) {}
     attempts++;
-    if (attempts < 30) setTimeout(pollDashQR, 5000);
+    if (attempts < 30 && !cancelled()) _dashQrTimer = setTimeout(pollDashQR, 5000);
   }
   pollDashQR();
 }
@@ -4032,6 +4126,8 @@ function _bindDashWahaButtons(phoneId) {
 }
 
 function _startDashWahaPoller(phoneId) {
+  _stopDashWahaPoller();
+  _stopDashQrPoll();
   _dashWahaPrevStatus = '';
   _dashWahaUpdating = false;
   _updateDashWaha(phoneId);
@@ -4961,11 +5057,6 @@ function notifyUser(type, title, bodyText) {
   const body = document.getElementById('ai-panel-body');
   const input = document.getElementById('ai-panel-q');
   const scopeChip = document.getElementById('ai-scope');
-
-  // Show the button once logged in
-  const bootWatch = setInterval(() => {
-    if (State.agent) { fab.style.display = 'flex'; clearInterval(bootWatch); }
-  }, 800);
 
   const ORG_RECIPES = [
     ['summarize_24h', '📋 Summarize last 24 hours'],
