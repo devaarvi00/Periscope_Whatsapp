@@ -1,5 +1,6 @@
 /* ── Hyperscope API Client ──────────────────────────────────────── */
 const BASE = '/api/v1';
+const FORBIDDEN_MSG = "You don't have permission to do this — ask an admin.";
 
 const Api = (() => {
   let _token = localStorage.getItem('token') || null;
@@ -21,6 +22,11 @@ const Api = (() => {
       body: body != null ? JSON.stringify(body) : undefined,
     });
     if (r.status === 401 && _token) { clearToken(); window.location.reload(); return; }
+    if (r.status === 403) {
+      const err = new Error(FORBIDDEN_MSG);
+      err.status = 403;
+      throw err;
+    }
     if (!r.ok) {
       let msg = 'Request failed';
       try {
@@ -248,6 +254,8 @@ const Api = (() => {
   // Exports: authenticated file downloads
   async function download(path, filename) {
     const r = await fetch(BASE + path, { headers: headers() });
+    if (r.status === 401 && _token) { clearToken(); window.location.reload(); return; }
+    if (r.status === 403) throw new Error(FORBIDDEN_MSG);
     if (!r.ok) throw new Error('Export failed');
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);

@@ -102,6 +102,11 @@ function chatSubtitle(chat) {
   return '';
 }
 
+// Admin-only controls (phone management, exports, automation rules) are hidden for other roles
+function isAdmin() {
+  return String(State.agent?.role || '').toLowerCase() === 'admin';
+}
+
 function avatarColor(name) {
   const colors = ['#0D8C7C','#2563EB','#7C3AED','#DB2777','#D97706','#059669'];
   let h = 0;
@@ -1232,7 +1237,7 @@ async function renderContactDetail(chat) {
       <div style="font-size:12px;color:var(--text-2);display:flex;flex-direction:column;gap:.3rem">
         <div style="display:flex;justify-content:space-between">
           <span style="color:var(--text-3)">Created</span>
-          <span>${chat.created_at ? new Date(chat.created_at).toLocaleDateString('en', {month:'short',day:'numeric',year:'numeric'}) : '—'}</span>
+          <span>${chat.created_at ? parseServerDate(chat.created_at).toLocaleDateString('en', {month:'short',day:'numeric',year:'numeric'}) : '—'}</span>
         </div>
         <div style="display:flex;justify-content:space-between">
           <span style="color:var(--text-3)">Last message</span>
@@ -2085,7 +2090,7 @@ async function showTicketModal(opts) {
         status: document.getElementById('tkm-status').value,
         priority: document.getElementById('tkm-priority').value,
         assigned_to: parseInt(document.getElementById('tkm-assignee').value) || null,
-        due_date: dueInp.value || null,
+        due_date: localInputToIso(dueInp.value),
       });
       const labelIds = [...document.querySelectorAll('.tk-label:checked')].map(c => +c.value);
       for (const lid of labelIds) await Api.tickets.addLabel(ticket.id, lid).catch(() => {});
@@ -2135,8 +2140,8 @@ async function showTaskModal(opts) {
         title,
         chat_id: chatId || null,
         message_wid: message?.message_wid || null,
-        due_date: document.getElementById('tkt-due').value || null,
-        reminder_at: document.getElementById('tkt-reminder').value || null,
+        due_date: localInputToIso(document.getElementById('tkt-due').value),
+        reminder_at: localInputToIso(document.getElementById('tkt-reminder').value),
         assigned_to: parseInt(document.getElementById('tkt-assignee').value) || null,
         priority: document.getElementById('tkt-prio').value,
         notes: document.getElementById('tkt-notes').value.trim() || null,
@@ -2221,7 +2226,7 @@ async function loadTickets(status = '') {
         <td><span class="${pillClass(t.status)}">${esc(t.status?.replace('_',' '))}</span></td>
         <td><span class="${pillClass(t.priority)}">${esc(t.priority)}</span></td>
         <td style="font-size:12px;color:var(--text-3)">${t.assigned_to ? esc(agentMap[t.assigned_to] || 'Agent #'+t.assigned_to) : '—'}</td>
-        <td style="font-size:12px;color:var(--text-3)">${t.due_date ? new Date(t.due_date).toLocaleDateString() : '—'}</td>
+        <td style="font-size:12px;color:var(--text-3)">${t.due_date ? parseServerDate(t.due_date).toLocaleDateString() : '—'}</td>
         <td>${t.sla_breached ? '<span class="pill" style="background:#FEF2F2;color:#DC2626">Breached</span>' : '<span class="pill" style="background:var(--success-bg);color:var(--success)">OK</span>'}</td>
         <td style="text-align:right">
           <button class="btn btn-ghost btn-sm ticket-edit" data-tid="${t.id}">Edit</button>
@@ -2652,13 +2657,13 @@ async function renderAutomation() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
         <h2>Automation Rules</h2>
-        <div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-rule-btn">+ New Rule</button></div>
+        ${isAdmin() ? `<div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-rule-btn">+ New Rule</button></div>` : ''}
       </div>
       <div class="scroll-area" id="rules-list"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>`;
 
   await loadRules();
-  document.getElementById('new-rule-btn').addEventListener('click', () => showRuleModal());
+  document.getElementById('new-rule-btn')?.addEventListener('click', () => showRuleModal());
 }
 
 async function loadRules() {
@@ -2688,11 +2693,11 @@ async function loadRules() {
         
         <div class="rule-controls" style="display:flex;align-items:center;gap:0.5rem;flex-shrink:0;margin-left:1.5rem">
           <span class="${pillClass(r.is_active ? 'active' : 'inactive')}" style="font-size:11.5px;font-weight:600">${r.is_active ? 'Active' : 'Paused'}</span>
-          <button class="btn btn-ghost btn-sm rule-toggle" data-rid="${r.id}" data-active="${r.is_active}" style="color:var(--accent);font-weight:600;font-size:12px;padding:4px 8px">${r.is_active ? 'Pause' : 'Resume'}</button>
+          ${isAdmin() ? `<button class="btn btn-ghost btn-sm rule-toggle" data-rid="${r.id}" data-active="${r.is_active}" style="color:var(--accent);font-weight:600;font-size:12px;padding:4px 8px">${r.is_active ? 'Pause' : 'Resume'}</button>
           <button class="btn btn-ghost btn-sm rule-del" data-rid="${r.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Rule">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
             Delete
-          </button>
+          </button>` : ''}
         </div>
       </div>`).join('');
 
@@ -2922,9 +2927,9 @@ async function loadBulkTab(tab) {
           <td>${(j.recipient_chat_ids||[]).length}</td>
           <td>${j.sent_count||0}</td>
           <td>${j.failed_count||0}</td>
-          <td style="font-size:12px">${esc(_bulkRepeatSummary(j))}${j.end_date ? `<div style="color:var(--text-3);font-size:11px">until ${new Date(j.end_date).toLocaleDateString()}</div>` : ''}</td>
+          <td style="font-size:12px">${esc(_bulkRepeatSummary(j))}${j.end_date ? `<div style="color:var(--text-3);font-size:11px">until ${parseServerDate(j.end_date).toLocaleDateString()}</div>` : ''}</td>
           <td>${j.runs_count||0}</td>
-          <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? new Date(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
+          <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? parseServerDate(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
           <td style="white-space:nowrap">
             <button class="btn btn-secondary btn-sm bulk-logs" data-jid="${j.id}">Logs</button>
             ${j.status==='pending' ? `<button class="btn btn-primary btn-sm bulk-send" data-jid="${j.id}">Send Now</button>
@@ -3053,7 +3058,7 @@ async function showBulkLogs(jobId) {
           <td>${esc(displayName(r.chat_name) || ('#' + (r.chat_id || '?')))}</td>
           <td><span class="${pillClass(r.status === 'sent' ? 'resolved' : 'urgent')}">${esc(r.status)}</span></td>
           <td>${r.run}</td>
-          <td style="font-size:11.5px;color:var(--text-3)">${r.at ? new Date(r.at).toLocaleString() : ''}</td>
+          <td style="font-size:11.5px;color:var(--text-3)">${r.at ? parseServerDate(r.at).toLocaleString() : ''}</td>
           <td style="font-size:11.5px;color:var(--text-3)">${esc(r.error || '—')}</td>
         </tr>`).join('') || '<tr><td colspan="5" class="text-muted">No delivery logs yet — logs appear after the campaign runs</td></tr>'}</tbody>
       </table></div>
@@ -3309,7 +3314,7 @@ async function renderSettings() {
         <div class="tab" data-tab="quickreplies">Quick Replies</div>
         <div class="tab" data-tab="agents">Agents</div>
         <div class="tab" data-tab="properties">Custom Properties</div>
-        <div class="tab" data-tab="exports">Data Exports</div>
+        ${isAdmin() ? '<div class="tab" data-tab="exports">Data Exports</div>' : ''}
       </div>
       <div class="scroll-area" id="settings-content"></div>
     </div>`;
@@ -3395,7 +3400,7 @@ async function loadSettingsTab(tab) {
               <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">WhatsApp Session</h3>
               <p style="margin:0;font-size:12.5px;color:var(--text-3)">Connect your WhatsApp number to Hyperscope</p>
             </div>
-            ${!phones.length ? `<button class="btn btn-primary btn-sm" id="btn-add-phone">+ Connect WhatsApp</button>` : ''}
+            ${!phones.length && isAdmin() ? `<button class="btn btn-primary btn-sm" id="btn-add-phone">+ Connect WhatsApp</button>` : ''}
           </div>
           
           <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:1rem">
@@ -3445,13 +3450,15 @@ async function loadSettingsTab(tab) {
               </div>
 
               <div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center">
-                ${connected
+                ${!isAdmin()
+                  ? `<span style="font-size:11.5px;color:var(--text-3)">Only admins can manage WhatsApp sessions</span>`
+                  : connected
                   ? `<button class="btn btn-secondary btn-sm phone-btn-reconnect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Reconnect / QR</button>
                      <button class="btn btn-danger btn-sm phone-btn-disconnect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Disconnect</button>
                      <button class="btn btn-ghost btn-sm phone-btn-clear" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px;color:#be123c" title="Delete all chats/messages for this phone from DB">Clear Data</button>`
                   : `<button class="btn btn-primary btn-sm phone-btn-connect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Connect</button>`
                 }
-                <button class="btn btn-ghost btn-sm phone-btn-delete" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px;margin-left:auto;color:var(--danger)" title="Remove phone session from Hyperscope">Delete</button>
+                ${isAdmin() ? `<button class="btn btn-ghost btn-sm phone-btn-delete" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px;margin-left:auto;color:var(--danger)" title="Remove phone session from Hyperscope">Delete</button>` : ''}
               </div>
             </div>
           `;
@@ -3965,9 +3972,9 @@ async function _updateDashWaha(phoneId) {
           <span style="font-size:12px;font-weight:600;color:#15803d;background:#dcfce7;padding:.25rem .75rem;border-radius:20px">Connected</span>
         </div>`;
         label.innerHTML = `<strong style="font-size:13px">WhatsApp</strong><br><span style="font-size:11px;color:var(--text-3)">Session active</span>`;
-        actions.innerHTML = `
+        actions.innerHTML = isAdmin() ? `
           <button class="btn btn-danger btn-sm" id="dash-btn-stop">Disconnect</button>
-          <button class="btn btn-primary btn-sm" id="dash-btn-restart">Restart</button>`;
+          <button class="btn btn-primary btn-sm" id="dash-btn-restart">Restart</button>` : '';
         _bindDashWahaButtons(phoneId);
       }
 
@@ -3977,7 +3984,7 @@ async function _updateDashWaha(phoneId) {
           <div style="width:28px;height:28px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
         </div>`;
         label.innerHTML = `Loading QR code…`;
-        actions.innerHTML = `<button class="btn btn-secondary btn-sm" id="dash-btn-restart">Reconnect</button>`;
+        actions.innerHTML = isAdmin() ? `<button class="btn btn-secondary btn-sm" id="dash-btn-restart">Reconnect</button>` : '';
         _bindDashWahaButtons(phoneId);
       }
       try {
@@ -4009,7 +4016,7 @@ async function _updateDashWaha(phoneId) {
           <span style="font-size:12px;font-weight:600;color:#dc2626;background:#fee2e2;padding:.25rem .75rem;border-radius:20px">Disconnected</span>
         </div>`;
         label.innerHTML = `Session is stopped`;
-        actions.innerHTML = `<button class="btn btn-primary btn-sm" id="dash-btn-start">Scan QR to Connect</button>`;
+        actions.innerHTML = isAdmin() ? `<button class="btn btn-primary btn-sm" id="dash-btn-start">Scan QR to Connect</button>` : '';
         _bindDashWahaButtons(phoneId);
       }
 
@@ -4022,7 +4029,7 @@ async function _updateDashWaha(phoneId) {
           <span style="font-size:12px;color:var(--text-3)">${esc(status)}</span>
         </div>`;
         label.innerHTML = `Unknown state`;
-        actions.innerHTML = `<button class="btn btn-secondary btn-sm" id="dash-btn-start">Start Session</button>`;
+        actions.innerHTML = isAdmin() ? `<button class="btn btn-secondary btn-sm" id="dash-btn-start">Start Session</button>` : '';
         _bindDashWahaButtons(phoneId);
       }
     }
@@ -4457,9 +4464,9 @@ async function loadScheduled() {
       <tbody>${items.map(m => `<tr>
         <td style="font-weight:600">${esc(displayName(m.chat_name) || ('#' + m.chat_id))}</td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
-        <td style="font-size:12px">${new Date(m.send_at).toLocaleString()}</td>
+        <td style="font-size:12px">${parseServerDate(m.send_at).toLocaleString()}</td>
         <td style="font-size:12px">${esc(m.repeat_summary || (m.repeat === 'none' ? 'Once' : m.repeat))}</td>
-        <td style="font-size:12px;color:var(--text-3)">${m.end_date ? new Date(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
+        <td style="font-size:12px;color:var(--text-3)">${m.end_date ? parseServerDate(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
         <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${esc(m.status)}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
         <td>${m.sent_count}</td>
         <td style="white-space:nowrap;text-align:right">${m.status === 'pending' ? `
@@ -4487,13 +4494,13 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
   const ed = editItem || {};
   const toLocalDt = (iso) => {
     if (!iso) return '';
-    const d = new Date(iso);
+    const d = parseServerDate(iso);
     if (isNaN(d.getTime())) return '';
     return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0, 16);
   };
   const toLocalDateOnly = (iso) => {
     if (!iso) return '';
-    const d = new Date(iso);
+    const d = parseServerDate(iso);
     if (isNaN(d.getTime())) return '';
     const yyyy = d.getFullYear();
     const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -4599,7 +4606,7 @@ async function renderLogs() {
             <input type="date" id="log-end-date" class="search-input" style="padding:4px 8px;font-size:12.5px;max-width:130px;height:30px">
           </div>
           <select id="log-action-filter" style="max-width:160px;height:30px;padding:4px 8px;font-size:12.5px;border-radius:6px;border:1px solid var(--border)"><option value="">All events</option></select>
-          <button class="btn btn-secondary btn-sm" id="log-export" style="height:30px;padding:4px 12px;font-size:12.5px">Export CSV</button>
+          ${isAdmin() ? '<button class="btn btn-secondary btn-sm" id="log-export" style="height:30px;padding:4px 12px;font-size:12.5px">Export CSV</button>' : ''}
         </div>
       </div>
       <div class="scroll-area">
@@ -4639,7 +4646,7 @@ async function renderLogs() {
   endInput.addEventListener('change', reloadWithFilters);
   actionSel.addEventListener('change', reloadWithFilters);
 
-  document.getElementById('log-export').addEventListener('click', async () => {
+  document.getElementById('log-export')?.addEventListener('click', async () => {
     try { await Api.exports.logs(30); toast('Export downloaded', 'success'); }
     catch(e) { toast(e.message, 'error'); }
   });
@@ -4706,7 +4713,7 @@ async function loadLogsTable(action, start_date, end_date) {
           </div>`;
       }
       return `<tr>
-        <td style="font-size:12.5px;color:var(--text-3);white-space:nowrap;vertical-align:top;padding-top:10px">${new Date(l.created_at).toLocaleString()}</td>
+        <td style="font-size:12.5px;color:var(--text-3);white-space:nowrap;vertical-align:top;padding-top:10px">${parseServerDate(l.created_at).toLocaleString()}</td>
         <td style="vertical-align:top;padding-top:8px">${formatLogEvent(l.action)}</td>
         <td style="font-size:13px;color:var(--text-2);vertical-align:top;padding-top:10px">${esc(l.agent_name || 'System')}</td>
         <td style="font-size:13px;vertical-align:top;padding-top:10px">${detailsHtml}</td>
@@ -4935,7 +4942,7 @@ async function renderChatListView() {
             <div class="task-title">${esc(t.title)}</div>
             <div class="task-sub">
               ${t.assignee_name ? esc(t.assignee_name) : 'Unassigned'}
-              ${t.due_date ? ' · due ' + new Date(t.due_date).toLocaleDateString() : ''}
+              ${t.due_date ? ' · due ' + parseServerDate(t.due_date).toLocaleDateString() : ''}
               ${t.notes ? ' · ' + esc(t.notes.slice(0, 40)) : ''}
             </div>
           </div>
