@@ -126,11 +126,21 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         media_filename = str(media.get("filename") or "")[:255]
 
         sender_name = msg_data.get("notifyName") or msg_data.get("pushName") or ""
-        from_raw = msg_data.get("from") or msg_data.get("author") or ""
-        if isinstance(from_raw, dict):
-            sender_number = str(from_raw.get("_serialized") or from_raw.get("id", "")).split("@")[0]
-        else:
-            sender_number = str(from_raw).split("@")[0]
+        def _raw_wid(v) -> str:
+            if isinstance(v, dict):
+                return str(v.get("_serialized") or v.get("id") or "")
+            return str(v or "")
+
+        # In groups `from` is the group itself (…@g.us); the person who wrote the
+        # message is `participant` (WEBJS also exposes it as `author` / _data.author).
+        from_raw = _raw_wid(msg_data.get("from"))
+        if from_raw.endswith("@g.us") or chat_wid.endswith("@g.us"):
+            _data = msg_data.get("_data") if isinstance(msg_data.get("_data"), dict) else {}
+            from_raw = (_raw_wid(msg_data.get("participant")) or _raw_wid(msg_data.get("author"))
+                        or _raw_wid(_data.get("author")) or ("" if from_me else from_raw))
+        elif not from_raw:
+            from_raw = _raw_wid(msg_data.get("author"))
+        sender_number = from_raw.split("@")[0] if not from_raw.endswith("@g.us") else ""
 
         await inbox.upsert_message({
             "chat_id": chat["id"],
