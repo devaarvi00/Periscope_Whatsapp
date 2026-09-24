@@ -64,7 +64,6 @@ const Api = (() => {
   // Inbox
   const inbox = {
     chats:      (q)     => get('/inbox/chats', q),
-    chat:       (id)    => get(`/inbox/chats/${id}`),
     updateChat: (id, b) => patch(`/inbox/chats/${id}`, b),
     markRead:   (id)    => post(`/inbox/chats/${id}/read`),
     messages:   (id, q) => get(`/inbox/chats/${id}/messages`, q),
@@ -79,13 +78,10 @@ const Api = (() => {
   // Tickets
   const tickets = {
     list:   (q)     => get('/tickets', q),
-    get:    (id)    => get(`/tickets/${id}`),
     create: (b)     => post('/tickets', b),
     update: (id, b) => patch(`/tickets/${id}`, b),
     del:    (id)    => del(`/tickets/${id}`),
-    labels:      (id)      => get(`/tickets/${id}/labels`),
     addLabel:    (id, lid) => post(`/tickets/${id}/labels/${lid}`),
-    removeLabel: (id, lid) => del(`/tickets/${id}/labels/${lid}`),
   };
 
   // Contacts
@@ -95,9 +91,6 @@ const Api = (() => {
     create: (b)     => post('/contacts', b),
     update: (id, b) => patch(`/contacts/${id}`, b),
     del:    (id)    => del(`/contacts/${id}`),
-    labels:      (id)      => get(`/contacts/${id}/labels`),
-    addLabel:    (id, lid) => post(`/contacts/${id}/labels/${lid}`),
-    removeLabel: (id, lid) => del(`/contacts/${id}/labels/${lid}`),
   };
 
   // Labels
@@ -154,15 +147,6 @@ const Api = (() => {
     create:   (b)     => post('/automation/rules', b),
     update:   (id, b) => patch(`/automation/rules/${id}`, b),
     del:      (id)    => del(`/automation/rules/${id}`),
-  };
-
-  // Knowledge Base
-  const kb = {
-    list:    (q)     => get('/knowledge-base', q),
-    create:  (b)     => post('/knowledge-base', b),
-    update:  (id, b) => patch(`/knowledge-base/${id}`, b),
-    approve: (id)    => patch(`/knowledge-base/${id}/approve`),
-    del:     (id)    => del(`/knowledge-base/${id}`),
   };
 
   // Bulk
@@ -239,18 +223,6 @@ const Api = (() => {
     setTicket:    (id, values)   => req('PUT', `/properties/ticket/${id}`, { values }),
   };
 
-  // Developer platform
-  const developer = {
-    apiKeys:       ()   => get('/developer/api-keys'),
-    createApiKey:  (b)  => post('/developer/api-keys', b),
-    revokeApiKey:  (id) => del(`/developer/api-keys/${id}`),
-    webhooks:      ()   => get('/developer/webhooks'),
-    webhookEvents: ()   => get('/developer/webhook-events'),
-    createWebhook: (b)  => post('/developer/webhooks', b),
-    testWebhook:   (id) => post(`/developer/webhooks/${id}/test`),
-    delWebhook:    (id) => del(`/developer/webhooks/${id}`),
-  };
-
   // Exports: authenticated file downloads
   async function download(path, filename) {
     const r = await fetch(BASE + path, { headers: headers() });
@@ -278,8 +250,8 @@ const Api = (() => {
   return {
     setToken, clearToken, getToken,
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
-    phones, analytics, automation, kb, bulk, ai, search,
-    logs, groups, scheduled, developer, exports: exportsApi,
+    phones, analytics, automation, bulk, ai, search,
+    logs, groups, scheduled, exports: exportsApi,
     tasks, properties,
   };
 })();

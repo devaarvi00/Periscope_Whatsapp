@@ -215,10 +215,6 @@ function pillClass(val) {
   return 'pill ' + (map[val] || '');
 }
 
-function labelChip(label) {
-  return `<span class="label-chip" style="background:${esc(label.color)}22;color:${esc(label.color)};border:1px solid ${esc(label.color)}55">${esc(label.name)}</span>`;
-}
-
 function formatTrigger(trigger) {
   const map = {
     message_received: '📩 Message Received',
