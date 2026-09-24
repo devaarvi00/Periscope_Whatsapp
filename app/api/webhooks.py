@@ -51,7 +51,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         inbox = MongoInboxService()
 
         # Dedup before any work — fast path
-        if await inbox.message_exists(msg_wid):
+        if await inbox.message_exists(msg_wid, phone.id):
             return
 
         notify_name = msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName") or ""
@@ -140,9 +140,18 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         })
 
         if not from_me:
-            new_unread = (chat.get("unread_count") or 0) + 1
-            await inbox.update_chat(chat["id"], unread_count=new_unread)
-            chat["unread_count"] = new_unread
+            # Atomic increment — concurrent webhooks must not lose counts.
+            # A new inbound message also re-opens a resolved conversation.
+            from pymongo import ReturnDocument
+            updated = await inbox.db.chats.find_one_and_update(
+                {"id": chat["id"]},
+                {"$inc": {"unread_count": 1},
+                 "$set": {"status": "open", "updated_at": datetime.utcnow()}},
+                projection={"unread_count": 1},
+                return_document=ReturnDocument.AFTER,
+            )
+            chat["unread_count"] = (updated or {}).get("unread_count") or (chat.get("unread_count") or 0) + 1
+            chat["status"] = "open"
 
         from app.core.ws_manager import ws_manager
         await ws_manager.emit_new_message(
@@ -185,9 +194,13 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         }
         if chat_is_new:
             await automation.run_rules("chat_created", rule_context)
-        await automation.run_rules("message_received", rule_context)
-        if body:
-            await automation.run_rules("message_keyword", rule_context)
+        # Only inbound messages trigger message rules. Our own echoes (agent
+        # replies, AI and automation sends) arrive as from_me and must not
+        # re-trigger rules — that would loop on send_message actions.
+        if not from_me:
+            await automation.run_rules("message_received", rule_context)
+            if body:
+                await automation.run_rules("message_keyword", rule_context)
 
         # AI auto-flag
         from app.models.ai_settings import get_ai_settings as _get_ai_cfg
@@ -198,15 +211,16 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             try:
                 from app.services.gemini_service import GeminiService
                 if await GeminiService().flag_message(body, _flag_criteria):
-                    await inbox.flag_message(msg_wid, True)
+                    await inbox.flag_message(msg_wid, phone.id, True)
                     await inbox.update_chat(chat["id"], is_flagged=True)
                     from app.core.ws_manager import ws_manager as _ws
                     await _ws.emit_chat_updated(chat["id"], {"is_flagged": True})
             except Exception as exc:
                 logger.warning("AI auto-flag failed: %s", exc)
 
-        # AI agent
-        if not from_me and chat.get("ai_active") and chat.get("ai_state") != "SNOOZED":
+        # AI agent — handle_incoming_message decides about SNOOZED chats so an
+        # expired snooze is lifted (checking here would skip them forever).
+        if not from_me and chat.get("ai_active"):
             from app.services.ai_agent_service import AIAgentService
             from app.services.waha_service import WAHAService
             ai = AIAgentService(db)
@@ -271,13 +285,18 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
         if not msg_wid:
             return
 
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
         inbox = MongoInboxService()
-        message = await inbox.get_message_by_wid(msg_wid)
+        message = await inbox.get_message_by_wid(msg_wid, phone.id)
         if not message:
             return
 
         from app.models.ticket import Ticket
-        existing = db.query(Ticket).filter(Ticket.message_wid == msg_wid).first()
+        existing = db.query(Ticket).filter(
+            Ticket.message_wid == msg_wid, Ticket.chat_id == message["chat_id"]
+        ).first()
         if existing:
             return
 
@@ -412,8 +431,14 @@ async def waha_webhook(
     background: BackgroundTasks,
     x_webhook_secret: str | None = Header(None),
 ):
-    secret = settings.waha_webhook_secret.strip()
-    if secret and x_webhook_secret != secret:
+    import hmac
+    secret = (settings.waha_webhook_secret or "").strip()
+    if not secret:
+        # Fail closed: an unset secret must not mean "accept everything"
+        logger.error("WAHA webhook rejected: WAHA_WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=403, detail="Webhook secret not configured")
+    provided = (x_webhook_secret or "").strip()
+    if not hmac.compare_digest(provided.encode(), secret.encode()):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     try:
