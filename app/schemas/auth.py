@@ -7,8 +7,10 @@ PASSWORD_MAX_LENGTH = 72
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
+    # Plain str: login only looks the address up. EmailStr rejects reserved
+    # domains such as .local, which locked out admin@hyperscope.local.
+    email: str = Field(max_length=254)
+    password: str = Field(max_length=256)
 
 
 class TokenResponse(BaseModel):
