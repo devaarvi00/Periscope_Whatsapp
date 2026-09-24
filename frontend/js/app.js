@@ -337,12 +337,18 @@ document.getElementById('topbar-refresh')?.addEventListener('click', () => {
             const go = row.dataset.go;
             closeResults(); input.value = '';
             if (go === 'chat' && row.dataset.id) {
+              const cid = +row.dataset.id;
               navigateTo('inbox');
-              setTimeout(() => { const c = State.inbox.chats?.find(x => x.id == row.dataset.id); if (c) openChat(c); }, 600);
+              // renderInbox awaits loadChats(); wait for it before opening the chat
+              Promise.resolve(_inboxReady).then(() => {
+                if (State.currentView !== 'inbox') return;
+                if (State.inbox.chats?.some(x => x.id === cid)) openChat(cid);
+                else toast('Chat not found in the current list', 'error');
+              });
             } else if (go) navigateTo(go);
           });
         });
-      } catch(_) {}
+      } catch(e) { closeResults(); toast(e.message || 'Search failed', 'error'); }
     }, 300);
   });
 })();
@@ -743,7 +749,8 @@ async function renderInbox() {
       </div>
     </div>`;
 
-  await loadChats();
+  _inboxReady = loadChats();
+  await _inboxReady;
 
   document.getElementById('chat-search').addEventListener('input', e => {
     State.inbox.search = e.target.value;
@@ -796,6 +803,7 @@ async function renderInbox() {
 }
 
 let _chatDebounce = null;
+let _inboxReady = null;   // promise of the initial loadChats() in renderInbox
 let _chatAutoSynced = false;
 let _dashWahaTimer = null;
 let _dashWahaUpdating = false;
@@ -978,7 +986,7 @@ function renderChatList(chats, hasMore) {
     let labelsHtml = '';
     if (c.labels && c.labels.length) {
       labelsHtml = `<div class="chat-item-labels">${c.labels.slice(0,4).map(lbl => {
-        const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
+        const labelObj = State.labels.find(l => l.id == lbl);
         const color2 = safeColor(labelObj?.color);
         const name = labelObj ? labelObj.name : (lbl || '');
         return `<span class="chat-label-mini" style="background:${color2}22;color:${color2};border:1px solid ${color2}44">${esc(name)}</span>`;
@@ -1070,11 +1078,12 @@ async function renderContactDetail(chat) {
   layout.classList.add('detail-open');
 
   const color = avatarColor(chat.name || chat.chat_wid);
-  const chatLabels = chat.labels || [];
+  // chat.labels holds label IDs (server: label_ids)
+  const chatLabels = (chat.labels || []).map(Number).filter(Number.isFinite);
 
   // Build label chips
   const labelsMarkup = chatLabels.map(lbl => {
-    const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
+    const labelObj = State.labels.find(l => l.id === lbl);
     const lColor = safeColor(labelObj?.color);
     const lName = labelObj ? labelObj.name : String(lbl);
     return `<span class="detail-label-chip" style="background:${lColor}22;color:${lColor};border:1px solid ${lColor}44" data-label="${esc(lbl)}">
@@ -1092,7 +1101,7 @@ async function renderContactDetail(chat) {
   } catch(_) {}
 
   // Available labels for "add" list
-  const availableLabels = State.labels.filter(l => !chatLabels.includes(l.id) && !chatLabels.includes(l.name));
+  const availableLabels = State.labels.filter(l => !chatLabels.includes(l.id));
   const addLabelOpts = availableLabels.map(l =>
     `<option value="${l.id}">${esc(l.name)}</option>`
   ).join('');
@@ -1252,10 +1261,9 @@ async function renderContactDetail(chat) {
       if (!labelId) return;
       const labelObj = State.labels.find(l => l.id == labelId);
       if (!labelObj) return;
-      const newLabels = [...chatLabels, labelObj.name];
       try {
-        await Api.inbox.updateChat(chat.id, { labels: newLabels });
-        chat.labels = newLabels;
+        await Api.inbox.addLabel(chat.id, labelObj.id);
+        chat.labels = [...chatLabels, labelObj.id];
         toast('Label added', 'success');
         renderContactDetail(chat);
         renderChatList(State.inbox.chats);
@@ -1267,11 +1275,10 @@ async function renderContactDetail(chat) {
   body.querySelectorAll('[data-remove-label]').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation();
-      const lbl = btn.dataset.removeLabel;
-      const newLabels = chatLabels.filter(l => l !== lbl && String(l) !== lbl);
+      const lid = parseInt(btn.dataset.removeLabel);
       try {
-        await Api.inbox.updateChat(chat.id, { labels: newLabels });
-        chat.labels = newLabels;
+        await Api.inbox.removeLabel(chat.id, lid);
+        chat.labels = chatLabels.filter(l => l !== lid);
         toast('Label removed', 'success');
         renderContactDetail(chat);
         renderChatList(State.inbox.chats);
@@ -1657,10 +1664,14 @@ let _msgScrollObserver = null;
 let _msgLoadingOlder = false;
 let _msgNoMoreOlder = false;
 let _msgLastSyncedChatId = null; // chat ID that was most recently synced; prevents double-sync in _fetchOlderMessages
+let _msgLoadSeq = 0;             // bumps on every loadMessages(); stale responses compare against it
 
 async function loadMessages(chatId, _alreadySynced) {
   const area = document.getElementById('messages-area');
   if (!area) return;
+  const seq = ++_msgLoadSeq;
+  // True when the user switched chats (or a newer load started) while we were awaiting
+  const stale = () => seq !== _msgLoadSeq || State.inbox.selectedChatId != chatId || !area.isConnected;
   const chat = State.inbox.chats?.find(c => c.id == chatId);
   const isGroup = chat?.is_group || false;
 
@@ -1679,17 +1690,20 @@ async function loadMessages(chatId, _alreadySynced) {
     // Always do a live WAHA sync first (200 msgs) unless WS just reconnected
     if (!_alreadySynced) {
       try { await Api.inbox.syncMessages(chatId, 200); _msgLastSyncedChatId = chatId; } catch(_) {}
+      if (stale()) return;
     }
 
     let messages = await Api.inbox.messages(chatId, { limit: 100 });
-    State.inbox.messages = messages;
+    if (stale()) return;
 
     // Interleave private team notes into the thread
     let notes = [];
     try { notes = await Api.notes.list(chatId); } catch(_) {}
+    if (stale()) return;
+    State.inbox.messages = messages;
     const thread = messages.map(m => ({ kind: 'msg', ts: m.timestamp, item: m }))
       .concat(notes.map(n => ({ kind: 'note', ts: n.created_at, item: n })))
-      .sort((a, b) => new Date(a.ts) - new Date(b.ts));
+      .sort((a, b) => parseServerDate(a.ts) - parseServerDate(b.ts));
 
     const msgHtml = thread.map(t => t.kind === 'note' ? renderNoteBubble(t.item) : renderMessage(t.item, isGroup)).join('');
 
@@ -1704,6 +1718,7 @@ async function loadMessages(chatId, _alreadySynced) {
     // Attach IntersectionObserver for seamless infinite scroll upward
     _attachScrollSentinel(chatId, isGroup, area);
   } catch(e) {
+    if (stale()) return;
     area.innerHTML = `<div class="loading-center text-muted">Could not load messages. Check your connection.</div>`;
   }
 }
@@ -1711,19 +1726,29 @@ async function loadMessages(chatId, _alreadySynced) {
 function _attachScrollSentinel(chatId, isGroup, area) {
   const sentinel = document.getElementById('scroll-top-sentinel');
   if (!sentinel) return;
-  _msgScrollObserver = new IntersectionObserver(async (entries) => {
+  if (_msgScrollObserver) _msgScrollObserver.disconnect();
+  const seq = _msgLoadSeq;
+  const observer = new IntersectionObserver(async (entries) => {
+    // Observer belongs to one chat load; retire it once another chat/load takes over
+    if (seq !== _msgLoadSeq || State.inbox.selectedChatId != chatId || !area.isConnected) {
+      observer.disconnect();
+      if (_msgScrollObserver === observer) _msgScrollObserver = null;
+      return;
+    }
     if (!entries[0].isIntersecting) return;
     if (_msgLoadingOlder || _msgNoMoreOlder) return;
     _msgLoadingOlder = true;
-    await _fetchOlderMessages(chatId, isGroup, area);
-    _msgLoadingOlder = false;
+    try { await _fetchOlderMessages(chatId, isGroup, area, seq); }
+    finally { if (seq === _msgLoadSeq) _msgLoadingOlder = false; }
   }, { root: area, threshold: 0.1 });
-  _msgScrollObserver.observe(sentinel);
+  _msgScrollObserver = observer;
+  observer.observe(sentinel);
 }
 
-async function _fetchOlderMessages(chatId, isGroup, area) {
+async function _fetchOlderMessages(chatId, isGroup, area, seq) {
   const sentinel = document.getElementById('scroll-top-sentinel');
   if (!sentinel || !area) return;
+  const stale = () => seq !== _msgLoadSeq || State.inbox.selectedChatId != chatId || !area.isConnected;
 
   // Show tiny spinner above sentinel
   const spinnerEl = document.createElement('div');
@@ -1740,6 +1765,7 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
     // 1. Try DB first using timestamp cursor (correct for historically-synced messages
     //    that arrive with high IDs but early timestamps — id-based cursor misses them)
     let older = oldestTs ? await Api.inbox.messages(chatId, { limit: 50, before_ts: oldestTs }) : [];
+    if (stale()) return;
 
     // 2. DB exhausted → pull from WAHA
     // Skip if loadMessages already synced this exact chat moments ago (avoids double-sync
@@ -1751,6 +1777,7 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
           ? await Api.inbox.messages(chatId, { limit: 50, before_ts: oldestTs })
           : await Api.inbox.messages(chatId, { limit: 50 });
       } catch(_) {}
+      if (stale()) return;
     }
     _msgLastSyncedChatId = null; // consume the guard — subsequent scroll-ups can WAHA sync normally
 
@@ -1766,7 +1793,7 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
     }
 
     // Prepend older messages into state
-    State.inbox.messages = older.concat(current);
+    State.inbox.messages = older.concat(State.inbox.messages || []);
     const html = older.map(m => renderMessage(m, isGroup)).join('');
     sentinel.insertAdjacentHTML('afterend', html);
 
@@ -1993,7 +2020,7 @@ async function showTicketModal(opts) {
     try {
       const ticket = await Api.tickets.create({
         chat_id: chatId,
-        message_id: message?.id || null,
+        message_wid: message?.message_wid || null,
         title,
         description: document.getElementById('tkm-desc').value,
         status: document.getElementById('tkm-status').value,
@@ -2048,7 +2075,7 @@ async function showTaskModal(opts) {
       await Api.tasks.create({
         title,
         chat_id: chatId || null,
-        message_id: message?.id || null,
+        message_wid: message?.message_wid || null,
         due_date: document.getElementById('tkt-due').value || null,
         reminder_at: document.getElementById('tkt-reminder').value || null,
         assigned_to: parseInt(document.getElementById('tkt-assignee').value) || null,
