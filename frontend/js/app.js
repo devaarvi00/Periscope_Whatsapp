@@ -1034,33 +1034,28 @@ function updatePhoneBadge() {
   const badge = document.getElementById('topbar-phone-count');
   const num = document.getElementById('topbar-phone-num');
   const total = document.getElementById('topbar-phone-total');
-  const dot = badge ? badge.querySelector('.phone-dot') : null;
-  if (badge && num) {
-    const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
-    num.textContent = working;
-    if (total) total.textContent = State.phones.length;
-    badge.style.display = State.phones.length ? 'flex' : 'none';
-    if (dot) {
-      const totalCount = State.phones.length;
-      if (working === 0) {
-        dot.style.background = '#ef4444';
-        badge.style.background = '#fef2f2';
-        badge.style.borderColor = '#fecaca';
-        badge.style.color = '#991b1b';
-      } else if (working < totalCount) {
-        dot.style.background = '#f59e0b';
-        badge.style.background = '#fffbeb';
-        badge.style.borderColor = '#fde68a';
-        badge.style.color = '#92400e';
-      } else {
-        dot.style.background = '#10b981';
-        badge.style.background = '#f0fdf4';
-        badge.style.borderColor = '#bbf7d0';
-        badge.style.color = '#166534';
-      }
-    }
-  }
+  if (!badge || !num) return;
+  const totalCount = State.phones.length;
+  const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
+  num.textContent = working;
+  if (total) total.textContent = totalCount;
+  badge.style.display = State.agent ? 'flex' : 'none';
+  // Colour lives in CSS (dashboard.css) so the dark theme applies
+  badge.classList.toggle('state-none', working === 0);
+  badge.classList.toggle('state-partial', working > 0 && working < totalCount);
+  badge.classList.toggle('state-ok', totalCount > 0 && working === totalCount);
+  badge.title = `${working} of ${totalCount} phone${totalCount === 1 ? '' : 's'} connected — manage in Settings`;
 }
+
+// ── Topbar actions (home, refresh, help, phones badge) ────────── //
+document.getElementById('topbar-home')?.addEventListener('click', () => navigateTo('dashboard'));
+document.getElementById('topbar-refresh')?.addEventListener('click', () => {
+  loadPhones();
+  navigateTo(State.currentView || 'dashboard');
+});
+document.getElementById('topbar-help')?.addEventListener('click', () => showHelpModal());
+document.getElementById('topbar-phone-count')?.addEventListener('click', () => navigateTo('settings'));
+
 async function loadPhones() {
   try {
     State.phones = await Api.phones.list();

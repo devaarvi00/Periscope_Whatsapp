@@ -2,6 +2,58 @@
    Loaded after app.css; everything here uses theme tokens so the
    dark theme (:root[data-theme="dark"]) applies automatically. */
 
+/* ── Topbar ───────────────────────────────────────────────────── */
+.app-topbar .app-topbar-left{min-width:0;gap:.4rem;}
+.topbar-home{
+  width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+  border:none;background:none;border-radius:6px;color:var(--text-3);cursor:pointer;
+}
+.topbar-home:hover{background:var(--surface-3);color:var(--text-2);}
+.topbar-home svg{width:15px;height:15px;}
+.app-topbar .app-breadcrumb{
+  display:flex !important;align-items:center;
+  font-size:13px;color:var(--text-2);text-transform:lowercase;white-space:nowrap;
+}
+.app-topbar .app-breadcrumb strong{font-weight:500;color:var(--text-2);}
+
+.topbar-outline-btn{
+  display:inline-flex;align-items:center;gap:.35rem;height:30px;padding:0 .65rem;
+  background:var(--surface);color:var(--text-2);
+  border:1px solid var(--border);border-radius:7px;
+  font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;white-space:nowrap;
+  transition:background .12s,border-color .12s;
+}
+.topbar-outline-btn:hover{background:var(--surface-2);color:var(--text);}
+.topbar-outline-btn:focus-visible,.topbar-home:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+.topbar-outline-btn svg{width:13px;height:13px;flex-shrink:0;}
+
+/* phones badge: override the filled pill from app.css with the outline style */
+.app-topbar .topbar-phone-badge{
+  background:var(--surface);border-color:var(--border);color:var(--text-2);
+  padding:0 .6rem;border-radius:7px;
+}
+.app-topbar .topbar-phone-badge .phone-dot{background:var(--text-3);}
+.app-topbar .topbar-phone-badge.state-ok .phone-dot{background:var(--online);}
+.app-topbar .topbar-phone-badge.state-partial .phone-dot{background:#f59e0b;}
+.app-topbar .topbar-phone-badge.state-none .phone-dot{background:var(--danger);}
+.app-topbar .topbar-phone-badge .topbar-caret{width:12px;height:12px;color:var(--text-3);}
+
+/* live-socket indicator collapses to a dot (label stays for screen readers) */
+.app-topbar .ws-status{padding:0 .2rem;}
+.app-topbar .ws-status .ws-label{
+  position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;
+}
+
+@media (max-width:1100px){
+  .topbar-outline-btn span:not([id]){display:none;}
+  .app-topbar .topbar-phone-badge > span:not(.phone-dot){display:inline;}
+  .topbar-outline-btn{padding:0 .5rem;}
+}
+@media (max-width:760px){
+  .app-topbar .app-breadcrumb{display:none !important;}
+  .app-topbar .topbar-phone-badge .topbar-caret{display:none;}
+}
+
 /* ── Dashboard layout ─────────────────────────────────────────── */
 .dsh-wrap{flex:1;overflow-y:auto;background:var(--bg);}
 .dsh-inner{max-width:1460px;margin:0 auto;padding:1.5rem 1.75rem 2.5rem;}

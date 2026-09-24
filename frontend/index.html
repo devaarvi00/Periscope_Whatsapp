@@ -281,6 +281,9 @@
     <!-- Top app bar -->
     <div class="app-topbar">
       <div class="app-topbar-left">
+        <button class="topbar-home" id="topbar-home" title="Dashboard" aria-label="Go to dashboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        </button>
         <div class="app-breadcrumb" id="app-breadcrumb">Dashboard</div>
       </div>
       <div class="app-topbar-search">
@@ -288,10 +291,19 @@
         <input type="text" id="global-search" placeholder="Search chats, messages, tickets, contacts...">
       </div>
       <div class="app-topbar-right">
-        <div class="topbar-phone-badge" id="topbar-phone-count" style="display:none">
+        <button class="topbar-outline-btn" id="topbar-refresh" title="Refresh this page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span>Refresh</span>
+        </button>
+        <button class="topbar-outline-btn" id="topbar-help" title="Help">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span>Help</span>
+        </button>
+        <button class="topbar-phone-badge topbar-outline-btn" id="topbar-phone-count" style="display:none" title="Manage WhatsApp phones">
           <span class="phone-dot"></span>
-          <span id="topbar-phone-num">0</span>&nbsp;/&nbsp;<span id="topbar-phone-total">0</span>&nbsp;phones
-        </div>
+          <span><span id="topbar-phone-num">0</span>&nbsp;/&nbsp;<span id="topbar-phone-total">0</span>&nbsp;phones</span>
+          <svg class="topbar-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
+        </button>
         <div class="ws-status" id="ws-status" title="Connecting…">
           <span class="ws-dot"></span>
           <span class="ws-label" id="ws-label">Connecting</span>
