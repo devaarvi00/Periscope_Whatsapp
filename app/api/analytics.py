@@ -46,10 +46,28 @@ def _parse_ids(value: str | None, name: str) -> list[int] | None:
         raise HTTPException(422, f"'{name}' must be comma-separated integers")
 
 
+def _resolve_tz(tz: str, offset_minutes: int | None) -> str:
+    """IANA zone when this server knows it, else the client's fixed UTC offset ("+05:30").
+
+    Browsers may report legacy names (e.g. Asia/Calcutta) missing from slim tzdata.
+    """
+    try:
+        ZoneInfo(tz)
+        return tz
+    except (ZoneInfoNotFoundError, ValueError):
+        pass
+    if offset_minutes is None:
+        return "UTC"
+    sign = "+" if offset_minutes >= 0 else "-"
+    h, m = divmod(abs(offset_minutes), 60)
+    return f"{sign}{h:02d}:{m:02d}"
+
+
 async def get_scope(
     from_: str | None = Query(None, alias="from"),
     to: str | None = None,
     tz: str = "UTC",
+    tz_offset: int | None = Query(None, ge=-840, le=840),
     chat_id: int | None = None,
     phone_ids: str | None = None,
     agent_ids: str | None = None,
@@ -62,10 +80,7 @@ async def get_scope(
         raise HTTPException(422, "'from' must be before 'to'")
     if end - start > MAX_RANGE:
         raise HTTPException(422, "Date range can be at most 366 days")
-    try:
-        ZoneInfo(tz)
-    except (ZoneInfoNotFoundError, ValueError):
-        tz = "UTC"
+    tz = _resolve_tz(tz, tz_offset)
 
     # Phone scope = requested ∩ allowed (None = every phone)
     allowed = allowed_phone_ids(db, agent)

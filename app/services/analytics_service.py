@@ -89,9 +89,17 @@ class Scope:
         return self.agent_ids is None or agent_id in self.agent_ids
 
 
+def _tzinfo(name: str):
+    """IANA zone, or a fixed offset written as "+05:30" / "-04:00" (also valid for Mongo)."""
+    if name[:1] in "+-" and len(name) == 6 and name[3] == ":":
+        mins = int(name[1:3]) * 60 + int(name[4:6])
+        return timezone(timedelta(minutes=mins if name[0] == "+" else -mins))
+    return ZoneInfo(name)
+
+
 def bucket_starts(scope: Scope) -> list[datetime]:
     """Naive-UTC start of every local hour/day bucket overlapping the range."""
-    tz = ZoneInfo(scope.tz)
+    tz = _tzinfo(scope.tz)
     local = scope.frm.replace(tzinfo=timezone.utc).astimezone(tz)
     if scope.bucket == "hour":
         cur = local.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc)
