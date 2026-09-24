@@ -125,7 +125,89 @@ async def update_chat(
             "assigned_to": updates["assigned_to"],
             "is_group": prev.get("is_group"),
         })
+        await _notify_chat_assigned(prev, updates["assigned_to"], agent)
     return {"ok": True}
+
+
+def _chat_display_name(chat: dict) -> str:
+    """Same rules as the frontend's displayName(): never leak raw WIDs."""
+    name = chat.get("name") or chat.get("chat_wid") or ""
+    if "@" not in name:
+        return name
+    ident, _, domain = name.partition("@")
+    if domain == "g.us":
+        return f"Group {ident[-6:]}"
+    if domain == "lid":
+        return "WhatsApp user"
+    return f"+{ident}" if ident.isdigit() and len(ident) >= 6 else ident
+
+
+async def _notify_chat_assigned(chat: dict, assignee_id: int | None, actor: Agent) -> None:
+    """Tell the new assignee (all their tabs) — never the agent who did it."""
+    if assignee_id is None or assignee_id == actor.id:
+        return
+    from app.core.ws_manager import ws_manager
+    await ws_manager.send_to_agent(assignee_id, "chat_assigned", {
+        "chat_id": chat["id"],
+        "chat_name": _chat_display_name(chat),
+        "by": actor.name,
+    })
+
+
+@router.get("/chats/{chat_id}/activity")
+async def chat_activity(
+    chat_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Activity-log entries for one chat (assignments, resolves, …), newest first."""
+    from app.models.activity_log import ActivityLog
+    await get_accessible_chat(db, agent, chat_id)
+    rows = (
+        db.query(ActivityLog)
+        .filter(ActivityLog.entity_type == "chat", ActivityLog.entity_id == chat_id)
+        .order_by(ActivityLog.id.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+    names = {a.id: a.name for a in db.query(Agent).all()}
+    return [{
+        "id": r.id,
+        "action": r.action,
+        "description": r.description or "",
+        "agent_name": names.get(r.agent_id, "") if r.agent_id else "",
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
+
+
+@router.get("/chats/{chat_id}/picture")
+async def chat_picture(
+    chat_id: int,
+    refresh: bool = False,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Profile / group picture URL, looked up from WAHA at most once a day."""
+    from datetime import timedelta
+    chat = await get_accessible_chat(db, agent, chat_id)
+    checked = chat.get("picture_checked_at")
+    if not refresh and isinstance(checked, datetime) and datetime.utcnow() - checked < timedelta(hours=24):
+        return {"url": chat.get("picture_url") or None}
+    phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
+    if not phone or phone.waha_status != "WORKING":
+        return {"url": chat.get("picture_url") or None}
+    url = await WAHAService.from_phone(phone).get_chat_picture(chat["chat_wid"])
+    # Only WhatsApp's own CDN over https ever reaches an <img src>
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url or "")
+        ok = parts.scheme == "https" and (parts.hostname or "").endswith(".whatsapp.net")
+    except ValueError:
+        ok = False
+    url = url if ok else None
+    await MongoInboxService().update_chat(chat_id, picture_url=url or "", picture_checked_at=datetime.utcnow())
+    return {"url": url}
 
 
 @router.post("/chats/{chat_id}/read")
@@ -346,14 +428,30 @@ async def bulk_update_chats(
         raise HTTPException(404, "No accessible chats selected")
     inbox = MongoInboxService()
 
-    allowed = {"is_archived", "is_pinned", "ai_active", "is_flagged", "status"}
+    allowed = {"is_archived", "is_pinned", "ai_active", "is_flagged", "status", "assigned_to"}
     updates = {k: v for k, v in (req.updates or {}).items() if k in allowed}
     if "status" in updates and updates["status"] not in ("open", "resolved"):
         raise HTTPException(400, "status must be 'open' or 'resolved'")
+    if "assigned_to" in updates and updates["assigned_to"] is not None:
+        try:
+            updates["assigned_to"] = int(updates["assigned_to"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "assigned_to must be an agent id or null")
     if "ai_active" in updates:
         updates["ai_state"] = "ACTIVE" if updates["ai_active"] else "INACTIVE"
+    # Snapshot previous assignees so only real changes notify
+    prev_chats: list[dict] = []
+    if "assigned_to" in updates:
+        prev_chats = await inbox.db.chats.find(
+            {"id": {"$in": ids}}, {"id": 1, "name": 1, "chat_wid": 1, "assigned_to": 1}
+        ).to_list(length=len(ids))
     if updates:
         await inbox.bulk_update_chats(ids, **updates)
+    if "assigned_to" in updates:
+        new_assignee = updates["assigned_to"]
+        for c in prev_chats:
+            if c.get("assigned_to") != new_assignee:
+                await _notify_chat_assigned(c, new_assignee, agent)
 
     if req.mark_read is True:
         await inbox.bulk_update_chats(ids, unread_count=0)

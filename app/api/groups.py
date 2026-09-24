@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -123,35 +123,67 @@ async def add_participants(
     return {"results": results}
 
 
+def _parse_day(v: str | None, end: bool = False) -> datetime | None:
+    """'YYYY-MM-DD' or full ISO → naive UTC datetime. A bare date used as the
+    upper bound means "through the end of that day"."""
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(400, f"Invalid date: {v}")
+    if dt.tzinfo is not None:
+        from datetime import timezone
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    if end and len(v) <= 10:
+        dt += timedelta(days=1)
+    return dt
+
+
 @router.get("/{chat_id}/analytics")
 async def group_analytics(
     chat_id: int,
     days: int = 30,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    """Group activity: daily message volume, top senders, in/out split."""
+    """Group activity for a window: message / reaction / join / exit counts,
+    daily message volume, top senders, in/out split.
+
+    Window: `from`/`to` (ISO date or datetime, UTC) or the last `days` days.
+    Reactions come from `message_reactions`, joins/exits from `group_events`
+    (both filled by WAHA webhooks); a metric is null (not tracked) until
+    that feed has stored anything for this number.
+    """
     inbox = MongoInboxService()
     chat = await get_accessible_chat(db, agent, chat_id)
     if not chat.get("is_group"):
         raise HTTPException(404, "Group not found")
-    since = datetime.utcnow() - timedelta(days=min(days, 180))
+    until = _parse_day(to, end=True) or datetime.utcnow()
+    since = _parse_day(from_) or (until - timedelta(days=max(1, min(days, 365))))
+    if since >= until:
+        raise HTTPException(400, "'from' must be before 'to'")
+    if until - since > timedelta(days=366):
+        raise HTTPException(400, "Date range is limited to one year")
+    window = {"$gte": since, "$lt": until}
 
-    total = await inbox.db.messages.count_documents({"chat_id": chat_id, "timestamp": {"$gte": since}})
-    incoming = await inbox.db.messages.count_documents({"chat_id": chat_id, "from_me": False, "timestamp": {"$gte": since}})
+    total = await inbox.db.messages.count_documents({"chat_id": chat_id, "timestamp": window})
+    incoming = await inbox.db.messages.count_documents({"chat_id": chat_id, "from_me": False, "timestamp": window})
 
     # Daily volume
     daily_pipeline = [
-        {"$match": {"chat_id": chat_id, "timestamp": {"$gte": since}}},
+        {"$match": {"chat_id": chat_id, "timestamp": window}},
         {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}}, "count": {"$sum": 1}}},
         {"$sort": {"_id": 1}},
     ]
-    daily_docs = await inbox.db.messages.aggregate(daily_pipeline).to_list(200)
+    daily_docs = await inbox.db.messages.aggregate(daily_pipeline).to_list(400)
     daily = [{"date": d["_id"], "count": d["count"]} for d in daily_docs]
 
     # Top senders
     sender_pipeline = [
-        {"$match": {"chat_id": chat_id, "from_me": False, "timestamp": {"$gte": since}}},
+        {"$match": {"chat_id": chat_id, "from_me": False, "timestamp": window}},
         {"$group": {"_id": {"name": "$sender_name", "number": "$sender_number"}, "n": {"$sum": 1}}},
         {"$sort": {"n": -1}},
         {"$limit": 10},
@@ -165,12 +197,37 @@ async def group_analytics(
         }
         for d in sender_docs
     ]
+
+    phone_id = chat["phone_id"]
+    reactions_since = await inbox.tracking_since("message_reactions", phone_id)
+    members_since = await inbox.tracking_since("group_events", phone_id)
+    reactions = await inbox.count_reactions(chat_id, since, until) if reactions_since else None
+    joined = left = removed = exited = None
+    if members_since:
+        joined = await inbox.count_group_events(chat_id, ["join", "add"], since, until)
+        left = await inbox.count_group_events(chat_id, ["leave"], since, until)
+        removed = await inbox.count_group_events(chat_id, ["remove"], since, until)
+        exited = left + removed
+
     return {
         "group": chat.get("name") or "",
         "days": days,
+        "from": since.isoformat(),
+        "to": until.isoformat(),
         "total_messages": total,
         "incoming": incoming,
         "outgoing": total - incoming,
+        "messages": total,
+        "reactions": reactions,
+        "members_joined": joined,
+        "members_exited": exited,       # left + removed
+        "members_left": left,
+        "members_removed": removed,
+        # When each event feed started (null = never received on this number)
+        "tracked_since": {
+            "reactions": reactions_since.isoformat() if reactions_since else None,
+            "members": members_since.isoformat() if members_since else None,
+        },
         "daily_volume": daily,
         "top_senders": top_senders,
     }

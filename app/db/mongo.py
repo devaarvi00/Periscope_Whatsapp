@@ -109,4 +109,22 @@ async def init_mongo_indexes() -> None:
     await _ensure_index(db.messages, [("chat_wid", 1), ("phone_id", 1), ("timestamp", -1)])
     await _ensure_index(db.messages, [("phone_id", 1), ("chat_wid", 1), ("timestamp", -1)])
 
+    # media library: newest media per number
+    await _ensure_index(db.messages, [("phone_id", 1), ("message_type", 1), ("timestamp", -1), ("id", -1)])
+
+    # group_events — participant joins/adds/leaves/removes from WAHA webhooks
+    await _ensure_index(db.group_events, [("chat_id", 1), ("timestamp", 1)])
+    await _ensure_index(db.group_events, [("phone_id", 1), ("timestamp", 1)])
+    await _ensure_index(db.group_events, [("type", 1), ("timestamp", 1)])
+    await _ensure_index(
+        db.group_events, [("source_event_id", 1)], unique=True,
+        name="source_event_id_unique",
+        partialFilterExpression={"source_event_id": {"$type": "string"}},
+    )
+
+    # message_reactions — one live reaction per (message, reactor)
+    await _ensure_index(db.message_reactions, [("phone_id", 1), ("message_wid", 1), ("reactor", 1)], unique=True)
+    await _ensure_index(db.message_reactions, [("chat_id", 1), ("timestamp", 1)])
+    await _ensure_index(db.message_reactions, [("phone_id", 1), ("timestamp", 1)])
+
     logger.info("MongoDB indexes ensured")

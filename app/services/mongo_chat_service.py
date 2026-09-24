@@ -47,7 +47,16 @@ def _serialize_chat(doc: dict) -> dict:
         "status": doc.get("status") or "open",
         "last_message_from_me": doc.get("last_message_from_me"),
         "labels": doc.get("label_ids") or [],
+        "last_message_type": doc.get("last_message_type") or "",
+        "last_message_sender": doc.get("last_message_sender") or "",
+        "picture_url": doc.get("picture_url") or None,
+        "picture_checked": doc.get("picture_checked_at") is not None,
+        "created_at": _iso(doc.get("created_at")),
     }
+
+
+def _iso(v: Any) -> Any:
+    return v.isoformat() if isinstance(v, datetime) else v
 
 
 from app.core.message_labels import _MEDIA_LABELS, _SYSTEM_LABELS
@@ -82,10 +91,26 @@ def _serialize_message(doc: dict) -> dict:
         "message_type": doc.get("message_type") or "text",
         "has_media": bool(doc.get("has_media")),
         "media_url": doc.get("media_url"),
+        "media_mimetype": doc.get("media_mimetype") or "",
+        "media_filename": doc.get("media_filename") or "",
+        "media_source": _media_source(doc),
         "is_read": bool(doc.get("is_read")),
         "is_flagged": bool(doc.get("is_flagged")),
         "timestamp": ts.isoformat() if isinstance(ts, datetime) else (ts or ""),
     }
+
+
+def _media_source(doc: dict) -> str | None:
+    """How the client can show this message's media:
+    'proxy'    → GET /api/v1/media/{id}/file (WAHA file, or downloadable lazily)
+    'external' → media_url is a public https link the agent sent
+    None       → no media."""
+    url = doc.get("media_url") or ""
+    if url.startswith("https://") and "/api/files/" not in url:
+        return "external"
+    if url or doc.get("has_media"):
+        return "proxy"
+    return None
 
 
 class MongoInboxService:
@@ -190,7 +215,7 @@ class MongoInboxService:
             "name", "is_archived", "is_pinned", "is_flagged",
             "ai_active", "ai_state", "ai_snoozed_at",
             "assigned_to", "unread_count", "last_message", "last_message_at",
-            "custom_properties", "status",
+            "custom_properties", "status", "picture_url", "picture_checked_at",
         }
         # None is a real value for nullable fields (unassign, clear snooze);
         # for the rest it means "leave unchanged".
@@ -260,7 +285,7 @@ class MongoInboxService:
         )
 
     async def bulk_update_chats(self, chat_ids: list[int], **kwargs: Any) -> int:
-        allowed = {"is_archived", "is_pinned", "ai_active", "ai_state", "is_flagged", "unread_count", "status"}
+        allowed = {"is_archived", "is_pinned", "ai_active", "ai_state", "is_flagged", "unread_count", "status", "assigned_to"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return 0
@@ -308,6 +333,8 @@ class MongoInboxService:
             "message_type": data.get("message_type") or "text",
             "has_media": bool(data.get("has_media")),
             "media_url": data.get("media_url"),
+            "media_mimetype": data.get("media_mimetype") or "",
+            "media_filename": data.get("media_filename") or "",
             "is_read": False,
             "is_flagged": False,
             "timestamp": ts,
@@ -329,6 +356,7 @@ class MongoInboxService:
             data.get("message_type") or "text",
             ts,
             bool(data.get("from_me")),
+            data.get("sender_name") or data.get("sender_number") or "",
         )
         return doc
 
@@ -341,6 +369,7 @@ class MongoInboxService:
         message_type: str,
         ts: datetime,
         from_me: bool | None = None,
+        sender: str | None = None,
     ) -> None:
         preview = body[:200] if body else _MEDIA_LABELS.get(message_type, "📎 Media")
         filt: dict = {"id": chat_id} if chat_id else {"chat_wid": chat_wid, "phone_id": phone_id}
@@ -352,6 +381,10 @@ class MongoInboxService:
         fields: dict = {"last_message": preview, "last_message_at": ts, "updated_at": datetime.utcnow()}
         if from_me is not None:
             fields["last_message_from_me"] = from_me
+        fields["last_message_type"] = (message_type or "text").lower()
+        if sender is not None:
+            # "Mrs:" prefix in the chat list for group previews
+            fields["last_message_sender"] = str(sender)[:80]
         await self.db.chats.update_one(filt, {"$set": fields})
 
     async def get_messages(
@@ -410,9 +443,129 @@ class MongoInboxService:
             {"phone_id": phone_id, "message_wid": message_wid}, {"$set": {"is_flagged": flagged}}
         )
 
+    async def set_message_media(self, message_id: int, **fields: Any) -> None:
+        allowed = {"media_url", "media_mimetype", "media_filename", "has_media"}
+        updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        if updates:
+            await self.db.messages.update_one({"id": message_id}, {"$set": updates})
+
+    # ── Media library ───────────────────────────────────────────────────── #
+
+    # message_type values grouped by the Media page's type filter
+    MEDIA_KINDS: dict[str, list[str]] = {
+        "image": ["image", "photo", "sticker", "gif"],
+        "video": ["video"],
+        "document": ["document", "pdf", "file"],
+        "audio": ["audio", "ptt", "voice"],
+    }
+
+    async def list_media(
+        self,
+        phone_ids: list[int] | None = None,
+        phone_id: int | None = None,
+        chat_ids: list[int] | None = None,
+        kind: str | None = None,
+        before_id: int | None = None,
+        limit: int = 60,
+    ) -> list[dict]:
+        """Media messages newest-first, keyset-paginated on (timestamp, id)."""
+        types = [t for v in self.MEDIA_KINDS.values() for t in v]
+        if kind in self.MEDIA_KINDS:
+            types = self.MEDIA_KINDS[kind]
+        filt: dict = {"message_type": {"$in": types}}
+        if phone_id is not None:
+            filt["phone_id"] = phone_id
+        elif phone_ids is not None:
+            filt["phone_id"] = {"$in": phone_ids}
+        if chat_ids is not None:
+            filt["chat_id"] = {"$in": chat_ids}
+        if before_id:
+            pivot = await self.db.messages.find_one({"id": before_id}, {"timestamp": 1})
+            if pivot:
+                filt["$or"] = [
+                    {"timestamp": {"$lt": pivot["timestamp"]}},
+                    {"timestamp": pivot["timestamp"], "id": {"$lt": before_id}},
+                ]
+        return await (
+            self.db.messages.find(filt)
+            .sort([("timestamp", -1), ("id", -1)])
+            .limit(limit)
+            .to_list(length=limit)
+        )
+
+    # ── Group events & reactions ────────────────────────────────────────── #
+    # Shared storage format (also read by the analytics charts):
+    #   group_events:      {phone_id, chat_id, chat_wid, type, participant,
+    #                       actor, timestamp, source_event_id}
+    #                      type ∈ join|add|leave|remove|promote|demote
+    #   message_reactions: {phone_id, chat_id, message_wid, reactor, emoji,
+    #                       timestamp, from_me} — one live reaction per reactor
+
+    GROUP_EVENT_TYPES = ("join", "add", "leave", "remove", "promote", "demote")
+
+    async def add_group_event(self, data: dict[str, Any]) -> bool:
+        """Store one participant event. Returns False when source_event_id
+        was already stored (webhook retry)."""
+        if data["type"] not in self.GROUP_EVENT_TYPES:
+            raise ValueError(f"unknown group event type {data['type']!r}")
+        doc = {
+            "phone_id": data["phone_id"],
+            "chat_id": data["chat_id"],
+            "chat_wid": data.get("chat_wid") or "",
+            "type": data["type"],
+            "participant": data.get("participant") or "",
+            "actor": data.get("actor") or None,
+            "timestamp": data.get("timestamp") or datetime.utcnow(),
+            "source_event_id": data.get("source_event_id") or None,
+        }
+        try:
+            await self.db.group_events.insert_one(doc)
+        except DuplicateKeyError:
+            return False
+        return True
+
+    async def set_reaction(self, data: dict[str, Any]) -> None:
+        """Upsert a reactor's reaction on a message; an empty emoji removes it."""
+        key = {
+            "phone_id": data["phone_id"],
+            "message_wid": data["message_wid"],
+            "reactor": data["reactor"],
+        }
+        emoji = data.get("emoji") or ""
+        if not emoji:
+            await self.db.message_reactions.delete_one(key)
+            return
+        await self.db.message_reactions.update_one(key, {"$set": {
+            "chat_id": data["chat_id"],
+            "emoji": emoji,
+            "timestamp": data.get("timestamp") or datetime.utcnow(),
+            "from_me": bool(data.get("from_me")),
+        }}, upsert=True)
+
+    async def count_group_events(self, chat_id: int, etypes: list[str],
+                                 since: datetime, until: datetime) -> int:
+        return await self.db.group_events.count_documents({
+            "chat_id": chat_id, "type": {"$in": etypes},
+            "timestamp": {"$gte": since, "$lt": until},
+        })
+
+    async def count_reactions(self, chat_id: int, since: datetime, until: datetime) -> int:
+        return await self.db.message_reactions.count_documents({
+            "chat_id": chat_id, "timestamp": {"$gte": since, "$lt": until},
+        })
+
+    async def tracking_since(self, collection: str, phone_id: int) -> datetime | None:
+        """Earliest stored row for this number (None = feed never received)."""
+        doc = await self.db[collection].find_one(
+            {"phone_id": phone_id}, {"timestamp": 1}, sort=[("timestamp", 1)],
+        )
+        return doc["timestamp"] if doc else None
+
     # ── Cleanup ─────────────────────────────────────────────────────────── #
 
     async def delete_phone_data(self, phone_id: int) -> None:
         """Remove all chats and messages for a phone — called on Clear Data."""
         await self.db.messages.delete_many({"phone_id": phone_id})
         await self.db.chats.delete_many({"phone_id": phone_id})
+        await self.db.group_events.delete_many({"phone_id": phone_id})
+        await self.db.message_reactions.delete_many({"phone_id": phone_id})

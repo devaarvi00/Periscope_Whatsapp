@@ -83,6 +83,9 @@ const Api = (() => {
     sync:          (pid)  => post(`/inbox/sync/${pid}`),
     syncMessages:  (cid, limit) => post(`/inbox/chats/${cid}/sync-messages${limit ? '?limit=' + limit : ''}`),
     bulkUpdate:    (b)    => post('/inbox/bulk-update', b),
+    getChat:       (id)   => get(`/inbox/chats/${id}`),
+    activity:      (id)   => get(`/inbox/chats/${id}/activity`),
+    picture:       (id)   => get(`/inbox/chats/${id}/picture`),
   };
 
   // Tickets
@@ -205,6 +208,28 @@ const Api = (() => {
     participants:    (id) => get(`/groups/${id}/participants`),
     analytics:       (id, days) => get(`/groups/${id}/analytics`, { days: days || 30 }),
     addParticipants: (b)  => post('/groups/add-participants', b),
+    analyticsRange:  (id, r) => get(`/groups/${id}/analytics`, { from: r.from, to: r.to }),
+  };
+
+  // Media library (files are fetched with auth, so they come back as blobs)
+  async function mediaBlob(id) {
+    const r = await fetch(`${BASE}/media/${id}/file`, { headers: headers() });
+    if (r.status === 401 && _token) { clearToken(); window.location.reload(); return; }
+    if (r.status === 403) throw new Error(FORBIDDEN_MSG);
+    if (!r.ok) throw new Error(r.status === 404 ? 'Media not available' : 'Could not load media');
+    return r.blob();
+  }
+  const media = {
+    list:     (q)  => get('/media', Object.fromEntries(Object.entries(q || {}).filter(([, v]) => v !== '' && v != null))),
+    blob:     mediaBlob,
+    download: async (id, filename) => {
+      const blob = await mediaBlob(id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename || 'file';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
   };
 
   // Scheduled messages
@@ -264,6 +289,6 @@ const Api = (() => {
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
     phones, analytics, automation, bulk, ai, search,
     logs, groups, scheduled, exports: exportsApi,
-    tasks, properties, org,
+    tasks, properties, org, media,
   };
 })();
