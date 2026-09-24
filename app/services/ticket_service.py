@@ -32,8 +32,11 @@ class TicketService:
         priority: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        chat_ids: list[int] | None = None,
     ) -> list[Ticket]:
         q = self.db.query(Ticket)
+        if chat_ids is not None:
+            q = q.filter(Ticket.chat_id.in_(chat_ids or [0]))
         if chat_id:
             q = q.filter(Ticket.chat_id == chat_id)
         if status:
@@ -48,9 +51,16 @@ class TicketService:
         ticket = self.get_ticket(ticket_id)
         if not ticket:
             return None
+        # Callers pass only the fields the client sent (exclude_unset), so
+        # None is meaningful for nullable fields: assigned_to=None unassigns,
+        # due_date=None clears the deadline.
+        nullable = {"assigned_to", "due_date"}
         for k, v in kwargs.items():
-            if hasattr(ticket, k) and v is not None:
-                setattr(ticket, k, v)
+            if not hasattr(ticket, k):
+                continue
+            if v is None and k not in nullable:
+                continue
+            setattr(ticket, k, v)
         if kwargs.get("status") in (TicketStatus.RESOLVED, TicketStatus.CLOSED):
             ticket.resolved_at = datetime.utcnow()
         self.db.commit()
