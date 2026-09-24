@@ -118,6 +118,13 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             elif msg_type in _SYSTEM_LABELS:
                 body = _SYSTEM_LABELS[msg_type]
 
+        # WAHA downloads media and reports where it is served (media.url);
+        # the file itself is fetched through /api/v1/media/{id}/file.
+        media = msg_data.get("media") if isinstance(msg_data.get("media"), dict) else {}
+        media_url = media.get("url") or msg_data.get("mediaUrl") or None
+        media_mimetype = str(media.get("mimetype") or "")[:100]
+        media_filename = str(media.get("filename") or "")[:255]
+
         sender_name = msg_data.get("notifyName") or msg_data.get("pushName") or ""
         from_raw = msg_data.get("from") or msg_data.get("author") or ""
         if isinstance(from_raw, dict):
@@ -136,6 +143,9 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             "body": body,
             "message_type": msg_type,
             "has_media": has_media,
+            "media_url": media_url if has_media else None,
+            "media_mimetype": media_mimetype,
+            "media_filename": media_filename,
             "timestamp": ts,
         })
 
@@ -338,6 +348,86 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
         db.close()
 
 
+def _wid(v: Any) -> str:
+    if isinstance(v, dict):
+        return str(v.get("_serialized") or v.get("id") or "")
+    return str(v or "")
+
+
+async def _record_reaction_event(payload: dict[str, Any]) -> None:
+    """Store every reaction (any emoji) in group_events for chat analytics."""
+    db = SessionLocal()
+    try:
+        session = payload.get("session", settings.waha_session_name)
+        data = payload.get("payload") or {}
+        reaction = data.get("reaction") or {}
+        emoji = str(reaction.get("text") or "").strip()
+        target_wid = _wid(reaction.get("messageId") or data.get("messageId"))
+        if not emoji or not target_wid:
+            return  # empty text = reaction removed; nothing to count
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
+        inbox = MongoInboxService()
+        target = await inbox.get_message_by_wid(target_wid, phone.id)
+        chat_wid = (target or {}).get("chat_wid") or ""
+        chat_id = (target or {}).get("chat_id")
+        if not chat_wid:
+            chat_wid = _wid(data.get("to") if data.get("fromMe") else data.get("from"))
+            chat = await inbox.get_chat_by_wid(chat_wid, phone.id) if chat_wid else None
+            chat_id = (chat or {}).get("id")
+        if not chat_wid:
+            return
+        participant = _wid(data.get("participant") or data.get("from"))
+        ts_raw = data.get("timestamp")
+        ts = datetime.utcfromtimestamp(ts_raw) if isinstance(ts_raw, (int, float)) else datetime.utcnow()
+        key = _wid(data.get("id")) or f"{target_wid}|{participant}|{emoji}|{int(ts.timestamp())}"
+        await inbox.add_group_event({
+            "phone_id": phone.id, "chat_id": chat_id, "chat_wid": chat_wid,
+            "type": "reaction", "event_key": f"reaction:{key}",
+            "participant": participant, "emoji": emoji[:16],
+            "message_wid": target_wid, "timestamp": ts,
+        })
+    except Exception as exc:
+        logger.exception("Reaction record error: %s", exc)
+    finally:
+        db.close()
+
+
+async def _process_group_participants(payload: dict[str, Any]) -> None:
+    """group.v2.participants → one join/leave row per participant."""
+    db = SessionLocal()
+    try:
+        session = payload.get("session", settings.waha_session_name)
+        data = payload.get("payload") or {}
+        etype = str(data.get("type") or "").lower()
+        if etype not in ("join", "leave"):
+            return  # promote / demote aren't membership changes
+        group_wid = _wid((data.get("group") or {}).get("id") if isinstance(data.get("group"), dict) else data.get("group"))
+        if not group_wid:
+            return
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
+        inbox = MongoInboxService()
+        chat = await inbox.get_chat_by_wid(group_wid, phone.id)
+        ts_raw = data.get("timestamp")
+        ts = datetime.utcfromtimestamp(ts_raw) if isinstance(ts_raw, (int, float)) else datetime.utcnow()
+        for p in data.get("participants") or []:
+            pid = _wid(p.get("id") if isinstance(p, dict) else p)
+            if not pid:
+                continue
+            await inbox.add_group_event({
+                "phone_id": phone.id, "chat_id": (chat or {}).get("id"), "chat_wid": group_wid,
+                "type": etype, "event_key": f"{etype}:{group_wid}|{pid}|{int(ts.timestamp())}",
+                "participant": pid, "timestamp": ts,
+            })
+    except Exception as exc:
+        logger.exception("group.v2.participants error: %s", exc)
+    finally:
+        db.close()
+
+
 async def _process_session_status(payload: dict[str, Any]) -> None:
     """Update phone WAHA status in DB and notify the frontend."""
     db = SessionLocal()
@@ -456,6 +546,9 @@ async def waha_webhook(
         background.add_task(_process_message_event, body)
     elif event == "message.reaction":
         background.add_task(_process_reaction_event, body)
+        background.add_task(_record_reaction_event, body)
+    elif event == "group.v2.participants":
+        background.add_task(_process_group_participants, body)
     elif event == "session.status":
         background.add_task(_process_session_status, body)
 

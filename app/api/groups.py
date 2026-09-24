@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -123,35 +123,67 @@ async def add_participants(
     return {"results": results}
 
 
+def _parse_day(v: str | None, end: bool = False) -> datetime | None:
+    """'YYYY-MM-DD' or full ISO → naive UTC datetime. A bare date used as the
+    upper bound means "through the end of that day"."""
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(400, f"Invalid date: {v}")
+    if dt.tzinfo is not None:
+        from datetime import timezone
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    if end and len(v) <= 10:
+        dt += timedelta(days=1)
+    return dt
+
+
 @router.get("/{chat_id}/analytics")
 async def group_analytics(
     chat_id: int,
     days: int = 30,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    """Group activity: daily message volume, top senders, in/out split."""
+    """Group activity for a window: message / reaction / join / exit counts,
+    daily message volume, top senders, in/out split.
+
+    Window: `from`/`to` (ISO date or datetime, UTC) or the last `days` days.
+    Reactions and joins/exits come from webhook events stored in
+    `group_events`; a metric is null (not tracked) until the first such
+    event has ever been stored for this number.
+    """
     inbox = MongoInboxService()
     chat = await get_accessible_chat(db, agent, chat_id)
     if not chat.get("is_group"):
         raise HTTPException(404, "Group not found")
-    since = datetime.utcnow() - timedelta(days=min(days, 180))
+    until = _parse_day(to, end=True) or datetime.utcnow()
+    since = _parse_day(from_) or (until - timedelta(days=max(1, min(days, 365))))
+    if since >= until:
+        raise HTTPException(400, "'from' must be before 'to'")
+    if until - since > timedelta(days=366):
+        raise HTTPException(400, "Date range is limited to one year")
+    window = {"$gte": since, "$lt": until}
 
-    total = await inbox.db.messages.count_documents({"chat_id": chat_id, "timestamp": {"$gte": since}})
-    incoming = await inbox.db.messages.count_documents({"chat_id": chat_id, "from_me": False, "timestamp": {"$gte": since}})
+    total = await inbox.db.messages.count_documents({"chat_id": chat_id, "timestamp": window})
+    incoming = await inbox.db.messages.count_documents({"chat_id": chat_id, "from_me": False, "timestamp": window})
 
     # Daily volume
     daily_pipeline = [
-        {"$match": {"chat_id": chat_id, "timestamp": {"$gte": since}}},
+        {"$match": {"chat_id": chat_id, "timestamp": window}},
         {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}}, "count": {"$sum": 1}}},
         {"$sort": {"_id": 1}},
     ]
-    daily_docs = await inbox.db.messages.aggregate(daily_pipeline).to_list(200)
+    daily_docs = await inbox.db.messages.aggregate(daily_pipeline).to_list(400)
     daily = [{"date": d["_id"], "count": d["count"]} for d in daily_docs]
 
     # Top senders
     sender_pipeline = [
-        {"$match": {"chat_id": chat_id, "from_me": False, "timestamp": {"$gte": since}}},
+        {"$match": {"chat_id": chat_id, "from_me": False, "timestamp": window}},
         {"$group": {"_id": {"name": "$sender_name", "number": "$sender_number"}, "n": {"$sum": 1}}},
         {"$sort": {"n": -1}},
         {"$limit": 10},
@@ -165,12 +197,34 @@ async def group_analytics(
         }
         for d in sender_docs
     ]
+
+    phone_id, wid = chat["phone_id"], chat["chat_wid"]
+
+    async def _event_metric(etype: str, family: list[str]):
+        tracked_since = await inbox.group_event_tracking_since(phone_id, family)
+        if tracked_since is None:
+            return None, None
+        n = await inbox.count_group_events(phone_id, wid, etype, since, until)
+        return n, tracked_since.isoformat()
+
+    reactions, reactions_since = await _event_metric("reaction", ["reaction"])
+    joined, members_since = await _event_metric("join", ["join", "leave"])
+    exited, _ = await _event_metric("leave", ["join", "leave"])
+
     return {
         "group": chat.get("name") or "",
         "days": days,
+        "from": since.isoformat(),
+        "to": until.isoformat(),
         "total_messages": total,
         "incoming": incoming,
         "outgoing": total - incoming,
+        "messages": total,
+        "reactions": reactions,
+        "members_joined": joined,
+        "members_exited": exited,
+        # When each event feed started (null = never received on this number)
+        "tracked_since": {"reactions": reactions_since, "members": members_since},
         "daily_volume": daily,
         "top_senders": top_senders,
     }

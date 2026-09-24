@@ -109,4 +109,12 @@ async def init_mongo_indexes() -> None:
     await _ensure_index(db.messages, [("chat_wid", 1), ("phone_id", 1), ("timestamp", -1)])
     await _ensure_index(db.messages, [("phone_id", 1), ("chat_wid", 1), ("timestamp", -1)])
 
+    # media library: newest media per number
+    await _ensure_index(db.messages, [("phone_id", 1), ("message_type", 1), ("timestamp", -1), ("id", -1)])
+
+    # group_events — reactions and group joins/leaves from WAHA webhooks
+    await _ensure_index(db.group_events, [("phone_id", 1), ("event_key", 1)], unique=True)
+    await _ensure_index(db.group_events, [("phone_id", 1), ("chat_wid", 1), ("type", 1), ("timestamp", -1)])
+    await _ensure_index(db.group_events, [("phone_id", 1), ("type", 1), ("timestamp", 1)])
+
     logger.info("MongoDB indexes ensured")

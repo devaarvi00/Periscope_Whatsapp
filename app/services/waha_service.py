@@ -10,6 +10,10 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Events our webhook subscribes to. group.v2.participants feeds the group
+# analytics (members joined / exited); reactions feed tickets + analytics.
+WEBHOOK_EVENTS = ["message.any", "message.reaction", "group.v2.participants", "session.status"]
+
 
 class WAHAError(Exception):
     def __init__(self, code: str, message: str, status_code: int | None = None) -> None:
@@ -90,7 +94,7 @@ class WAHAService:
             payload["config"] = {
                 "webhooks": [{
                     "url": webhook_url,
-                    "events": ["message.any", "message.reaction", "session.status"],
+                    "events": WEBHOOK_EVENTS,
                     "customHeaders": [{"name": "X-Webhook-Secret", "value": webhook_secret}],
                 }]
             }
@@ -177,6 +181,67 @@ class WAHAService:
         except Exception as exc:
             logger.warning("WAHA get_messages error: %s", exc)
         return []
+
+    async def get_message(self, chat_id: str, message_id: str, download_media: bool = True) -> dict[str, Any]:
+        """One message by id; with download_media WAHA returns `media.url`."""
+        from urllib.parse import quote
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/chats/{quote(chat_id, safe='@.')}/messages/{quote(message_id, safe='')}"
+        try:
+            resp = await get_http_client().get(
+                url, headers=self._headers,
+                params={"downloadMedia": "true" if download_media else "false"},
+            )
+            if resp.is_success:
+                data = resp.json()
+                return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.warning("WAHA get_message error: %s", exc)
+        return {}
+
+    async def get_chat_picture(self, chat_id: str) -> str | None:
+        """Profile / group picture URL (WhatsApp CDN), or None when hidden."""
+        from urllib.parse import quote
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/chats/{quote(chat_id, safe='@.')}/picture"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                data = resp.json()
+                return (data or {}).get("url") if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.warning("WAHA get_chat_picture error: %s", exc)
+        return None
+
+    def files_path(self, media_url: str) -> str | None:
+        """Path of a WAHA-served media file (`/api/files/...`), else None.
+
+        WAHA reports its own public base URL in media.url, which may differ
+        from the address we reach it on — only the path is trusted and it is
+        always fetched from this phone's configured WAHA base.
+        """
+        from urllib.parse import urlsplit
+        try:
+            path = urlsplit(media_url or "").path
+        except ValueError:
+            return None
+        if not path.startswith("/api/files/") or ".." in path:
+            return None
+        return path
+
+    async def fetch_file(self, path: str, max_bytes: int = 64 * 1024 * 1024) -> tuple[bytes, str] | None:
+        """Download a WAHA media file by path. Returns (content, content_type)."""
+        from app.core.http_client import get_http_client
+        headers = {k: v for k, v in self._headers.items() if k != "Content-Type"}
+        headers["Accept"] = "*/*"
+        try:
+            resp = await get_http_client().get(f"{self.base}{path}", headers=headers)
+        except Exception as exc:
+            logger.warning("WAHA fetch_file error: %s", exc)
+            return None
+        if not resp.is_success or len(resp.content) > max_bytes:
+            return None
+        return resp.content, resp.headers.get("content-type", "application/octet-stream")
 
     # ── Groups ────────────────────────────────────────────────────────────────
 
@@ -280,7 +345,7 @@ class WAHAService:
             "config": {
                 "webhooks": [{
                     "url": webhook_url,
-                    "events": ["message.any", "message.reaction", "session.status"],
+                    "events": WEBHOOK_EVENTS,
                     "customHeaders": [{"name": "X-Webhook-Secret", "value": secret}],
                 }]
             }

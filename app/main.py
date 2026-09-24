@@ -27,6 +27,7 @@ from app.api.public_api import router as public_api_router
 from app.api.tasks import router as tasks_router
 from app.api.labels import router as labels_router
 from app.api.logs import router as logs_router
+from app.api.media import router as media_router
 from app.api.notes import router as notes_router
 from app.api.org import router as org_router
 from app.api.phones import router as phones_router
@@ -169,6 +170,7 @@ app.include_router(scheduled_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(tasks_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(properties_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(org_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(media_router, prefix=PREFIX, dependencies=_auth)
 
 
 WS_AUTH_TIMEOUT_SECONDS = 10
