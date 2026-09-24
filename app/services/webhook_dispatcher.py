@@ -48,7 +48,17 @@ async def dispatch_event(event: str, data: dict[str, Any]) -> None:
         }
         body = json.dumps(payload)
 
+        from app.services.url_safety import UnsafeURLError, assert_public_url
+
         for endpoint in targets:
+            # Re-validate at send time: DNS may have been re-pointed at an
+            # internal address since the endpoint was saved (DNS rebinding).
+            try:
+                await assert_public_url(endpoint.url)
+            except UnsafeURLError as exc:
+                endpoint.failure_count = (endpoint.failure_count or 0) + 1
+                logger.warning("Outbound webhook %s blocked: %s", endpoint.url, exc)
+                continue
             headers = {"Content-Type": "application/json", "X-Event": event}
             if endpoint.secret:
                 signature = hmac.new(
@@ -57,7 +67,8 @@ async def dispatch_event(event: str, data: dict[str, Any]) -> None:
                 headers["X-Signature"] = f"sha256={signature}"
             try:
                 resp = await get_http_client().post(
-                    endpoint.url, content=body, headers=headers
+                    endpoint.url, content=body, headers=headers,
+                    follow_redirects=False,  # a redirect could bounce us to an internal host
                 )
                 if not resp.is_success:
                     endpoint.failure_count = (endpoint.failure_count or 0) + 1

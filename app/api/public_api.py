@@ -73,7 +73,8 @@ async def public_send_message(
     try:
         result = await waha.send_text(target, req.message)
     except Exception as exc:
-        raise HTTPException(502, f"Send failed: {exc}")
+        logger.exception("Public API send failed: %s", exc)
+        raise HTTPException(502, "Failed to send message via WhatsApp")
 
     if chat:
         try:

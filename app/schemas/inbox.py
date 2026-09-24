@@ -1,6 +1,6 @@
-from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, computed_field
 
 
 class SendMessageRequest(BaseModel):
@@ -12,11 +12,15 @@ class SendMessageRequest(BaseModel):
 
 
 class ChatUpdateRequest(BaseModel):
+    """Partial update. Only fields present in the request body are applied
+    (routes use exclude_unset), so `"assigned_to": null` unassigns."""
+
     is_flagged: bool | None = None
     is_archived: bool | None = None
     is_pinned: bool | None = None
     ai_active: bool | None = None
     assigned_to: int | None = None
+    status: Literal["open", "resolved"] | None = None
 
 
 class PhoneOut(BaseModel):
@@ -27,6 +31,12 @@ class PhoneOut(BaseModel):
     waha_status: str
     is_active: bool
     waha_base_url: str | None = None
-    waha_api_key: str | None = None
+    # Never serialised — only used to compute has_waha_key
+    waha_api_key: str | None = Field(default=None, exclude=True)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def has_waha_key(self) -> bool:
+        return bool(self.waha_api_key)
 
     model_config = {"from_attributes": True}

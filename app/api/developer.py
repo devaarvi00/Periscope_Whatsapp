@@ -125,13 +125,17 @@ def create_webhook(
     agent: Agent = Depends(get_current_agent),
 ):
     _require_admin(agent)
-    if not req.url.startswith(("http://", "https://")):
-        raise HTTPException(400, "URL must start with http:// or https://")
+    from app.services.url_safety import UnsafeURLError, check_public_url
+    try:
+        # Sync route → runs in the threadpool, so blocking DNS is fine here
+        url = check_public_url(req.url)
+    except UnsafeURLError as exc:
+        raise HTTPException(400, f"Invalid webhook URL: {exc}")
     invalid = [e for e in (req.events or []) if e not in WEBHOOK_EVENTS]
     if invalid:
         raise HTTPException(400, f"Unknown events: {invalid}")
     hook = WebhookEndpoint(
-        url=req.url, secret=req.secret, events=req.events, created_by=agent.id
+        url=url, secret=req.secret, events=req.events, created_by=agent.id
     )
     db.add(hook)
     db.commit()

@@ -38,12 +38,23 @@ class WAHAService:
 
     @classmethod
     def from_phone(cls, phone: object) -> "WAHAService":
-        """Build WAHAService using a Phone model's own WAHA URL/key (falls back to global settings)."""
-        return cls(
+        """Build WAHAService using a Phone model's own WAHA URL/key.
+
+        Falls back to the global settings, but the global API key is only ever
+        sent to the global WAHA base URL — a phone pointing at a different
+        server must carry its own key, otherwise requests go out keyless.
+        """
+        global_base = (settings.waha_base_url or "").strip().rstrip("/")
+        phone_base = (getattr(phone, "waha_base_url", None) or "").strip().rstrip("/")
+        phone_key = getattr(phone, "waha_api_key", None) or None
+        svc = cls(
             session_name=getattr(phone, "session_name", ""),
-            base_url=getattr(phone, "waha_base_url", None) or None,
-            api_key=getattr(phone, "waha_api_key", None) or None,
+            base_url=phone_base or None,
+            api_key=phone_key,
         )
+        if phone_base and phone_base.lower() != global_base.lower() and not phone_key:
+            svc._headers.pop("X-Api-Key", None)
+        return svc
 
     # ── Session ──────────────────────────────────────────────────────────────
 
