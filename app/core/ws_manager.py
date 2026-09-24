@@ -22,6 +22,10 @@ class ConnectionManager:
         # Confirm connection to the client
         await self._send(websocket, {"type": "connected", "agent_id": agent_id})
 
+    def online_agent_ids(self) -> set[int]:
+        """Agents with at least one live socket (this process only)."""
+        return {int(a) for a, conns in self._connections.items() if conns}
+
     def disconnect(self, websocket: WebSocket, agent_id: int) -> None:
         conns = self._connections.get(agent_id, [])
         if websocket in conns:

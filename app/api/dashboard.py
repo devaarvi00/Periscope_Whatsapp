@@ -23,10 +23,7 @@ _ACTIVE_TICKET = (TicketStatus.OPEN, TicketStatus.IN_PROGRESS)
 
 
 def _online_agent_ids() -> set[int]:
-    # ws_manager has no public accessor yet; _connections is keyed by agent_id
-    # and only holds agents with at least one live socket. Swap for a public
-    # method (e.g. ws_manager.online_agent_ids()) once one exists.
-    return {int(a) for a, conns in list(ws_manager._connections.items()) if conns}
+    return ws_manager.online_agent_ids()
 
 
 @router.get("/summary")

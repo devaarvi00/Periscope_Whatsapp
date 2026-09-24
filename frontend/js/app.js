@@ -267,6 +267,7 @@ function showApp() {
   const hashView = decodeURIComponent(location.hash.replace('#', ''));
   navigateTo(VIEW_LABELS[hashView] ? hashView : 'dashboard');
   loadOrg();
+  refreshUnreadBadge();
   loadLabels();
   loadPhones();
   connectWS();
@@ -1324,11 +1325,22 @@ function _filterChats(chats) {
   return chats;
 }
 
-function _updateUnreadBadge(chats) {
-  const total = chats.reduce((s, c) => s + (c.unread_count || 0), 0);
-  const badge = document.getElementById('unread-badge');
-  if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+// Sidebar "Chats" badge = number of unread chats across the agent's numbers.
+// Comes from the server so it's right on every page, not just the loaded list page.
+let _unreadBadgeTimer = null;
+function refreshUnreadBadge(delay = 0) {
+  clearTimeout(_unreadBadgeTimer);
+  _unreadBadgeTimer = setTimeout(async () => {
+    if (!State.agent) return;
+    try {
+      const s = await Api.analytics.summary();
+      const n = s?.chats?.unread || 0;
+      const badge = document.getElementById('unread-badge');
+      if (badge) { badge.textContent = n > 99 ? '99+' : n; badge.style.display = n ? 'inline-flex' : 'none'; }
+    } catch (_) { /* keep the last value */ }
+  }, delay);
 }
+function _updateUnreadBadge() { refreshUnreadBadge(1500); }
 
 async function loadMoreChats() {
   const btn = document.getElementById('load-more-chats-btn');
