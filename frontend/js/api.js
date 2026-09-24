@@ -61,6 +61,8 @@ const Api = (() => {
     setAgentPhones: (id, ids)   => req('PUT', `/auth/agents/${id}/phones`, ids),
     changePassword: (current_password, new_password) =>
       post('/auth/change-password', { current_password, new_password }),
+    notificationPrefs:     ()      => get('/auth/me/notification-prefs'),
+    saveNotificationPrefs: (prefs) => req('PUT', '/auth/me/notification-prefs', prefs),
   };
 
   // Organization (workspace identity for the sidebar switcher)
