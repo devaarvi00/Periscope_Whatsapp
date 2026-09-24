@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.schemas.auth import AgentCreate, AgentOut, LoginRequest, TokenResponse
+from app.schemas.auth import AgentCreate, AgentOut, ChangePasswordRequest, LoginRequest, TokenResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -110,6 +110,37 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
         email=agent.email,
         role=agent.role,
     )
+
+
+@router.post("/change-password", status_code=204)
+def change_password(
+    req: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    # 400 (not 401) on a wrong current password: the frontend treats 401 as
+    # "session expired" and logs the user out.
+    email_key = agent.email.strip().lower()
+    remaining = _lockout_remaining(email_key)
+    if remaining:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Try again later.",
+            headers={"Retry-After": str(remaining)},
+        )
+    if not verify_password(req.current_password, agent.password_hash):
+        _record_failed_login(email_key)
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if req.new_password == req.current_password:
+        raise HTTPException(status_code=400, detail="New password must be different")
+    try:
+        agent.password_hash = hash_password(req.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _reset_failed_logins(email_key)
+    db.commit()
+    logger.info("Password changed for agent_id=%s", agent.id)
+    return None
 
 
 @router.post("/register", response_model=AgentOut, status_code=201)

@@ -20,6 +20,7 @@ from app.models.api_key import ApiKey, WebhookEndpoint
 from app.models.scheduled_message import ScheduledMessage
 from app.models.task import Task
 from app.models.property_definition import PropertyDefinition
+from app.models.org_settings import OrgSettings
 
 __all__ = [
     "Agent", "AgentPhone", "Phone",
@@ -27,5 +28,5 @@ __all__ = [
     "Note", "QuickReply", "AutomationRule", "KnowledgeItem",
     "BulkMessageJob", "ActivityLog", "ApiKey", "WebhookEndpoint",
     "ScheduledMessage", "Task", "PropertyDefinition",
-    "BulkMessageLog", "MessageTemplate", "SavedChatList", "AIAgentSettings",
+    "BulkMessageLog", "MessageTemplate", "SavedChatList", "AIAgentSettings", "OrgSettings",
 ]

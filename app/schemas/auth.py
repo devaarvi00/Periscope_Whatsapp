@@ -13,6 +13,11 @@ class LoginRequest(BaseModel):
     password: str = Field(max_length=256)
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(max_length=256)
+    new_password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
