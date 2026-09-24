@@ -747,6 +747,7 @@ const VIEW_LABELS = {
   automation: 'Automation Rules',
   bulk: 'Bulk Messages', settings: 'Settings',
   communities: 'Groups', logs: 'Logs', scheduled: 'Scheduled Messages',
+  media: 'Media',
 };
 
 function navigateTo(view) {
@@ -778,6 +779,7 @@ function navigateTo(view) {
     communities:      renderCommunities,
     logs:             renderLogs,
     scheduled:        renderScheduled,
+    media:            renderMedia,
   }[view] || (() => { main.innerHTML = `<div class="loading-center">View not found</div>`; }))();
 }
 
@@ -919,17 +921,21 @@ function handleWSEvent(data) {
     if (State.currentView === 'inbox') {
       const chatEntry = State.inbox.chats?.find(c => c.id == d.chat_id);
       if (chatEntry) {
+        const isOpen = State.inbox.selectedChatId == d.chat_id;
         chatEntry.last_message = d.body || '';
-        chatEntry.last_message_time = d.timestamp;
-        if (!d.from_me && State.inbox.selectedChatId != d.chat_id) {
-          chatEntry.unread_count = (chatEntry.unread_count || 0) + 1;
+        chatEntry.last_message_at = d.timestamp;   // unix seconds — parseServerDate handles numbers
+        chatEntry.last_message_type = d.message_type || 'text';
+        chatEntry.last_message_sender = d.sender_name || d.sender_number || '';
+        chatEntry.last_message_from_me = !!d.from_me;
+        if (!d.from_me && !isOpen) {
+          chatEntry.unread_count = d.unread_count || (chatEntry.unread_count || 0) + 1;
         }
+        // Chat is on screen: keep it read on the server too
+        if (!d.from_me && isOpen) Api.inbox.markRead(d.chat_id).catch(() => {});
         // Bubble this chat to the top
         State.inbox.chats = [chatEntry, ...State.inbox.chats.filter(c => c.id !== d.chat_id)];
-        renderChatList(State.inbox.chats);
-        const total = State.inbox.chats.reduce((s, c) => s + (c.unread_count || 0), 0);
-        const badge = document.getElementById('unread-badge');
-        if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+        renderChatList(State.inbox.chats, _chatHasMore);
+        _updateUnreadBadge(State.inbox.chats);
       } else {
         // New chat not yet in state — full refresh
         refreshChatList();
@@ -974,7 +980,15 @@ function handleWSEvent(data) {
   }
 
   if (event === 'chat_updated') {
-    if (State.currentView === 'inbox') refreshChatList();
+    if (State.currentView !== 'inbox') return;
+    // Field-level update (e.g. AI auto-flag) → patch the row in place
+    const chatEntry = State.inbox.chats?.find(c => c.id == d.chat_id);
+    const fields = Object.keys(d || {}).filter(k => k !== 'chat_id');
+    if (chatEntry && fields.length) {
+      fields.forEach(k => { chatEntry[k] = d[k]; });
+      cxRerenderRow(chatEntry);
+      if (State.inbox.selectedChatId == d.chat_id) renderThreadHeaderState(chatEntry);
+    } else refreshChatList();
     return;
   }
 
@@ -1068,100 +1082,391 @@ async function loadPhones() {
 }
 
 // ── INBOX VIEW ─────────────────────────────────────────────────── //
+
+// Inline outline icons for the chats UI (24×24, stroke = currentColor)
+const CX_ICONS = {
+  phone:     '<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/>',
+  folder:    '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  chevDown:  '<polyline points="6 9 12 15 18 9"/>',
+  chevUp:    '<polyline points="18 15 12 9 6 15"/>',
+  chevLeft:  '<polyline points="15 18 9 12 15 6"/>',
+  chevRight: '<polyline points="9 18 15 12 9 6"/>',
+  search:    '<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+  filter:    '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>',
+  sync:      '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
+  users:     '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+  user:      '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  userPlus:  '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/>',
+  flag:      '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/>',
+  send:      '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+  clip:      '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  smile:     '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>',
+  translate: '<path d="M5 8l6 6M4 14l6-6 2-3M2 5h12M7 2h1M22 22l-5-10-5 10M14 18h6"/>',
+  sparkle:   '<path d="M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z"/><path d="M19 3v4M17 5h4"/>',
+  wand:      '<path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M15 9h.01M17.8 6.2L19 5M3 21l9-9M12.2 6.2L11 5"/>',
+  zap:       '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+  clock:     '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  edit:      '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>',
+  panel:     '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/>',
+  info:      '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>',
+  sliders:   '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  bot:       '<rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><line x1="8" y1="14" x2="8.01" y2="14"/><line x1="16" y1="14" x2="16.01" y2="14"/>',
+  ticket:    '<path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3a2 2 0 0 0 0-4z"/><path d="M13 5v2M13 11v2M13 17v2"/>',
+  task:      '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  image:     '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+  video:     '<polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
+  doc:       '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
+  mic:       '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>',
+  megaphone: '<path d="M3 11v2a1 1 0 0 0 1 1h2l6 4V6L6 10H4a1 1 0 0 0-1 1z"/><path d="M16 8.5a5 5 0 0 1 0 7M19 5.5a9 9 0 0 1 0 13"/>',
+  chart:     '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>',
+  history:   '<path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/>',
+  note:      '<path d="M15.5 3H5a2 2 0 0 0-2 2v14c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2V8.5L15.5 3z"/><path d="M15 3v6h6"/>',
+  location:  '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
+  download:  '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+  check:     '<polyline points="20 6 9 17 4 12"/>',
+  x:         '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  more:      '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
+  heart:     '<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>',
+  msg:       '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  logIn:     '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>',
+  logOut:    '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+  tag:       '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>',
+  trash:     '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
+  play:      '<polygon points="6 4 20 12 6 20 6 4"/>',
+  calendar:  '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+};
+function cxIcon(name, size = 16) {
+  return `<svg class="cx-ico" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${CX_ICONS[name] || ''}</svg>`;
+}
+// Small round WhatsApp-green logo used on the sending-number chip
+const CX_WA_LOGO = `<svg class="cx-wa-logo" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="11" fill="#25D366"/><path fill="#fff" d="M16.9 14.2c-.3-.1-1.6-.8-1.8-.9-.3-.1-.4-.1-.6.1-.2.3-.7.9-.8 1-.2.2-.3.2-.6.1-.3-.1-1.1-.4-2.1-1.3-.8-.7-1.3-1.5-1.5-1.8-.2-.3 0-.4.1-.6l.4-.5c.1-.2.2-.3.3-.5.1-.2 0-.4 0-.5l-.8-1.9c-.2-.5-.4-.4-.6-.4h-.5c-.2 0-.5.1-.7.3-.3.3-1 1-1 2.3s1 2.7 1.2 2.9c.1.2 2 3.1 4.9 4.3 2.4.9 2.9.8 3.4.7.6-.1 1.6-.7 1.9-1.3.2-.6.2-1.2.2-1.3-.1-.2-.3-.3-.6-.4z"/></svg>`;
+
+// Chat-list date: time when today, else "22-Sep-26"
+function cxFmtListDate(ts) {
+  const d = parseServerDate(ts);
+  if (!d || isNaN(d.getTime())) return '';
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' });
+  return `${String(d.getDate()).padStart(2, '0')}-${d.toLocaleString('en', { month: 'short' })}-${String(d.getFullYear()).slice(-2)}`;
+}
+function cxDayLabel(d) {
+  return `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+}
+// "+91 95107 15498" for Indian numbers, "+<digits>" otherwise
+function cxFmtPhone(num) {
+  const d = String(num || '').replace(/\D/g, '');
+  if (!d) return '';
+  if (d.length === 12 && d.startsWith('91')) return `+91 ${d.slice(2, 7)} ${d.slice(7)}`;
+  return '+' + d;
+}
+function cxPhoneOf(chat) { return State.phones.find(p => p.id === chat?.phone_id); }
+function cxPhoneLabel(phone) { return phone ? (cxFmtPhone(phone.phone_number) || phone.name || '') : ''; }
+// Only WhatsApp's own CDN (https) may reach an <img src>
+function cxSafePicture(u) { return typeof u === 'string' && /^https:\/\/[a-z0-9.-]+\.whatsapp\.net\//i.test(u) ? u : ''; }
+
+function cxAvatar(chat, size, extraCls = '') {
+  const name = displayName(chat);
+  const pic = cxSafePicture(chat.picture_url);
+  const inner = chat.is_group ? cxIcon('users', Math.round(size * .46))
+    : /^[+\d]/.test(name) || !name ? cxIcon('user', Math.round(size * .46)) : esc(initials(name));
+  return `<div class="cx-avatar${chat.is_group ? ' is-group' : ''} ${extraCls}" data-avatar-cid="${chat.id}" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .36)}px;background:${avatarColor(name)}">${inner}${pic ? `<img src="${esc(pic)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ''}</div>`;
+}
+
+// Profile pictures: fetched lazily (server caches the WAHA lookup for 24h)
+const _cxPicQueue = [];
+const _cxPicSeen = new Set();
+let _cxPicBusy = 0;
+function cxQueuePictures(chats) {
+  chats.slice(0, 60).forEach(c => {
+    if (c.picture_url || c.picture_checked || _cxPicSeen.has(c.id)) return;
+    _cxPicSeen.add(c.id);
+    _cxPicQueue.push(c.id);
+  });
+  _cxPumpPictures();
+}
+function _cxPumpPictures() {
+  while (_cxPicBusy < 3 && _cxPicQueue.length) {
+    const id = _cxPicQueue.shift();
+    _cxPicBusy++;
+    Api.inbox.picture(id)
+      .then(r => { if (r && r.url) cxSetPicture(id, r.url); })
+      .catch(() => {})
+      .finally(() => { _cxPicBusy--; _cxPumpPictures(); });
+  }
+}
+function cxSetPicture(chatId, url) {
+  const safe = cxSafePicture(url);
+  if (!safe) return;
+  const chat = State.inbox.chats?.find(c => c.id == chatId);
+  if (chat) chat.picture_url = safe;
+  document.querySelectorAll(`[data-avatar-cid="${+chatId}"]`).forEach(av => {
+    if (av.querySelector('img')) return;
+    const img = document.createElement('img');
+    img.alt = ''; img.referrerPolicy = 'no-referrer';
+    img.onerror = () => img.remove();
+    img.src = safe;
+    av.appendChild(img);
+  });
+}
+
+// Agents (for assignee avatars) — loaded once per inbox visit
+let _cxAgentMap = {};
+async function cxLoadAgents() {
+  try {
+    const list = await Api.auth.agents();
+    _cxAgentMap = Object.fromEntries((list || []).map(a => [a.id, a]));
+  } catch (_) {}
+  return Object.values(_cxAgentMap);
+}
+function cxAssigneeAvatar(agentId, size = 20) {
+  const a = agentId != null ? _cxAgentMap[agentId] : null;
+  if (agentId == null) {
+    return `<span class="cx-assignee none" style="width:${size}px;height:${size}px" title="Unassigned">${cxIcon('user', Math.round(size * .6))}</span>`;
+  }
+  const name = a?.name || `Agent #${agentId}`;
+  return `<span class="cx-assignee" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .42)}px;background:${avatarColor(name)}" title="Assigned to ${esc(name)}">${esc(initials(name))}</span>`;
+}
+
+// Generic anchored popover (one at a time)
+let _cxPopEl = null;
+function cxClosePop() { if (_cxPopEl) { _cxPopEl.remove(); _cxPopEl = null; } }
+document.addEventListener('click', e => { if (_cxPopEl && !_cxPopEl.contains(e.target)) cxClosePop(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') cxClosePop(); });
+function cxPopover(anchor, html, opts = {}) {
+  cxClosePop();
+  const r = anchor.getBoundingClientRect();
+  const el = document.createElement('div');
+  el.className = 'cx-pop ' + (opts.cls || '');
+  el.innerHTML = html;
+  document.body.appendChild(el);
+  const w = el.offsetWidth, h = el.offsetHeight;
+  let left = opts.alignRight ? r.right - w : r.left;
+  left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+  let top = opts.above ? r.top - h - 6 : r.bottom + 6;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
+  if (top < 8) top = Math.min(window.innerHeight - h - 8, r.bottom + 6);
+  el.style.left = left + 'px';
+  el.style.top = top + 'px';
+  _cxPopEl = el;
+  return el;
+}
+
+const CX_FOLDERS = [
+  { f: 'all', label: 'All chats' },
+  { f: 'inbox', label: 'Inbox' },
+  { f: 'mine', label: 'Assigned to me' },
+  { f: 'unread', label: 'Unread' },
+  { f: 'flagged', label: 'Flagged' },
+  { f: 'awaiting', label: 'Awaiting reply' },
+];
+function cxFolderLabel() {
+  if (State.inbox.labelFilter) {
+    const l = State.labels.find(x => x.id == State.inbox.labelFilter);
+    return l ? l.name : 'Label';
+  }
+  return (CX_FOLDERS.find(x => x.f === State.inbox.filter) || CX_FOLDERS[0]).label;
+}
+function cxFiltersActive() {
+  return !!(State.inbox.typeFilter || State.inbox.statusFilter || State.inbox.showArchived);
+}
+function cxUpdateListHeader() {
+  const fl = document.getElementById('cx-folder-label');
+  if (fl) fl.textContent = cxFolderLabel();
+  const fb = document.getElementById('cx-folder-btn');
+  if (fb) fb.classList.toggle('is-label', !!State.inbox.labelFilter);
+  document.getElementById('cx-filter-btn')?.classList.toggle('on', cxFiltersActive());
+  const pb = document.getElementById('cx-phone-btn');
+  if (pb) {
+    const ph = State.phones.find(p => p.id == State.inbox.phoneFilter);
+    pb.classList.toggle('on', !!ph);
+    pb.title = ph ? `Showing ${cxPhoneLabel(ph)} only` : 'All phones';
+  }
+}
+
+function cxEmptyThread() {
+  return `<div class="empty-state" style="flex:1">
+    <div class="empty-state-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    </div>
+    <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
+    <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
+  </div>`;
+}
+
+function cxDetailPref() {
+  try { const v = localStorage.getItem('cx-detail-open'); if (v != null) return v === '1'; } catch (_) {}
+  return window.innerWidth >= 1280;
+}
+function cxSetDetailPref(open) { try { localStorage.setItem('cx-detail-open', open ? '1' : '0'); } catch (_) {} }
+
 async function renderInbox() {
   const main = document.getElementById('main-content');
   main.innerHTML = `
-    <div class="inbox-layout h-full" id="inbox-layout">
-      <div class="chat-list-panel" id="chat-list-panel">
-        <div class="chat-list-header">
-          <div class="search-bar" style="flex:1">
-            <input type="search" id="chat-search" placeholder="Search chats...">
-          </div>
-          <button class="btn btn-primary btn-sm" id="sync-btn" title="Sync">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:13px;height:13px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+    <div class="inbox-layout cx-layout h-full" id="inbox-layout">
+      <div class="chat-list-panel cx-list-panel" id="chat-list-panel">
+        <div class="cx-list-head">
+          <button type="button" class="cx-ibtn" id="cx-phone-btn" title="All phones">${cxIcon('phone')}</button>
+          <button type="button" class="cx-folder-btn" id="cx-folder-btn">
+            ${cxIcon('folder', 15)}<span id="cx-folder-label">${esc(cxFolderLabel())}</span>${cxIcon('chevDown', 14)}
           </button>
+          <span class="cx-grow"></span>
+          <button type="button" class="cx-ibtn" id="cx-search-toggle" title="Search chats">${cxIcon('search')}</button>
+          <button type="button" class="cx-ibtn" id="cx-filter-btn" title="Filters">${cxIcon('filter')}</button>
+          <button type="button" class="cx-ibtn" id="sync-btn" title="Sync chats from WhatsApp">${cxIcon('sync')}</button>
         </div>
-        <div class="chat-list-filters" id="chat-filters">
-          <span class="filter-chip active" data-f="all">All chats</span>
-          <span class="filter-chip" data-f="inbox">Inbox</span>
-          <span class="filter-chip" data-f="mine">Assigned to me</span>
-          <span class="filter-chip" data-f="unread">Unread</span>
-          <span class="filter-chip" data-f="flagged">Flagged</span>
-          <span class="filter-chip" data-f="awaiting">Awaiting reply</span>
-          <span class="filter-chip" id="label-filter-chip">🏷 Label ▾</span>
+        <div class="cx-search-row" id="cx-search-row" ${State.inbox.search ? '' : 'hidden'}>
+          ${cxIcon('search', 14)}
+          <input type="search" id="chat-search" placeholder="Search chats…" value="${esc(State.inbox.search || '')}" autocomplete="off">
         </div>
-        <div class="chat-list" id="chat-list">
+        <div class="chat-list cx-chat-list" id="chat-list">
           <div class="loading-center"><div class="spinner"></div></div>
         </div>
       </div>
-      <div class="thread-panel" id="thread-panel">
-        <div class="empty-state" style="flex:1">
-          <div class="empty-state-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          </div>
-          <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
-          <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
-        </div>
-      </div>
-      <div class="contact-detail-panel" id="detail-panel" style="display:none">
-        <div class="detail-panel-header">
-          <span>Details</span>
-          <button class="detail-panel-close" id="close-detail-btn" title="Close panel">×</button>
-        </div>
-        <div class="detail-panel-body" id="detail-panel-body"></div>
-      </div>
+      <div class="thread-panel cx-thread-panel" id="thread-panel">${cxEmptyThread()}</div>
+      <div class="contact-detail-panel cx-detail" id="detail-panel" style="display:none"></div>
     </div>`;
 
-  _inboxReady = loadChats();
-  await _inboxReady;
+  _inboxReady = (async () => { await cxLoadAgents(); await loadChats(); })();
 
-  document.getElementById('chat-search').addEventListener('input', e => {
+  const searchInput = document.getElementById('chat-search');
+  searchInput.addEventListener('input', e => {
     State.inbox.search = e.target.value;
     debounceLoadChats();
   });
+  document.getElementById('cx-search-toggle').addEventListener('click', () => {
+    const row = document.getElementById('cx-search-row');
+    row.hidden = !row.hidden;
+    if (!row.hidden) searchInput.focus();
+    else if (State.inbox.search) { State.inbox.search = ''; searchInput.value = ''; loadChats(); }
+  });
 
-  document.querySelectorAll('.filter-chip').forEach(c => {
-    c.addEventListener('click', () => {
-      document.querySelectorAll('.filter-chip').forEach(x => x.classList.remove('active'));
-      c.classList.add('active');
-      State.inbox.filter = c.dataset.f;
-      loadChats();
+  // Phone filter: All phones / one connected number
+  document.getElementById('cx-phone-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const cur = State.inbox.phoneFilter || null;
+    const pop = cxPopover(e.currentTarget, `
+      <div class="cx-pop-title">Phone</div>
+      <button class="cx-pop-item${!cur ? ' sel' : ''}" data-ph="">${cxIcon('phone', 14)}<span>All phones</span>${!cur ? cxIcon('check', 14) : ''}</button>
+      ${State.phones.map(p => `
+        <button class="cx-pop-item${cur == p.id ? ' sel' : ''}" data-ph="${p.id}">
+          <span class="cx-dot ${p.waha_status === 'WORKING' ? 'ok' : ''}"></span>
+          <span>${esc(cxPhoneLabel(p))}${p.name && p.name !== p.phone_number ? `<small>${esc(p.name)}</small>` : ''}</span>
+          ${cur == p.id ? cxIcon('check', 14) : ''}
+        </button>`).join('')}`);
+    pop.querySelectorAll('[data-ph]').forEach(b => b.addEventListener('click', () => {
+      State.inbox.phoneFilter = b.dataset.ph ? +b.dataset.ph : null;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
+    }));
+  });
+
+  // Folder dropdown: the existing chat filters + by-label
+  document.getElementById('cx-folder-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    const pop = cxPopover(btn, `
+      ${CX_FOLDERS.map(x => {
+        const sel = !State.inbox.labelFilter && State.inbox.filter === x.f;
+        return `<button class="cx-pop-item${sel ? ' sel' : ''}" data-folder="${x.f}">${cxIcon('folder', 14)}<span>${x.label}</span>${sel ? cxIcon('check', 14) : ''}</button>`;
+      }).join('')}
+      <div class="cx-pop-sep"></div>
+      <button class="cx-pop-item" data-bylabel="1">${cxIcon('tag', 14)}<span>By label…</span>${cxIcon('chevRight', 14)}</button>
+      ${State.inbox.labelFilter ? `<button class="cx-pop-item" data-clearlabel="1">${cxIcon('x', 14)}<span>Clear label filter</span></button>` : ''}`);
+    pop.querySelectorAll('[data-folder]').forEach(b => b.addEventListener('click', () => {
+      State.inbox.filter = b.dataset.folder;
+      State.inbox.labelFilter = null;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
+    }));
+    pop.querySelector('[data-bylabel]').addEventListener('click', ev => {
+      ev.stopPropagation();
+      cxClosePop();
+      openLabelPicker(btn, {
+        applied: new Set(State.inbox.labelFilter ? [State.inbox.labelFilter] : []),
+        onToggle: async (label, nowApplied) => {
+          State.inbox.labelFilter = nowApplied ? label.id : null;
+          closeLabelPicker(); cxUpdateListHeader(); loadChats();
+        },
+      });
+    });
+    pop.querySelector('[data-clearlabel]')?.addEventListener('click', () => {
+      State.inbox.labelFilter = null;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
+    });
+  });
+
+  // Filter options: chat type, status, archived
+  document.getElementById('cx-filter-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const i = State.inbox;
+    const opt = (group, val, label, cur) =>
+      `<button class="cx-seg-btn${(cur || '') === val ? ' on' : ''}" data-g="${group}" data-v="${val}">${label}</button>`;
+    const pop = cxPopover(e.currentTarget, `
+      <div class="cx-pop-title">Chat type</div>
+      <div class="cx-seg">${opt('type', '', 'All', i.typeFilter)}${opt('type', 'direct', 'Direct', i.typeFilter)}${opt('type', 'group', 'Groups', i.typeFilter)}</div>
+      <div class="cx-pop-title">Status</div>
+      <div class="cx-seg">${opt('status', '', 'Any', i.statusFilter)}${opt('status', 'open', 'Open', i.statusFilter)}${opt('status', 'resolved', 'Resolved', i.statusFilter)}</div>
+      <label class="cx-pop-check"><input type="checkbox" id="cx-f-archived" ${i.showArchived ? 'checked' : ''}> Show archived chats only</label>
+      ${cxFiltersActive() ? `<button class="cx-pop-item" data-reset="1">${cxIcon('x', 14)}<span>Reset filters</span></button>` : ''}`,
+      { alignRight: true, cls: 'cx-pop-wide' });
+    pop.querySelectorAll('.cx-seg-btn').forEach(b => b.addEventListener('click', () => {
+      if (b.dataset.g === 'type') i.typeFilter = b.dataset.v || null;
+      else i.statusFilter = b.dataset.v || null;
+      pop.querySelectorAll(`.cx-seg-btn[data-g="${b.dataset.g}"]`).forEach(x => x.classList.toggle('on', x === b));
+      cxUpdateListHeader(); loadChats();
+    }));
+    pop.querySelector('#cx-f-archived').addEventListener('change', ev => {
+      i.showArchived = ev.target.checked;
+      cxUpdateListHeader(); loadChats();
+    });
+    pop.querySelector('[data-reset]')?.addEventListener('click', () => {
+      i.typeFilter = i.statusFilter = null; i.showArchived = false;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
     });
   });
 
   document.getElementById('sync-btn').addEventListener('click', async () => {
-    const phone = State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
+    const phone = State.phones.find(p => p.id == State.inbox.phoneFilter && p.waha_status === 'WORKING')
+      || State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
     if (!phone) return toast('No WhatsApp connected', 'error');
     const btn = document.getElementById('sync-btn');
-    if (btn) btn.disabled = true;
+    if (btn) { btn.disabled = true; btn.classList.add('spinning'); }
     try {
       await Api.inbox.sync(phone.id);
       _chatAutoSynced = false;
       toast('Synced from WhatsApp', 'success');
       await loadChats();
     } catch(e) { toast(e.message || 'Sync failed — is WhatsApp connected?', 'error'); }
-    finally { if (btn) btn.disabled = false; }
+    finally { if (btn) { btn.disabled = false; btn.classList.remove('spinning'); } }
   });
 
-  // Label filter: show only chats carrying a chosen label
-  const lfChip = document.getElementById('label-filter-chip');
-  if (lfChip) lfChip.addEventListener('click', e => {
-    e.stopPropagation();
-    openLabelPicker(lfChip, {
-      applied: new Set(State.inbox.labelFilter ? [State.inbox.labelFilter] : []),
-      onToggle: async (label, nowApplied) => {
-        State.inbox.labelFilter = nowApplied ? label.id : null;
-        lfChip.textContent = nowApplied ? `🏷 ${label.name} ×` : '🏷 Label ▾';
-        lfChip.classList.toggle('active', nowApplied);
-        closeLabelPicker();
-        loadChats();
-      },
-    });
+  // Chat rows (delegated): "+ Label" / label chips open the picker, else open chat
+  document.getElementById('chat-list').addEventListener('click', e => {
+    const chip = e.target.closest('[data-addlabel]');
+    if (chip) {
+      e.stopPropagation();
+      const chat = State.inbox.chats?.find(x => x.id == chip.dataset.addlabel);
+      if (chat) cxOpenChatLabelPicker(chip, chat);
+      return;
+    }
+    const row = e.target.closest('.chat-item[data-cid]');
+    if (row) openChat(+row.dataset.cid);
   });
 
-  document.getElementById('close-detail-btn').addEventListener('click', () => {
-    document.getElementById('detail-panel').style.display = 'none';
-    document.getElementById('inbox-layout').classList.remove('detail-open');
+  cxUpdateListHeader();
+  await _inboxReady;
+}
+
+function cxOpenChatLabelPicker(anchor, chat) {
+  openLabelPicker(anchor, {
+    applied: new Set(chat.labels || []),
+    onToggle: async (label, nowApplied) => {
+      if (nowApplied) await Api.inbox.addLabel(chat.id, label.id);
+      else await Api.inbox.removeLabel(chat.id, label.id);
+      chat.labels = nowApplied
+        ? [...new Set([...(chat.labels || []), label.id])]
+        : (chat.labels || []).filter(id => id !== label.id);
+      renderChatList(State.inbox.chats, _chatHasMore);
+      if (State.inbox.selectedChatId == chat.id) cxRefreshDetailHead(chat);
+    },
   });
 }
 
@@ -1177,13 +1482,19 @@ function debounceLoadChats() {
 }
 
 let _chatLoadOffset = 0;
+let _chatListSeq = 0;        // bumps on every loadChats(); stale responses compare against it
+let _chatHasMore = false;
+let _chatLoadingMore = false;
 const CHAT_PAGE = 200;
 
 async function loadChats() {
+  const seq = ++_chatListSeq;
   _chatLoadOffset = 0;
+  _chatLoadingMore = false;
 
   // Refresh phone state from server so status is always current
   try { State.phones = await Api.phones.list(); } catch(_) {}
+  if (seq !== _chatListSeq) return;
 
   const phoneConnected = State.phones.some(p => p.waha_status === 'WORKING');
   const phone = State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
@@ -1195,7 +1506,7 @@ async function loadChats() {
     State.inbox.selectedChatId = null;
     const chatList = document.getElementById('chat-list');
     if (chatList) chatList.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:1rem;padding:2rem;text-align:center">
-      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1.4"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--text-3)" stroke-width="1.4"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
       <div>
         <p style="font-weight:600;color:var(--text-2);margin:0 0 .35rem">WhatsApp disconnected</p>
         <span style="font-size:12px;color:var(--text-3)">Connect your WhatsApp to see conversations</span>
@@ -1214,22 +1525,15 @@ async function loadChats() {
         <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
       </div>`;
     }
+    cxCloseDetail(false);
     _updateUnreadBadge([]);
     return;
   }
 
   // Restore thread panel empty state if it was showing the disconnected message
   const threadPanel = document.getElementById('thread-panel');
-  if (threadPanel && !State.inbox.selectedChatId) {
-    if (threadPanel.querySelector('.whatsapp-disconnected-thread') || threadPanel.innerHTML.includes('WhatsApp Disconnected')) {
-      threadPanel.innerHTML = `<div class="empty-state" style="flex:1">
-        <div class="empty-state-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        </div>
-        <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
-        <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
-      </div>`;
-    }
+  if (threadPanel && !State.inbox.selectedChatId && threadPanel.querySelector('.whatsapp-disconnected-thread')) {
+    threadPanel.innerHTML = cxEmptyThread();
   }
 
   const q = _buildChatQuery();
@@ -1238,10 +1542,11 @@ async function loadChats() {
 
   try {
     let chats = await Api.inbox.chats(q);
+    if (seq !== _chatListSeq) return;
     if (!Array.isArray(chats)) chats = [];
 
     // Auto-sync from WAHA when inbox is empty and phone is connected
-    if (chats.length === 0 && !_chatAutoSynced) {
+    if (chats.length === 0 && !_chatAutoSynced && !Object.keys(q).some(k => !['limit', 'offset'].includes(k))) {
       _chatAutoSynced = true;
       const chatList = document.getElementById('chat-list');
       if (chatList) chatList.innerHTML = `<div class="loading-center" style="flex-direction:column;gap:.5rem">
@@ -1253,13 +1558,17 @@ async function loadChats() {
         chats = await Api.inbox.chats(q);
         if (!Array.isArray(chats)) chats = [];
       } catch(_) {}
+      if (seq !== _chatListSeq) return;
     }
 
+    const rawCount = chats.length;
     chats = _filterChats(chats);
     State.inbox.chats = chats;
-    renderChatList(chats, chats.length === CHAT_PAGE);
+    _chatHasMore = rawCount === CHAT_PAGE;
+    renderChatList(chats, _chatHasMore);
     _updateUnreadBadge(chats);
   } catch(err) {
+    if (seq !== _chatListSeq) return;
     const chatList = document.getElementById('chat-list');
     if (chatList) chatList.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:.5rem">
       <span>Failed to load chats</span>
@@ -1271,14 +1580,19 @@ async function loadChats() {
 function refreshChatList() { loadChats(); }
 
 function _buildChatQuery() {
-  const f = State.inbox.filter;
+  const i = State.inbox;
+  const f = i.filter;
   const q = {};
   if (f === 'flagged') q.is_flagged = true;
-  if (f === 'archived') q.is_archived = true;
-  if (f === 'inbox') q.is_archived = false;
+  if (f === 'archived' || i.showArchived) q.is_archived = true;
+  else if (f === 'inbox') q.is_archived = false;
   if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
-  if (State.inbox.labelFilter) q.label_id = State.inbox.labelFilter;
-  if (State.inbox.search) q.search = State.inbox.search;
+  if (i.labelFilter) q.label_id = i.labelFilter;
+  if (i.search) q.search = i.search;
+  if (i.phoneFilter) q.phone_id = i.phoneFilter;
+  if (i.typeFilter === 'group') q.is_group = true;
+  else if (i.typeFilter === 'direct') q.is_group = false;
+  if (i.statusFilter) q.status = i.statusFilter;
   return q;
 }
 
@@ -1297,489 +1611,897 @@ function _updateUnreadBadge(chats) {
 }
 
 async function loadMoreChats() {
+  if (_chatLoadingMore || !_chatHasMore) return;
+  _chatLoadingMore = true;
+  const seq = _chatListSeq;
   const btn = document.getElementById('load-more-chats-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
-  _chatLoadOffset += CHAT_PAGE;
+  const offset = _chatLoadOffset + CHAT_PAGE;
   const q = _buildChatQuery();
   q.limit = CHAT_PAGE;
-  q.offset = _chatLoadOffset;
+  q.offset = offset;
   try {
     let more = await Api.inbox.chats(q);
+    if (seq !== _chatListSeq) return;
     if (!Array.isArray(more)) more = [];
-    more = _filterChats(more);
+    _chatLoadOffset = offset;
+    _chatHasMore = more.length === CHAT_PAGE;
+    // Live updates may have bubbled chats up — never list one twice
+    const seen = new Set(State.inbox.chats.map(c => c.id));
+    more = _filterChats(more).filter(c => !seen.has(c.id));
     State.inbox.chats = State.inbox.chats.concat(more);
-    // Re-render full list with "load more" button if we got a full page
-    renderChatList(State.inbox.chats, more.length === CHAT_PAGE);
+    renderChatList(State.inbox.chats, _chatHasMore);
     _updateUnreadBadge(State.inbox.chats);
   } catch(e) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Load more'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Load more conversations'; }
+  } finally {
+    if (seq === _chatListSeq) _chatLoadingMore = false;
   }
 }
 
+const CX_MEDIA_LABEL_RE = /^(📷 Photo|🎬 Video|🎤 Voice message|📄 Document|🖼 Sticker|🎞 GIF|📍 Location|👤 Contact|📎 Media)$/u;
+function cxTypeIcon(type, body) {
+  const t = String(type || '').toLowerCase();
+  if (['image', 'photo', 'sticker', 'gif'].includes(t)) return 'image';
+  if (t === 'video') return 'video';
+  if (['audio', 'ptt', 'voice'].includes(t)) return 'mic';
+  if (['document', 'pdf', 'file'].includes(t)) return 'doc';
+  if (t === 'location') return 'location';
+  if (t === 'contact' || t === 'vcard') return 'user';
+  if (t === 'poll_creation') return 'chart';
+  if (/^(📢|📣)/u.test(body || '')) return 'megaphone';
+  return '';
+}
+
+function cxChatRow(c) {
+  const name = displayName(c);
+  const unread = c.unread_count || 0;
+  const active = c.id == State.inbox.selectedChatId ? ' active' : '';
+  const labels = (c.labels || []).map(id => State.labels.find(l => l.id == id)).filter(Boolean);
+  const labelHtml = labels.length
+    ? `<span class="cx-lchips" data-addlabel="${c.id}" title="Edit labels">${labels.slice(0, 2).map(l =>
+        `<span class="cx-lchip" style="--lc:${safeColor(l.color)}">${esc(l.name)}</span>`).join('')}${labels.length > 2 ? `<span class="cx-lchip more">+${labels.length - 2}</span>` : ''}</span>`
+    : `<span class="cx-add-label" data-addlabel="${c.id}">+ Label</span>`;
+
+  let preview = c.last_message || '';
+  const icon = cxTypeIcon(c.last_message_type, preview);
+  if (icon) preview = preview.replace(/^(📷|🎬|🎤|📄|🖼|🎞|📍|👤|📎|📊|📢|📣)\s*/u, '');
+  let sender = '';
+  if (c.is_group && preview) {
+    if (c.last_message_from_me) sender = 'You';
+    else if (c.last_message_sender) sender = displayName(c.last_message_sender);
+  }
+  const phone = cxPhoneOf(c);
+  return `<div class="chat-item cx-row${active}" data-cid="${c.id}">
+    ${cxAvatar(c, 40)}
+    <div class="cx-row-main">
+      <div class="cx-r1">
+        <span class="cx-name">${esc(name)}</span>
+        ${labelHtml}
+      </div>
+      <div class="cx-r2">
+        <span class="cx-preview">${sender ? `<b>${esc(sender)}:</b> ` : ''}${icon ? cxIcon(icon, 13) : ''}<span>${esc(preview.substring(0, 120))}</span></span>
+        <span class="cx-r2-right">
+          ${unread ? `<span class="cx-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+          ${c.is_flagged ? `<span class="cx-flag" title="Flagged">${cxIcon('flag', 13)}</span>` : ''}
+          ${cxAssigneeAvatar(c.assigned_to, 20)}
+        </span>
+      </div>
+      <div class="cx-r3">
+        <span class="cx-phone">${phone ? `${cxIcon('phone', 11)}${esc(cxPhoneLabel(phone))}` : ''}</span>
+        ${c.ai_active ? '<span class="ai-badge">AI</span>' : ''}
+        <span class="cx-date">${esc(cxFmtListDate(c.last_message_at))}</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+let _cxListObserver = null;
 function renderChatList(chats, hasMore) {
   const el = document.getElementById('chat-list');
   if (!el) return;
+  if (_cxListObserver) { _cxListObserver.disconnect(); _cxListObserver = null; }
   if (!chats.length) {
     el.innerHTML = `<div class="loading-center text-muted">No conversations</div>`; return;
   }
-  el.innerHTML = chats.map(c => {
-    const active = c.id == State.inbox.selectedChatId ? ' active' : '';
-    const color = avatarColor(displayName(c));
-    const isGroup = c.is_group;
-    const unread = c.unread_count || 0;
+  el.innerHTML = chats.map(cxChatRow).join('') + (hasMore
+    ? `<div class="cx-more" id="cx-chat-more"><button id="load-more-chats-btn" class="btn btn-secondary btn-sm">Load more conversations</button></div>`
+    : '');
 
-    // Phone tag: find phone name from State.phones using c.phone_id
-    let phoneTagHtml = '';
-    if (isGroup) {
-      phoneTagHtml = `<span class="chat-phone-tag">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
-        Group
-      </span>`;
-    } else if (c.phone_id && State.phones.length) {
-      const phone = State.phones.find(p => p.id === c.phone_id);
-      if (phone) {
-        phoneTagHtml = `<span class="chat-phone-tag">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
-          ${esc(phone.name || phone.phone_number)}
-        </span>`;
-      }
-    }
-
-    // Label chips
-    let labelsHtml = '';
-    if (c.labels && c.labels.length) {
-      labelsHtml = `<div class="chat-item-labels">${c.labels.slice(0,4).map(lbl => {
-        const labelObj = State.labels.find(l => l.id == lbl);
-        const color2 = safeColor(labelObj?.color);
-        const name = labelObj ? labelObj.name : (lbl || '');
-        return `<span class="chat-label-mini" style="background:${color2}22;color:${color2};border:1px solid ${color2}44">${esc(name)}</span>`;
-      }).join('')}</div>`;
-    }
-
-    return `<div class="chat-item${active}" data-cid="${c.id}">
-      <div class="chat-avatar${isGroup?' group':''}" style="background:${color}">${initials(displayName(c))}</div>
-      <div class="chat-meta">
-        <div class="chat-meta-top">
-          <span class="chat-name">${esc(displayName(c))}</span>
-          <span class="chat-time">${timeAgo(c.last_message_at)}</span>
-        </div>
-        <div class="chat-meta-bottom">
-          <span class="chat-preview">${esc((c.last_message||'').substring(0,55))}</span>
-          <div class="chat-badges-right">
-            ${c.is_flagged ? `<svg viewBox="0 0 24 24" fill="#f59e0b" style="width:11px;height:11px;flex-shrink:0"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15" stroke="#f59e0b" stroke-width="2"/></svg>` : ''}
-            ${c.ai_active ? `<span class="ai-badge">AI</span>` : ''}
-            ${unread ? `<span class="unread-dot">${unread > 99 ? '99+' : unread}</span>` : ''}
-          </div>
-        </div>
-        ${phoneTagHtml ? `<div style="display:flex;align-items:center;gap:.25rem;margin-top:2px">${phoneTagHtml}${!labelsHtml ? `<span class="add-label-chip" data-addlabel="${c.id}">+ Label</span>` : ''}</div>` : (!labelsHtml ? `<div style="margin-top:2px"><span class="add-label-chip" data-addlabel="${c.id}">+ Label</span></div>` : '')}
-        ${labelsHtml}
-      </div>
-    </div>`;
-  }).join('');
-
-  // "+ Label" chips: inline label picker with create-on-the-fly
-  el.querySelectorAll('.add-label-chip').forEach(chip => {
-    chip.addEventListener('click', e => {
-      e.stopPropagation();
-      const chat = State.inbox.chats?.find(x => x.id == chip.dataset.addlabel);
-      if (!chat) return;
-      openLabelPicker(chip, {
-        applied: new Set(chat.labels || []),
-        onToggle: async (label, nowApplied) => {
-          if (nowApplied) await Api.inbox.addLabel(chat.id, label.id);
-          else await Api.inbox.removeLabel(chat.id, label.id);
-          chat.labels = nowApplied
-            ? [...(chat.labels || []), label.id]
-            : (chat.labels || []).filter(id => id !== label.id);
-        },
-      });
-    });
-  });
-
-  el.querySelectorAll('.chat-item').forEach(el => {
-    el.addEventListener('click', () => openChat(+el.dataset.cid));
-  });
-
-  // "Load more chats" button when there's a full page (more may exist)
+  // Infinite scroll: fetch the next page when the footer scrolls into view
   if (hasMore) {
-    const morBtn = document.createElement('div');
-    morBtn.style.cssText = 'text-align:center;padding:.75rem 1rem';
-    morBtn.innerHTML = `<button id="load-more-chats-btn" class="btn btn-secondary btn-sm" style="width:100%;font-size:12px">Load more conversations</button>`;
-    el.appendChild(morBtn);
     document.getElementById('load-more-chats-btn').addEventListener('click', loadMoreChats);
+    if ('IntersectionObserver' in window) {
+      _cxListObserver = new IntersectionObserver(entries => {
+        if (entries[0].isIntersecting) loadMoreChats();
+      }, { root: el, rootMargin: '300px' });
+      _cxListObserver.observe(document.getElementById('cx-chat-more'));
+    }
   }
+  cxQueuePictures(chats);
+}
+
+// Update one row in place (live updates) without re-rendering the list
+function cxRerenderRow(chat) {
+  const row = document.querySelector(`#chat-list .chat-item[data-cid="${chat.id}"]`);
+  if (row) row.outerHTML = cxChatRow(chat);
 }
 
 async function openChat(chatId) {
+  chatId = +chatId;
+  let chat = State.inbox.chats.find(c => c.id === chatId);
+  if (!chat) {
+    // Opened from elsewhere (media page, search) and not in the current list page
+    try { chat = await Api.inbox.getChat(chatId); } catch (_) { toast('Chat not found', 'error'); return; }
+    if (State.currentView !== 'inbox' || !chat?.id) return;
+    State.inbox.chats = [chat, ...State.inbox.chats.filter(c => c.id !== chat.id)];
+    renderChatList(State.inbox.chats, _chatHasMore);
+  }
   State.inbox.selectedChatId = chatId;
   document.querySelectorAll('.chat-item').forEach(el => {
     el.classList.toggle('active', +el.dataset.cid === chatId);
   });
-  const chat = State.inbox.chats.find(c => c.id === chatId);
-  if (!chat) return;
+  document.getElementById('inbox-layout')?.classList.add('cx-thread-open');
   // Immediately mark as read in state so unread badge clears without a re-fetch
   if (chat.unread_count) {
     chat.unread_count = 0;
     _updateUnreadBadge(State.inbox.chats);
-    document.querySelectorAll(`.chat-item[data-cid="${chatId}"] .unread-dot`).forEach(d => d.remove());
+    document.querySelectorAll(`.chat-item[data-cid="${chatId}"] .cx-unread`).forEach(d => d.remove());
   }
-  const wasDetailOpen = document.getElementById('detail-panel')?.style.display !== 'none';
   renderThread(chat);
-  if (wasDetailOpen) renderContactDetail(chat);
+  const detail = document.getElementById('detail-panel');
+  if (detail && (detail.style.display !== 'none' || cxDetailPref())) renderContactDetail(chat);
   Api.inbox.markRead(chatId).catch(()=>{});
+  Api.inbox.picture(chatId).then(r => { if (r && r.url) cxSetPicture(chatId, r.url); }).catch(() => {});
   await loadMessages(chatId);
 }
 
-// ── Contact Detail Panel ────────────────────────────────────────── //
-async function renderContactDetail(chat) {
+// Open a chat from another view and, if loaded, scroll to one message
+async function cxOpenChatAt(chatId, messageId) {
+  if (State.currentView !== 'inbox') {
+    navigateTo('inbox');
+    await Promise.resolve(_inboxReady);
+  }
+  if (State.currentView !== 'inbox') return;
+  if (!State.phones.some(p => p.waha_status === 'WORKING')) return toast('WhatsApp disconnected — connect it to open chats', 'error');
+  await openChat(chatId);
+  if (!messageId || State.inbox.selectedChatId != chatId) return;
+  const el = document.querySelector(`#messages-area .msg[data-mid="${+messageId}"]`);
+  if (el) {
+    el.scrollIntoView({ block: 'center' });
+    el.classList.add('cx-flash');
+    setTimeout(() => el.classList.remove('cx-flash'), 2200);
+  }
+}
+
+// ── Assignment ─────────────────────────────────────────────────── //
+function cxOpenAssignPop(anchor, chat, opts = {}) {
+  const agents = Object.values(_cxAgentMap);
+  const pop = cxPopover(anchor, `
+    <div class="cx-pop-title">Assign to</div>
+    <button class="cx-pop-item${chat.assigned_to == null ? ' sel' : ''}" data-aid="">${cxAssigneeAvatar(null, 20)}<span>Unassigned</span>${chat.assigned_to == null ? cxIcon('check', 14) : ''}</button>
+    ${agents.map(a => `
+      <button class="cx-pop-item${chat.assigned_to == a.id ? ' sel' : ''}" data-aid="${a.id}">
+        ${cxAssigneeAvatar(a.id, 20)}<span>${esc(a.name)}${State.agent && a.id === State.agent.id ? ' <small>(you)</small>' : ''}</span>${chat.assigned_to == a.id ? cxIcon('check', 14) : ''}
+      </button>`).join('')}`, { alignRight: !!opts.alignRight, cls: 'cx-pop-scroll' });
+  pop.querySelectorAll('[data-aid]').forEach(b => b.addEventListener('click', async () => {
+    cxClosePop();
+    await cxAssign(chat, b.dataset.aid ? +b.dataset.aid : null);
+  }));
+}
+async function cxAssign(chat, agentId) {
+  try {
+    await Api.inbox.updateChat(chat.id, { assigned_to: agentId });
+    chat.assigned_to = agentId;
+    toast(agentId ? `Assigned to ${_cxAgentMap[agentId]?.name || 'agent'}` : 'Unassigned', 'success');
+    cxRerenderRow(chat);
+    if (State.inbox.selectedChatId == chat.id) {
+      const hb = document.getElementById('cx-assign-btn');
+      if (hb) hb.innerHTML = cxAssigneeAvatar(chat.assigned_to, 26);
+      const sel = document.getElementById('detail-assign-select');
+      if (sel) sel.value = agentId == null ? '' : String(agentId);
+    }
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+// ── Contact Detail Panel (tabbed) ──────────────────────────────── //
+const CX_TABS = [
+  { id: 'details',    icon: 'info',    label: 'Details' },
+  { id: 'properties', icon: 'sliders', label: 'Properties' },
+  { id: 'ai',         icon: 'bot',     label: 'AI' },
+  { id: 'tickets',    icon: 'ticket',  label: 'Tickets & Tasks' },
+  { id: 'members',    icon: 'users',   label: 'Members', group: true },
+  { id: 'media',      icon: 'image',   label: 'Media' },
+  { id: 'analytics',  icon: 'chart',   label: 'Group Analytics', group: true },
+  { id: 'history',    icon: 'history', label: 'History' },
+  { id: 'notes',      icon: 'note',    label: 'Notes' },
+];
+let _cxDetailTab = 'details';
+let _cxDetailSeq = 0;
+const _cxParticipants = new Map();   // chat id → participants promise
+
+function cxParticipants(chat) {
+  if (!_cxParticipants.has(chat.id)) {
+    const p = Api.groups.participants(chat.id).catch(e => { _cxParticipants.delete(chat.id); throw e; });
+    _cxParticipants.set(chat.id, p);
+  }
+  return _cxParticipants.get(chat.id);
+}
+
+function cxCloseDetail(savePref = true) {
   const panel = document.getElementById('detail-panel');
-  const body = document.getElementById('detail-panel-body');
+  if (panel) panel.style.display = 'none';
+  document.getElementById('inbox-layout')?.classList.remove('detail-open');
+  document.getElementById('btn-details-toggle')?.classList.remove('on');
+  if (savePref) cxSetDetailPref(false);
+}
+
+function cxDetailLabelsHtml(chat) {
+  const labels = (chat.labels || []).map(id => State.labels.find(l => l.id == id)).filter(Boolean);
+  return labels.length
+    ? labels.map(l => `<span class="cx-lchip" style="--lc:${safeColor(l.color)}">${esc(l.name)}</span>`).join('') + `<button class="cx-add-label" data-dp-label="1" title="Edit labels">+</button>`
+    : `<button class="cx-add-label" data-dp-label="1">+ Label</button>`;
+}
+function cxRefreshDetailHead(chat) {
+  const el = document.getElementById('cx-dp-labels');
+  if (el) {
+    el.innerHTML = cxDetailLabelsHtml(chat);
+    el.querySelector('[data-dp-label]')?.addEventListener('click', e => { e.stopPropagation(); cxOpenChatLabelPicker(e.currentTarget, chat); });
+  }
+}
+
+async function renderContactDetail(chat, tab) {
+  const panel = document.getElementById('detail-panel');
   const layout = document.getElementById('inbox-layout');
-  if (!panel || !body || !layout) return;
+  if (!panel || !layout) return;
+  if (tab) _cxDetailTab = tab;
+  const tabs = CX_TABS.filter(t => !t.group || chat.is_group);
+  if (!tabs.some(t => t.id === _cxDetailTab)) _cxDetailTab = 'details';
 
   panel.style.display = 'flex';
   layout.classList.add('detail-open');
+  document.getElementById('btn-details-toggle')?.classList.add('on');
+  cxSetDetailPref(true);
 
-  const color = avatarColor(chat.name || chat.chat_wid);
-  // chat.labels holds label IDs (server: label_ids)
-  const chatLabels = (chat.labels || []).map(Number).filter(Number.isFinite);
-
-  // Build label chips
-  const labelsMarkup = chatLabels.map(lbl => {
-    const labelObj = State.labels.find(l => l.id === lbl);
-    const lColor = safeColor(labelObj?.color);
-    const lName = labelObj ? labelObj.name : String(lbl);
-    return `<span class="detail-label-chip" style="background:${lColor}22;color:${lColor};border:1px solid ${lColor}44" data-label="${esc(lbl)}">
-      ${esc(lName)}<span class="chip-remove" data-remove-label="${esc(lbl)}">×</span>
-    </span>`;
-  }).join('');
-
-  // Build agent options
-  let agentOpts = `<option value="">— Unassigned —</option>`;
-  try {
-    const agents = await Api.auth.agents();
-    agentOpts += agents.map(a =>
-      `<option value="${a.id}" ${chat.assigned_to == a.id ? 'selected' : ''}>${esc(a.name)}</option>`
-    ).join('');
-  } catch(_) {}
-
-  // Available labels for "add" list
-  const availableLabels = State.labels.filter(l => !chatLabels.includes(l.id));
-  const addLabelOpts = availableLabels.map(l =>
-    `<option value="${l.id}">${esc(l.name)}</option>`
-  ).join('');
-
-  body.innerHTML = `
-    <div class="detail-contact-top">
-      <div class="detail-avatar" style="background:${color}">${initials(displayName(chat))}</div>
-      <div class="detail-contact-name">${esc(displayName(chat))}</div>
-      <div class="detail-contact-wid">${esc(chatSubtitle(chat))}</div>
+  panel.innerHTML = `
+    <div class="cx-dp-head">
+      ${cxAvatar(chat, 40)}
+      <div class="cx-dp-title">
+        <div class="cx-dp-name">${esc(displayName(chat))}</div>
+        <div class="cx-dp-labels" id="cx-dp-labels"></div>
+      </div>
+      <div class="cx-dp-actions">
+        <button class="cx-ibtn" id="cx-dp-assign" title="Assign">${cxIcon('userPlus')}</button>
+        <button class="cx-ibtn" id="cx-dp-edit" title="Edit properties">${cxIcon('edit')}</button>
+        <button class="cx-ibtn" id="cx-dp-sync" title="Sync messages from WhatsApp">${cxIcon('sync')}</button>
+        <button class="cx-ibtn" id="close-detail-btn" title="Collapse panel">${cxIcon('panel')}</button>
+      </div>
     </div>
+    <div class="cx-dp-tabs" role="tablist">
+      ${tabs.map(t => `<button class="cx-dp-tab${t.id === _cxDetailTab ? ' on' : ''}" data-tab="${t.id}" role="tab" aria-selected="${t.id === _cxDetailTab}" title="${esc(t.label)}">${cxIcon(t.icon, 16)}${t.id === _cxDetailTab ? `<span>${esc(t.label)}</span>` : ''}</button>`).join('')}
+    </div>
+    <div class="detail-panel-body cx-dp-body" id="detail-panel-body"></div>`;
 
+  cxRefreshDetailHead(chat);
+  panel.querySelectorAll('.cx-dp-tab').forEach(b => b.addEventListener('click', () => renderContactDetail(chat, b.dataset.tab)));
+  document.getElementById('close-detail-btn').addEventListener('click', () => cxCloseDetail());
+  document.getElementById('cx-dp-assign').addEventListener('click', e => { e.stopPropagation(); cxOpenAssignPop(e.currentTarget, chat, { alignRight: true }); });
+  document.getElementById('cx-dp-edit').addEventListener('click', () => renderContactDetail(chat, 'properties'));
+  document.getElementById('cx-dp-sync').addEventListener('click', () => cxSyncThread(chat));
+
+  const body = document.getElementById('detail-panel-body');
+  const seq = ++_cxDetailSeq;
+  const stale = () => seq !== _cxDetailSeq || State.inbox.selectedChatId != chat.id || !body.isConnected;
+  const renderers = {
+    details: cxTabDetails, properties: cxTabProperties, ai: cxTabAI, tickets: cxTabTickets,
+    members: cxTabMembers, media: cxTabMedia, analytics: cxTabAnalytics, history: cxTabHistory, notes: cxTabNotes,
+  };
+  try { await renderers[_cxDetailTab](chat, body, stale); }
+  catch (e) { if (!stale()) body.innerHTML = `<div class="cx-dp-empty">Could not load — ${esc(e.message || 'error')}</div>`; }
+}
+
+function cxDpLoading() { return '<div class="cx-dp-empty"><div class="spinner" style="width:16px;height:16px"></div></div>'; }
+
+async function cxTabDetails(chat, body) {
+  const phone = cxPhoneOf(chat);
+  const agentOpts = `<option value="">— Unassigned —</option>` + Object.values(_cxAgentMap).map(a =>
+    `<option value="${a.id}" ${chat.assigned_to == a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
+  const resolved = (chat.status || 'open') === 'resolved';
+  body.innerHTML = `
     <div class="detail-section">
       <div class="detail-section-label">Assigned To</div>
-      <select class="detail-assign-select" id="detail-assign-select">
-        ${agentOpts}
-      </select>
+      <select class="detail-assign-select" id="detail-assign-select">${agentOpts}</select>
     </div>
-
     <div class="detail-section">
-      <div class="detail-section-label">Labels</div>
-      <div class="detail-labels-row" id="detail-labels-row">
-        ${labelsMarkup || '<span style="font-size:12px;color:var(--text-3);font-style:italic">No labels yet</span>'}
-      </div>
-      ${availableLabels.length ? `
-      <div style="display:flex;gap:.4rem;align-items:center;margin-top:.4rem">
-        <select id="detail-add-label-select" style="font-size:11.5px;padding:2px 5px;border:1px solid var(--border);border-radius:4px;flex:1;height:26px;background:var(--surface)">
-          <option value="">+ Add label…</option>
-          ${addLabelOpts}
-        </select>
-      </div>` : `<div style="font-size:11.5px;color:var(--text-3);margin-top:.35rem">
-        <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent);text-decoration:none">Create labels</a> in Settings
-      </div>`}
+      <div class="detail-section-label">${chat.is_group ? 'Group' : 'Contact'}</div>
+      <div class="cx-kv"><span>${chat.is_group ? 'Type' : 'Number'}</span><span>${esc(chat.is_group ? 'Group chat' : (chatSubtitle(chat) || '—'))}</span></div>
+      <div class="cx-kv"><span>Via</span><span>${phone ? `${CX_WA_LOGO} ${esc(cxPhoneLabel(phone))}` : '—'}</span></div>
+      ${phone?.name && phone.name !== phone.phone_number ? `<div class="cx-kv"><span>Phone name</span><span>${esc(phone.name)}</span></div>` : ''}
     </div>
-
-    <div class="detail-section">
-      <div class="detail-section-label">Properties</div>
-      <div id="detail-properties"><span style="font-size:12px;color:var(--text-3)">Loading…</span></div>
-    </div>
-
-    <div class="detail-section">
-      <div class="detail-section-label">Phone</div>
-      <div style="font-size:12.5px;color:var(--text-2)">
-        ${chat.is_group ? 'Group chat' : (chatSubtitle(chat) || '—')}
-      </div>
-      ${(() => {
-        if (chat.phone_id && State.phones.length) {
-          const phone = State.phones.find(p => p.id === chat.phone_id);
-          if (phone) return `<div style="font-size:11.5px;color:var(--text-3);margin-top:2px">via ${esc(phone.name||phone.phone_number)}</div>`;
-        }
-        return '';
-      })()}
-    </div>
-
     <div class="detail-section">
       <div class="detail-section-label">Status</div>
       <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
-        <span class="${pillClass(chat.status||'open')}" style="font-size:11px">${esc(chat.status||'open')}</span>
+        <span class="${pillClass(chat.status || 'open')}" style="font-size:11px">${esc(chat.status || 'open')}</span>
         ${chat.ai_active ? '<span class="ai-badge" style="font-size:10px">AI Active</span>' : ''}
-        ${chat.is_flagged ? '<span style="font-size:10px;font-weight:600;background:#fffbeb;color:#d97706;border:1px solid #fde68a;border-radius:10px;padding:1px 7px">Flagged</span>' : ''}
+        ${chat.is_flagged ? `<span class="cx-flag-pill">${cxIcon('flag', 11)} Flagged</span>` : ''}
       </div>
-      <button class="detail-close-chat-btn" id="detail-close-chat-btn" style="margin-top:.6rem">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-        Mark as Resolved
-      </button>
+      <div class="cx-dp-btnrow">
+        <button class="detail-close-chat-btn" id="detail-close-chat-btn">${cxIcon(resolved ? 'sync' : 'check', 13)} ${resolved ? 'Reopen' : 'Mark as Resolved'}</button>
+        <button class="detail-close-chat-btn" id="detail-flag-btn">${cxIcon('flag', 13)} ${chat.is_flagged ? 'Unflag' : 'Flag'}</button>
+      </div>
     </div>
-
     <div class="detail-section">
       <div class="detail-section-label">Conversation</div>
-      <div style="font-size:12px;color:var(--text-2);display:flex;flex-direction:column;gap:.3rem">
-        <div style="display:flex;justify-content:space-between">
-          <span style="color:var(--text-3)">Created</span>
-          <span>${chat.created_at ? parseServerDate(chat.created_at).toLocaleDateString('en', {month:'short',day:'numeric',year:'numeric'}) : '—'}</span>
-        </div>
-        <div style="display:flex;justify-content:space-between">
-          <span style="color:var(--text-3)">Last message</span>
-          <span>${chat.last_message_at ? timeAgo(chat.last_message_at) + ' ago' : '—'}</span>
-        </div>
-        <div style="display:flex;justify-content:space-between">
-          <span style="color:var(--text-3)">Unread</span>
-          <span>${chat.unread_count || 0} messages</span>
-        </div>
-      </div>
+      <div class="cx-kv"><span>Created</span><span>${chat.created_at ? parseServerDate(chat.created_at).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }) : '—'}</span></div>
+      <div class="cx-kv"><span>Last message</span><span>${chat.last_message_at ? esc(timeAgo(chat.last_message_at)) + (timeAgo(chat.last_message_at) === 'now' ? '' : ' ago') : '—'}</span></div>
+      <div class="cx-kv"><span>Unread</span><span>${chat.unread_count || 0} messages</span></div>
     </div>`;
 
-  // Assign agent handler
-  document.getElementById('detail-assign-select').addEventListener('change', async e => {
-    const val = e.target.value ? parseInt(e.target.value) : null;
-    try {
-      await Api.inbox.updateChat(chat.id, { assigned_to: val });
-      chat.assigned_to = val;
-      toast(val ? 'Chat assigned' : 'Unassigned', 'success');
-      renderChatList(State.inbox.chats);
-    } catch(err) { toast(err.message, 'error'); }
+  document.getElementById('detail-assign-select').addEventListener('change', e => {
+    cxAssign(chat, e.target.value ? parseInt(e.target.value) : null);
   });
-
-  // Custom properties: render definitions with current values, save on change
-  (async () => {
-    const wrap = document.getElementById('detail-properties');
-    if (!wrap) return;
-    try {
-      const [defs, valRes] = await Promise.all([
-        Api.properties.definitions('chat'),
-        Api.properties.chatValues(chat.id),
-      ]);
-      const values = valRes.custom_properties || {};
-      if (!defs.length) {
-        wrap.innerHTML = `<div style="font-size:11.5px;color:var(--text-3)">
-          No custom properties defined.
-          <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent)">Create in Settings</a></div>`;
-        return;
-      }
-      const sections = {};
-      defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
-      wrap.innerHTML = Object.entries(sections).map(([sec, list]) => `
-        ${Object.keys(sections).length > 1 ? `<div class="prop-section-title">${esc(sec)}</div>` : ''}
-        ${list.map(d => {
-          const v = values[String(d.id)];
-          if (d.prop_type === 'single_select') {
-            return `<div class="prop-row"><label>${esc(d.name)}</label>
-              <select data-prop="${d.id}"><option value="">—</option>
-                ${(d.options || []).map(o => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}
-              </select></div>`;
-          }
-          if (d.prop_type === 'multi_select') {
-            const cur = Array.isArray(v) ? v : [];
-            return `<div class="prop-row"><label>${esc(d.name)}</label>
-              <div class="prop-multi" data-prop-multi="${d.id}">
-                ${(d.options || []).map(o => `<label><input type="checkbox" value="${esc(o)}" ${cur.includes(o) ? 'checked' : ''}>${esc(o)}</label>`).join('')}
-              </div></div>`;
-          }
-          const type = d.prop_type === 'date' ? 'date' : d.prop_type === 'number' ? 'number' : 'text';
-          return `<div class="prop-row"><label>${esc(d.name)}</label>
-            <input type="${type}" data-prop="${d.id}" value="${v != null ? esc(String(v)) : ''}"></div>`;
-        }).join('')}`).join('');
-
-      const save = async (id, value) => {
-        try { await Api.properties.setChat(chat.id, { [id]: value }); toast('Property saved', 'success'); }
-        catch(e) { toast(e.message, 'error'); }
-      };
-      wrap.querySelectorAll('[data-prop]').forEach(inp =>
-        inp.addEventListener('change', () => save(inp.dataset.prop, inp.value)));
-      wrap.querySelectorAll('[data-prop-multi]').forEach(group =>
-        group.querySelectorAll('input').forEach(cb => cb.addEventListener('change', () => {
-          const vals = [...group.querySelectorAll('input:checked')].map(c => c.value);
-          save(group.dataset.propMulti, vals);
-        })));
-    } catch(_) {
-      wrap.innerHTML = '<span style="font-size:11.5px;color:var(--text-3)">Could not load properties</span>';
-    }
-  })();
-
-  // Add label handler
-  const addLabelSel = document.getElementById('detail-add-label-select');
-  if (addLabelSel) {
-    addLabelSel.addEventListener('change', async e => {
-      const labelId = e.target.value;
-      if (!labelId) return;
-      const labelObj = State.labels.find(l => l.id == labelId);
-      if (!labelObj) return;
-      try {
-        await Api.inbox.addLabel(chat.id, labelObj.id);
-        chat.labels = [...chatLabels, labelObj.id];
-        toast('Label added', 'success');
-        renderContactDetail(chat);
-        renderChatList(State.inbox.chats);
-      } catch(err) { toast(err.message, 'error'); }
-    });
-  }
-
-  // Remove label handlers
-  body.querySelectorAll('[data-remove-label]').forEach(btn => {
-    btn.addEventListener('click', async e => {
-      e.stopPropagation();
-      const lid = parseInt(btn.dataset.removeLabel);
-      try {
-        await Api.inbox.removeLabel(chat.id, lid);
-        chat.labels = chatLabels.filter(l => l !== lid);
-        toast('Label removed', 'success');
-        renderContactDetail(chat);
-        renderChatList(State.inbox.chats);
-      } catch(err) { toast(err.message, 'error'); }
-    });
-  });
-
-  // Close/resolve chat
   document.getElementById('detail-close-chat-btn').addEventListener('click', async () => {
+    const next = resolved ? 'open' : 'resolved';
     try {
-      await Api.inbox.updateChat(chat.id, { status: 'resolved' });
-      chat.status = 'resolved';
-      toast('Chat marked as resolved', 'success');
+      await Api.inbox.updateChat(chat.id, { status: next });
+      chat.status = next;
+      toast(next === 'resolved' ? 'Chat marked as resolved' : 'Chat reopened', 'success');
       renderContactDetail(chat);
-      renderChatList(State.inbox.chats);
-    } catch(err) { toast(err.message, 'error'); }
+      cxRerenderRow(chat);
+    } catch (err) { toast(err.message, 'error'); }
   });
+  document.getElementById('detail-flag-btn').addEventListener('click', () => cxToggleFlag(chat));
+}
+
+async function cxToggleFlag(chat) {
+  try {
+    await Api.inbox.updateChat(chat.id, { is_flagged: !chat.is_flagged });
+    chat.is_flagged = !chat.is_flagged;
+    cxRerenderRow(chat);
+    if (State.inbox.selectedChatId == chat.id) {
+      renderThreadHeaderState(chat);
+      if (document.getElementById('detail-panel')?.style.display !== 'none' && _cxDetailTab === 'details') renderContactDetail(chat);
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function cxTabProperties(chat, body, stale) {
+  body.innerHTML = `<div class="detail-section"><div class="detail-section-label">Properties</div><div id="detail-properties">${cxDpLoading()}</div></div>`;
+  const wrap = document.getElementById('detail-properties');
+  let defs, valRes;
+  try {
+    [defs, valRes] = await Promise.all([Api.properties.definitions('chat'), Api.properties.chatValues(chat.id)]);
+  } catch (_) {
+    if (!stale()) wrap.innerHTML = '<span style="font-size:11.5px;color:var(--text-3)">Could not load properties</span>';
+    return;
+  }
+  if (stale()) return;
+  const values = valRes.custom_properties || {};
+  if (!defs.length) {
+    wrap.innerHTML = `<div style="font-size:11.5px;color:var(--text-3)">
+      No custom properties defined.
+      <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent)">Create in Settings</a></div>`;
+    return;
+  }
+  const sections = {};
+  defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
+  wrap.innerHTML = Object.entries(sections).map(([sec, list]) => `
+    ${Object.keys(sections).length > 1 ? `<div class="prop-section-title">${esc(sec)}</div>` : ''}
+    ${list.map(d => {
+      const v = values[String(d.id)];
+      if (d.prop_type === 'single_select') {
+        return `<div class="prop-row"><label>${esc(d.name)}</label>
+          <select data-prop="${d.id}"><option value="">—</option>
+            ${(d.options || []).map(o => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}
+          </select></div>`;
+      }
+      if (d.prop_type === 'multi_select') {
+        const cur = Array.isArray(v) ? v : [];
+        return `<div class="prop-row"><label>${esc(d.name)}</label>
+          <div class="prop-multi" data-prop-multi="${d.id}">
+            ${(d.options || []).map(o => `<label><input type="checkbox" value="${esc(o)}" ${cur.includes(o) ? 'checked' : ''}>${esc(o)}</label>`).join('')}
+          </div></div>`;
+      }
+      const type = d.prop_type === 'date' ? 'date' : d.prop_type === 'number' ? 'number' : 'text';
+      return `<div class="prop-row"><label>${esc(d.name)}</label>
+        <input type="${type}" data-prop="${d.id}" value="${v != null ? esc(String(v)) : ''}"></div>`;
+    }).join('')}`).join('');
+
+  const save = async (id, value) => {
+    try { await Api.properties.setChat(chat.id, { [id]: value }); toast('Property saved', 'success'); }
+    catch(e) { toast(e.message, 'error'); }
+  };
+  wrap.querySelectorAll('[data-prop]').forEach(inp =>
+    inp.addEventListener('change', () => save(inp.dataset.prop, inp.value)));
+  wrap.querySelectorAll('[data-prop-multi]').forEach(group =>
+    group.querySelectorAll('input').forEach(cb => cb.addEventListener('change', () => {
+      const vals = [...group.querySelectorAll('input:checked')].map(c => c.value);
+      save(group.dataset.propMulti, vals);
+    })));
+}
+
+async function cxTabAI(chat, body, stale) {
+  const state = chat.ai_state || (chat.ai_active ? 'ACTIVE' : 'INACTIVE');
+  body.innerHTML = `
+    <div class="detail-section">
+      <div class="detail-section-label">AI agent for this chat</div>
+      <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.7rem">
+        <span class="${pillClass(state)}" style="font-size:11px">${esc(state)}</span>
+        <span style="font-size:12px;color:var(--text-3)">${chat.ai_active ? 'Replies automatically; pauses when a human replies.' : 'Not replying automatically.'}</span>
+      </div>
+      <button class="btn ${chat.ai_active ? 'btn-secondary' : 'btn-primary'} btn-sm" id="cx-ai-toggle">${cxIcon('bot', 14)} ${chat.ai_active ? 'Deactivate AI' : 'Activate AI'}</button>
+    </div>
+    <div class="detail-section">
+      <div class="detail-section-label">Assist</div>
+      <div class="cx-dp-btnrow">
+        <button class="btn btn-secondary btn-sm" id="cx-ai-summary">${cxIcon('note', 14)} Summarize</button>
+        <button class="btn btn-secondary btn-sm" id="cx-ai-suggest">${cxIcon('sparkle', 14)} Suggest reply</button>
+      </div>
+      <div id="cx-ai-out" class="cx-ai-out" hidden></div>
+    </div>`;
+  document.getElementById('cx-ai-toggle').addEventListener('click', () => cxToggleAI(chat));
+  document.getElementById('cx-ai-summary').addEventListener('click', async e => {
+    const out = document.getElementById('cx-ai-out');
+    e.currentTarget.disabled = true;
+    out.hidden = false; out.innerHTML = cxDpLoading();
+    try {
+      const res = await Api.ai.summarize(chat.id);
+      if (stale()) return;
+      out.innerHTML = esc(res.summary || '').replace(/\n/g, '<br>').replace(/(^|<br>)-\s*/g, '$1• ');
+    } catch (err) { if (!stale()) out.textContent = err.message; }
+    if (!stale()) e.currentTarget.disabled = false;
+  });
+  document.getElementById('cx-ai-suggest').addEventListener('click', () => cxSuggestReply(chat));
+}
+
+async function cxToggleAI(chat) {
+  try {
+    if (chat.ai_active) { await Api.ai.deactivate(chat.id); chat.ai_active = false; chat.ai_state = 'INACTIVE'; toast('AI deactivated', 'success'); }
+    else { await Api.ai.activate(chat.id); chat.ai_active = true; chat.ai_state = 'ACTIVE'; toast('AI activated', 'success'); }
+    cxRerenderRow(chat);
+    if (State.inbox.selectedChatId == chat.id) {
+      renderThreadHeaderState(chat);
+      if (_cxDetailTab === 'ai' && document.getElementById('detail-panel')?.style.display !== 'none') renderContactDetail(chat);
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function cxSuggestReply(chat) {
+  try {
+    const res = await Api.ai.suggestReply(chat.id);
+    const ta = document.getElementById('reply-text');
+    if (ta && State.inbox.selectedChatId == chat.id) {
+      ta.value = res.suggestion || res.reply || '';
+      ta.dispatchEvent(new Event('input'));
+      ta.focus();
+    }
+    toast('Reply suggestion ready', 'success');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function cxTabTickets(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const [tickets, tasks] = await Promise.all([
+    Api.tickets.list({ chat_id: chat.id, limit: 50 }).catch(() => []),
+    Api.tasks.list({ chat_id: chat.id, view: 'all' }).catch(() => []),
+  ]);
+  if (stale()) return;
+  body.innerHTML = `
+    <div class="detail-section">
+      <div class="cx-sec-head"><span class="detail-section-label">Tickets (${tickets.length})</span>
+        <button class="cx-link-btn" id="cx-new-ticket">+ New ticket</button></div>
+      ${tickets.length ? tickets.map(t => `
+        <div class="cx-item">
+          <div class="cx-item-title">#${t.id} ${esc(t.title)}</div>
+          <div class="cx-item-meta"><span class="${pillClass(t.status)}">${esc(t.status)}</span><span class="${pillClass(t.priority)}">${esc(t.priority)}</span>${t.created_at ? `<span>${esc(cxFmtListDate(t.created_at))}</span>` : ''}</div>
+        </div>`).join('') : '<div class="cx-dp-muted">No tickets for this chat</div>'}
+    </div>
+    <div class="detail-section">
+      <div class="cx-sec-head"><span class="detail-section-label">Tasks (${tasks.length})</span>
+        <button class="cx-link-btn" id="cx-new-task">+ New task</button></div>
+      ${tasks.length ? tasks.map(t => `
+        <div class="cx-item">
+          <div class="cx-item-title">${t.status === 'done' ? '<s>' : ''}${esc(t.title)}${t.status === 'done' ? '</s>' : ''}</div>
+          <div class="cx-item-meta"><span class="${pillClass(t.priority)}">${esc(t.priority || '')}</span>${t.due_date ? `<span>${cxIcon('calendar', 11)} ${esc(cxFmtListDate(t.due_date))}</span>` : ''}${t.assignee_name ? `<span>${esc(t.assignee_name)}</span>` : ''}</div>
+        </div>`).join('') : '<div class="cx-dp-muted">No tasks for this chat</div>'}
+    </div>`;
+  const again = () => { if (State.inbox.selectedChatId == chat.id) renderContactDetail(chat, 'tickets'); };
+  document.getElementById('cx-new-ticket').addEventListener('click', () => showTicketModal({ chatId: chat.id }));
+  document.getElementById('cx-new-task').addEventListener('click', () => showTaskModal({ chatId: chat.id, onSaved: again }));
+}
+
+async function cxTabMembers(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  let res;
+  try { res = await cxParticipants(chat); }
+  catch (e) { if (!stale()) body.innerHTML = `<div class="cx-dp-empty">${esc(e.message || 'Could not load members')}</div>`; return; }
+  if (stale()) return;
+  const list = res.participants || [];
+  if (!res.api_available && !list.length) {
+    body.innerHTML = '<div class="cx-dp-empty">Members are only available while this WhatsApp number is connected.</div>';
+    return;
+  }
+  const admins = list.filter(p => p.is_admin).length;
+  body.innerHTML = `
+    <div class="detail-section">
+      <div class="cx-sec-head"><span class="detail-section-label">${list.length} members · ${admins} admin${admins === 1 ? '' : 's'}</span></div>
+      <input type="search" class="cx-dp-search" id="cx-mem-search" placeholder="Search number…">
+      <div id="cx-mem-list">${list.map(p => `
+        <div class="cx-member" data-num="${esc(p.number)}">
+          <span class="cx-assignee" style="width:26px;height:26px;font-size:10px;background:${avatarColor(p.number)}">${cxIcon('user', 13)}</span>
+          <span class="cx-member-num">${esc(/^\d{6,}$/.test(p.number) ? cxFmtPhone(p.number) : p.number)}</span>
+          ${p.is_admin ? '<span class="cx-admin">Admin</span>' : ''}
+        </div>`).join('')}</div>
+    </div>`;
+  document.getElementById('cx-mem-search').addEventListener('input', e => {
+    const q = e.target.value.replace(/\D/g, '');
+    body.querySelectorAll('.cx-member').forEach(r => { r.hidden = !!q && !r.dataset.num.includes(q); });
+  });
+}
+
+async function cxTabMedia(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const res = await Api.media.list({ chat_id: chat.id, limit: 60 });
+  if (stale()) return;
+  const items = res.items || [];
+  if (!items.length) { body.innerHTML = '<div class="cx-dp-empty">No media in this chat yet</div>'; return; }
+  body.innerHTML = `<div class="cx-dp-media">${items.map(m => cxMediaTile(m, { compact: true })).join('')}</div>`;
+  cxObserveMedia(body);
+  body.querySelectorAll('.cx-tile').forEach(t => t.addEventListener('click', e => {
+    if (e.target.closest('audio,video,[data-dl-id]')) return;
+    const el = document.querySelector(`#messages-area .msg[data-mid="${t.dataset.mid}"]`);
+    if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.classList.add('cx-flash'); setTimeout(() => el.classList.remove('cx-flash'), 2200); }
+    else toast('Scroll up in the chat to load this older message', 'default');
+  }));
+}
+
+function cxRangeDates(range, from, to) {
+  const now = new Date();
+  const midnight = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  if (range === 'today') return { from: midnight(now).toISOString(), to: now.toISOString() };
+  if (range === '7d') return { from: new Date(midnight(now).getTime() - 6 * 864e5).toISOString(), to: now.toISOString() };
+  if (range === '30d') return { from: new Date(midnight(now).getTime() - 29 * 864e5).toISOString(), to: now.toISOString() };
+  if (range === 'custom' && from && to) {
+    const [fy, fm, fd] = from.split('-').map(Number), [ty, tm, td] = to.split('-').map(Number);
+    return { from: new Date(fy, fm - 1, fd).toISOString(), to: new Date(ty, tm - 1, td + 1).toISOString() };
+  }
+  return null;
+}
+let _cxAnalyticsRange = { range: '7d', from: '', to: '' };
+async function cxTabAnalytics(chat, body, stale) {
+  const r = _cxAnalyticsRange;
+  body.innerHTML = `
+    <div class="detail-section">
+      <div class="cx-sec-head">
+        <span class="cx-ga-title">Group Analytics</span>
+        <button class="cx-ibtn" id="cx-ga-refresh" title="Refresh">${cxIcon('sync', 14)}</button>
+      </div>
+      <select id="cx-ga-range" class="detail-assign-select">
+        <option value="today" ${r.range === 'today' ? 'selected' : ''}>Today</option>
+        <option value="7d" ${r.range === '7d' ? 'selected' : ''}>Last 7 days</option>
+        <option value="30d" ${r.range === '30d' ? 'selected' : ''}>Last 30 days</option>
+        <option value="custom" ${r.range === 'custom' ? 'selected' : ''}>Custom range…</option>
+      </select>
+      <div class="cx-ga-custom" id="cx-ga-custom" ${r.range === 'custom' ? '' : 'hidden'}>
+        <input type="date" id="cx-ga-from" value="${esc(r.from)}"> <span>–</span> <input type="date" id="cx-ga-to" value="${esc(r.to)}">
+      </div>
+      <div class="cx-ga-grid" id="cx-ga-grid">${cxDpLoading()}</div>
+    </div>`;
+  const load = async () => {
+    const grid = document.getElementById('cx-ga-grid');
+    if (!grid) return;
+    const dates = cxRangeDates(r.range, r.from, r.to);
+    if (!dates) { grid.innerHTML = '<div class="cx-dp-muted">Pick both dates</div>'; return; }
+    grid.innerHTML = cxDpLoading();
+    let res;
+    try { res = await Api.groups.analyticsRange(chat.id, dates); }
+    catch (e) { if (!stale()) grid.innerHTML = `<div class="cx-dp-muted">${esc(e.message)}</div>`; return; }
+    if (stale() || !grid.isConnected) return;
+    const card = (label, icon, cls, v, tip) => `
+      <div class="cx-ga-card ${cls}" ${v == null ? `title="${esc(tip || 'Not tracked yet')}"` : (tip ? `title="${esc(tip)}"` : '')}>
+        <span class="cx-ga-icon">${cxIcon(icon, 18)}</span>
+        <span class="cx-ga-val">${v == null ? '—' : Number(v).toLocaleString()}</span>
+        <span class="cx-ga-label">${label}</span>
+      </div>`;
+    const since = res.tracked_since || {};
+    grid.innerHTML =
+      card('Messages', 'msg', 'c-blue', res.messages ?? res.total_messages) +
+      card('Reactions', 'heart', 'c-pink', res.reactions, since.reactions ? `Tracked since ${cxFmtListDate(since.reactions)}` : 'Not tracked yet') +
+      card('Members Joined', 'logIn', 'c-green', res.members_joined, since.members ? `Tracked since ${cxFmtListDate(since.members)}` : 'Not tracked yet') +
+      card('Members Exited', 'logOut', 'c-red', res.members_exited,
+        res.members_exited == null ? 'Not tracked yet' : `${res.members_left ?? 0} left · ${res.members_removed ?? 0} removed`);
+  };
+  document.getElementById('cx-ga-refresh').addEventListener('click', load);
+  document.getElementById('cx-ga-range').addEventListener('change', e => {
+    r.range = e.target.value;
+    document.getElementById('cx-ga-custom').hidden = r.range !== 'custom';
+    if (r.range === 'custom' && !r.from) {
+      const t = new Date(), f = new Date(Date.now() - 6 * 864e5);
+      const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      r.from = iso(f); r.to = iso(t);
+      document.getElementById('cx-ga-from').value = r.from;
+      document.getElementById('cx-ga-to').value = r.to;
+    }
+    load();
+  });
+  ['cx-ga-from', 'cx-ga-to'].forEach(id => document.getElementById(id).addEventListener('change', e => {
+    r[id === 'cx-ga-from' ? 'from' : 'to'] = e.target.value; load();
+  }));
+  await load();
+}
+
+async function cxTabHistory(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const rows = await Api.inbox.activity(chat.id);
+  if (stale()) return;
+  if (!rows.length) { body.innerHTML = '<div class="cx-dp-empty">No activity recorded for this chat yet</div>'; return; }
+  body.innerHTML = `<div class="detail-section cx-timeline">${rows.map(r => `
+    <div class="cx-tl-row">
+      <span class="cx-tl-dot"></span>
+      <div>
+        <div class="cx-tl-text">${esc(r.description || formatLogEvent(r.action))}</div>
+        <div class="cx-tl-meta">${r.agent_name ? esc(r.agent_name) + ' · ' : ''}${r.created_at ? esc(parseServerDate(r.created_at).toLocaleString('en', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })) : ''}</div>
+      </div>
+    </div>`).join('')}</div>`;
+}
+
+async function cxTabNotes(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const notes = await Api.notes.list(chat.id);
+  if (stale()) return;
+  body.innerHTML = `
+    <div class="detail-section">
+      <textarea id="cx-note-new" class="cx-note-input" placeholder="Add a private note — only your team sees it. @name mentions a teammate."></textarea>
+      <div style="display:flex;justify-content:flex-end;margin-top:.4rem"><button class="btn btn-primary btn-sm" id="cx-note-save">Add note</button></div>
+    </div>
+    <div class="detail-section">
+      ${notes.length ? notes.slice().reverse().map(n => `
+        <div class="cx-note" data-nid="${n.id}">
+          <div class="cx-note-head"><b>${esc(n.agent_name || 'Team')}</b><span>${n.created_at ? esc(cxFmtListDate(n.created_at)) : ''}</span>
+            <button class="cx-ibtn sm" data-del-note="${n.id}" title="Delete note">${cxIcon('trash', 13)}</button></div>
+          <div class="cx-note-body">${esc(n.content || '').replace(/\n/g, '<br>')}</div>
+        </div>`).join('') : '<div class="cx-dp-muted">No notes yet</div>'}
+    </div>`;
+  document.getElementById('cx-note-save').addEventListener('click', async () => {
+    const content = document.getElementById('cx-note-new').value.trim();
+    if (!content) return;
+    try {
+      await Api.notes.create({ chat_id: chat.id, content });
+      toast('Note saved', 'success');
+      renderContactDetail(chat, 'notes');
+      if (State.inbox.selectedChatId == chat.id) loadMessages(chat.id, true);
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  body.querySelectorAll('[data-del-note]').forEach(b => b.addEventListener('click', async () => {
+    if (!confirm('Delete this note?')) return;
+    try {
+      await Api.notes.del(+b.dataset.delNote);
+      renderContactDetail(chat, 'notes');
+      if (State.inbox.selectedChatId == chat.id) loadMessages(chat.id, true);
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+// ── Thread ─────────────────────────────────────────────────────── //
+const CX_EMOJI = ('😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😜 🤪 🤗 🤔 🤐 😐 😏 😒 🙄 😬 😌 😔 😴 😷 🤒 🥳 😎 🤓 😕 😟 😮 😲 😳 🥺 😢 😭 😱 😤 😡 👍 👎 👌 ✌️ 🤞 🤝 🙏 👏 🙌 💪 👋 ☝️ 👉 👀 ' +
+  '❤️ 🧡 💛 💚 💙 💜 🖤 💔 💯 ✨ 🔥 ⭐ 🎉 🎊 🎁 🎂 ✅ ❌ ⚠️ ❓ ❗ 📌 📎 📞 📱 💬 📅 ⏰ 🚀 💡 💰 🛒 📦 🚚 🏠 ☕ 🌹').split(' ');
+const CX_LANGS = ['English', 'Hindi', 'Gujarati', 'Marathi', 'Tamil', 'Telugu', 'Bengali', 'Urdu', 'Arabic', 'Spanish', 'French', 'German', 'Portuguese'];
+
+function cxInsertAtCursor(ta, text) {
+  const s = ta.selectionStart ?? ta.value.length, e = ta.selectionEnd ?? ta.value.length;
+  ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+  ta.selectionStart = ta.selectionEnd = s + text.length;
+  ta.dispatchEvent(new Event('input'));
+  ta.focus();
+}
+
+function cxThreadSubtitle(chat) {
+  if (!chat.is_group) return chatSubtitle(chat) || '';
+  return 'Group';
+}
+async function cxFillGroupSubtitle(chat) {
+  if (!chat.is_group) return;
+  try {
+    const res = await cxParticipants(chat);
+    const el = document.getElementById('cx-thread-sub');
+    if (!el || State.inbox.selectedChatId != chat.id) return;
+    const nums = (res.participants || []).map(p => /^\d{6,}$/.test(p.number) ? cxFmtPhone(p.number) : '').filter(Boolean);
+    if (nums.length) { el.textContent = nums.join(', '); el.title = `${nums.length} members`; }
+  } catch (_) {}
+}
+
+// Refresh the bits of the thread header that depend on chat state
+function renderThreadHeaderState(chat) {
+  const ai = document.getElementById('btn-ai-toggle');
+  if (ai) {
+    ai.classList.toggle('on', !!chat.ai_active);
+    ai.title = chat.ai_active ? 'AI is replying — click to deactivate' : 'Activate AI replies';
+    ai.innerHTML = `${cxIcon('bot', 14)}<span>${chat.ai_active ? 'AI On' : 'AI Off'}</span>`;
+  }
+  const flag = document.getElementById('btn-flag');
+  if (flag) flag.innerHTML = `${cxIcon('flag', 13)} ${chat.is_flagged ? 'Unflag' : 'Flag'}`;
+  const res = document.getElementById('btn-close-chat');
+  if (res) res.innerHTML = `${cxIcon('check', 13)} ${(chat.status || 'open') === 'resolved' ? 'Reopen chat' : 'Resolve chat'}`;
+  document.getElementById('cx-thead-flag')?.toggleAttribute('hidden', !chat.is_flagged);
+}
+
+async function cxSyncThread(chat) {
+  const btn = document.getElementById('cx-thread-sync');
+  btn?.classList.add('spinning');
+  try {
+    const r = await Api.inbox.syncMessages(chat.id, 200);
+    if (State.inbox.selectedChatId == chat.id) await loadMessages(chat.id, true);
+    toast(`Synced ${r?.synced ?? 0} messages`, 'success');
+  } catch (e) { toast(e.message || 'Sync failed', 'error'); }
+  finally { btn?.classList.remove('spinning'); }
 }
 
 function renderThread(chat) {
   const panel = document.getElementById('thread-panel');
   if (!panel) return;
-  const isAI = chat.ai_active;
   const isDetailOpen = document.getElementById('detail-panel')?.style.display !== 'none';
+  const phone = cxPhoneOf(chat);
+  const sendPhones = phone ? [phone] : State.phones;
   panel.innerHTML = `
-    <div class="thread-header">
-      <div class="thread-contact-info">
-        <div class="chat-avatar" style="background:${avatarColor(displayName(chat))};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(displayName(chat))}</div>
-        <div class="thread-contact-text">
-          <div class="thread-name">${esc(displayName(chat))}</div>
-          <div class="thread-meta">${esc(chatSubtitle(chat))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
-        </div>
+    <div class="thread-header cx-thead">
+      <button class="cx-ibtn cx-back" id="cx-back" title="Back to chats">${cxIcon('chevLeft', 18)}</button>
+      ${cxAvatar(chat, 38)}
+      <div class="thread-contact-text">
+        <div class="thread-name">${esc(displayName(chat))}<span class="cx-thead-flag" id="cx-thead-flag" title="Flagged" ${chat.is_flagged ? '' : 'hidden'}>${cxIcon('flag', 13)}</span></div>
+        <div class="thread-meta" id="cx-thread-sub">${esc(cxThreadSubtitle(chat))}</div>
       </div>
-      <div class="thread-actions">
-        <button id="btn-ai-toggle" class="${isAI ? 'active-ai' : ''}" title="${isAI ? 'Deactivate AI' : 'Activate AI'}">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-          ${isAI ? 'AI On' : 'AI Off'}
-        </button>
-        <button id="btn-suggest" title="AI suggest reply">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          Suggest
-        </button>
-        <button id="btn-close-chat" class="btn-close-chat" title="Resolve chat">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-          Resolve
-        </button>
+      <div class="cx-thead-actions">
+        <button class="cx-assign-btn" id="cx-assign-btn" title="Assign chat">${cxAssigneeAvatar(chat.assigned_to, 26)}</button>
+        <button class="cx-pill-btn" id="btn-ai-toggle"></button>
+        <button class="cx-ibtn" id="cx-thread-sync" title="Sync messages from WhatsApp">${cxIcon('sync')}</button>
+        <button class="cx-ibtn" id="cx-tsearch-btn" title="Search in this chat">${cxIcon('search')}</button>
         <div class="thread-more-wrap">
-          <button id="btn-more" title="More actions" class="btn-icon-only">
-            <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" style="width:14px;height:14px"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
-          </button>
+          <button class="cx-ibtn" id="btn-more" title="More actions">${cxIcon('more')}</button>
           <div class="thread-more-menu" id="thread-more-menu">
-            <button id="btn-summarize">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="21" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="11" y2="18"/></svg>
-              Summary
-            </button>
-            <button id="btn-ticket">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
-              Create Ticket
-            </button>
-            <button id="btn-note">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-              Add Note
-            </button>
-            <button id="btn-flag">
-              <svg viewBox="0 0 24 24" fill="${chat.is_flagged ? 'var(--warning)':'none'}" stroke="var(--warning)" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
-              ${chat.is_flagged ? 'Unflag' : 'Flag'}
-            </button>
+            <button id="btn-summarize">${cxIcon('note', 13)} Summary</button>
+            <button id="btn-ticket">${cxIcon('ticket', 13)} Create Ticket</button>
+            <button id="btn-task">${cxIcon('task', 13)} Create Task</button>
+            <button id="btn-note">${cxIcon('edit', 13)} Add Note</button>
+            <button id="btn-flag"></button>
+            <button id="btn-close-chat"></button>
           </div>
         </div>
-        <button id="btn-details-toggle" class="btn-icon-only${isDetailOpen ? ' btn-details-active' : ''}" title="Toggle contact details">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-        </button>
+        <button class="cx-ibtn${isDetailOpen ? ' on' : ''}" id="btn-details-toggle" title="Toggle details panel">${cxIcon('panel')}</button>
       </div>
     </div>
-    <div class="messages-area" id="messages-area">
+    <div class="cx-tsearch" id="cx-tsearch" hidden>
+      ${cxIcon('search', 14)}
+      <input type="search" id="cx-tsearch-input" placeholder="Search loaded messages…" autocomplete="off">
+      <span class="cx-tsearch-count" id="cx-tsearch-count"></span>
+      <button class="cx-ibtn sm" id="cx-tsearch-prev" title="Previous">${cxIcon('chevUp', 14)}</button>
+      <button class="cx-ibtn sm" id="cx-tsearch-next" title="Next">${cxIcon('chevDown', 14)}</button>
+      <button class="cx-ibtn sm" id="cx-tsearch-close" title="Close">${cxIcon('x', 14)}</button>
+    </div>
+    <div class="messages-area cx-messages" id="messages-area">
       <div class="loading-center"><div class="spinner"></div></div>
     </div>
-    <div class="reply-area" id="reply-area">
+    <div class="reply-area cx-composer" id="reply-area">
       <div class="composer-tabs">
         <span class="composer-tab active" id="tab-whatsapp">WhatsApp</span>
         <span class="composer-tab" id="tab-note">Private Note</span>
       </div>
-      <div class="reply-toolbar" id="reply-toolbar">
-        <button class="btn btn-ghost btn-sm" id="btn-qr">/ Quick Reply</button>
-        <button class="btn btn-ghost btn-sm" id="btn-polish" title="AI polish: fix grammar and tone">✨ Polish</button>
-        <button class="btn btn-ghost btn-sm" id="btn-attach" title="Send image or file by URL">📎 Media</button>
-        <button class="btn btn-ghost btn-sm" id="btn-schedule" title="Schedule this message">🕐 Schedule</button>
-        <select id="phone-select" class="btn btn-secondary btn-sm" style="border:1px solid var(--border);padding:3px 6px">
-          ${State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('')}
-        </select>
-      </div>
-      <div class="reply-bar">
-        <textarea id="reply-text" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
-        <button class="btn btn-primary" id="send-btn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:15px;height:15px"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-        </button>
+      <div class="cx-cbox">
+        <div class="reply-bar cx-rbar">
+          <textarea id="reply-text" rows="1" placeholder="Message…"></textarea>
+          <button class="cx-send" id="send-btn" title="Send (Enter)">${cxIcon('send', 17)}</button>
+        </div>
+        <div class="cx-tools" id="reply-toolbar">
+          <button class="cx-ibtn wa-only" id="btn-attach" title="Send image or file by URL">${cxIcon('clip')}</button>
+          <button class="cx-ibtn" id="cx-emoji-btn" title="Emoji">${cxIcon('smile')}</button>
+          <button class="cx-ibtn" id="cx-translate-btn" title="Translate draft">${cxIcon('translate')}</button>
+          <button class="cx-ibtn wa-only" id="btn-suggest" title="AI: suggest a reply">${cxIcon('sparkle')}</button>
+          <button class="cx-ibtn" id="btn-polish" title="AI: polish grammar and tone">${cxIcon('wand')}</button>
+          <button class="cx-ibtn wa-only" id="btn-qr" title="Quick replies (or type /)">${cxIcon('zap')}</button>
+          <button class="cx-ibtn wa-only" id="btn-schedule" title="Schedule this message">${cxIcon('clock')}</button>
+          <span class="cx-grow"></span>
+          <span class="cx-from-chip wa-only" title="Replies go out from the number this chat belongs to">${CX_WA_LOGO}<span>${esc(cxPhoneLabel(phone) || 'No number')}</span></span>
+          <select id="phone-select" hidden>${sendPhones.map(p => `<option value="${p.id}">${esc(p.name || p.phone_number)}</option>`).join('')}</select>
+        </div>
       </div>
     </div>`;
 
-  // AI toggle
-  document.getElementById('btn-ai-toggle').addEventListener('click', async () => {
-    try {
-      if (chat.ai_active) {
-        await Api.ai.deactivate(chat.id);
-        chat.ai_active = false;
-        toast('AI deactivated', 'success');
-      } else {
-        await Api.ai.activate(chat.id);
-        chat.ai_active = true;
-        toast('AI activated', 'success');
-      }
-      renderThread(chat);
-      loadMessages(chat.id);
-    } catch(e) { toast(e.message, 'error'); }
+  renderThreadHeaderState(chat);
+  cxFillGroupSubtitle(chat);
+
+  document.getElementById('cx-back').addEventListener('click', () => {
+    document.getElementById('inbox-layout')?.classList.remove('cx-thread-open');
   });
+  document.getElementById('cx-assign-btn').addEventListener('click', e => { e.stopPropagation(); cxOpenAssignPop(e.currentTarget, chat, { alignRight: true }); });
+  document.getElementById('btn-ai-toggle').addEventListener('click', () => cxToggleAI(chat));
+  document.getElementById('cx-thread-sync').addEventListener('click', () => cxSyncThread(chat));
+
+  // Search in chat: highlights matches among loaded messages
+  const sBar = document.getElementById('cx-tsearch');
+  const sInput = document.getElementById('cx-tsearch-input');
+  let hits = [], hitIdx = -1;
+  const runSearch = () => {
+    const area = document.getElementById('messages-area');
+    const q = sInput.value.trim().toLowerCase();
+    hits = [];
+    area?.querySelectorAll('.msg').forEach(el => {
+      const match = !!q && el.textContent.toLowerCase().includes(q);
+      el.classList.toggle('cx-hit', match);
+      el.classList.toggle('cx-dim', !!q && !match);
+      if (match) hits.push(el);
+    });
+    hitIdx = hits.length ? hits.length - 1 : -1;
+    focusHit();
+  };
+  const focusHit = () => {
+    hits.forEach((h, i) => h.classList.toggle('cx-hit-cur', i === hitIdx));
+    document.getElementById('cx-tsearch-count').textContent = sInput.value.trim() ? (hits.length ? `${hitIdx + 1} of ${hits.length}` : 'No matches') : '';
+    if (hitIdx >= 0) hits[hitIdx].scrollIntoView({ block: 'center' });
+  };
+  const closeSearch = () => { sBar.hidden = true; sInput.value = ''; runSearch(); };
+  document.getElementById('cx-tsearch-btn').addEventListener('click', () => {
+    if (sBar.hidden) { sBar.hidden = false; sInput.focus(); } else closeSearch();
+  });
+  sInput.addEventListener('input', runSearch);
+  sInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); if (hits.length) { hitIdx = (hitIdx - 1 + hits.length) % hits.length; focusHit(); } }
+    if (e.key === 'Escape') closeSearch();
+  });
+  document.getElementById('cx-tsearch-prev').addEventListener('click', () => { if (hits.length) { hitIdx = (hitIdx - 1 + hits.length) % hits.length; focusHit(); } });
+  document.getElementById('cx-tsearch-next').addEventListener('click', () => { if (hits.length) { hitIdx = (hitIdx + 1) % hits.length; focusHit(); } });
+  document.getElementById('cx-tsearch-close').addEventListener('click', closeSearch);
+  panel._cxRunSearch = () => { if (!sBar.hidden && sInput.value.trim()) runSearch(); };
+
+  const ta = document.getElementById('reply-text');
+  const autosize = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; };
+  ta.addEventListener('input', autosize);
 
   // Suggest reply
-  document.getElementById('btn-suggest').addEventListener('click', async () => {
-    try {
-      const res = await Api.ai.suggestReply(chat.id);
-      document.getElementById('reply-text').value = res.suggestion || res.reply || JSON.stringify(res);
-      toast('Reply suggestion ready', 'success');
-    } catch(e) { toast(e.message, 'error'); }
-  });
+  document.getElementById('btn-suggest').addEventListener('click', () => cxSuggestReply(chat));
 
   // Polish draft reply
   document.getElementById('btn-polish').addEventListener('click', async () => {
-    const ta = document.getElementById('reply-text');
     const draft = ta.value.trim();
     if (!draft) return toast('Type a draft first', 'error');
     const btn = document.getElementById('btn-polish');
-    btn.disabled = true; btn.textContent = '✨ Polishing…';
+    btn.disabled = true; btn.classList.add('spinning');
     try {
       const res = await Api.ai.polish(draft);
-      ta.value = res.polished || draft;
+      ta.value = res.polished || draft; autosize();
       toast('Reply polished', 'success');
     } catch(e) { toast(e.message, 'error'); }
-    btn.disabled = false; btn.textContent = '✨ Polish';
+    btn.disabled = false; btn.classList.remove('spinning');
+  });
+
+  // Translate draft into a chosen language (existing AI translate endpoint)
+  document.getElementById('cx-translate-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const draft = ta.value.trim();
+    if (!draft) return toast('Type a draft to translate', 'error');
+    const btn = e.currentTarget;
+    const pop = cxPopover(btn, `<div class="cx-pop-title">Translate draft to</div>
+      ${CX_LANGS.map(l => `<button class="cx-pop-item" data-lang="${l}"><span>${l}</span></button>`).join('')}`,
+      { above: true, cls: 'cx-pop-scroll' });
+    pop.querySelectorAll('[data-lang]').forEach(b => b.addEventListener('click', async () => {
+      cxClosePop();
+      btn.disabled = true; btn.classList.add('spinning');
+      try {
+        const res = await Api.ai.translate(ta.value.trim(), b.dataset.lang);
+        if (res.translated) { ta.value = res.translated; autosize(); }
+        toast(`Translated to ${b.dataset.lang}`, 'success');
+      } catch (err) { toast(err.message, 'error'); }
+      btn.disabled = false; btn.classList.remove('spinning');
+    }));
+  });
+
+  // Emoji picker (built-in grid)
+  document.getElementById('cx-emoji-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const pop = cxPopover(e.currentTarget, `<div class="cx-emoji-grid">${CX_EMOJI.map(em => `<button type="button" data-em="${em}">${em}</button>`).join('')}</div>`,
+      { above: true, cls: 'cx-pop-emoji' });
+    pop.querySelectorAll('[data-em]').forEach(b => b.addEventListener('click', ev => {
+      ev.stopPropagation();
+      cxInsertAtCursor(ta, b.dataset.em);
+    }));
   });
 
   // Send media by URL
@@ -1812,7 +2534,7 @@ function renderThread(chat) {
 
   // Schedule current draft
   document.getElementById('btn-schedule').addEventListener('click', () => {
-    showScheduleModal(chat.id, document.getElementById('reply-text').value.trim());
+    showScheduleModal(chat.id, ta.value.trim());
   });
 
   // Summarize
@@ -1826,10 +2548,8 @@ function renderThread(chat) {
     } catch(e) { toast(e.message, 'error'); }
   });
 
-  // Create ticket
-  document.getElementById('btn-ticket').addEventListener('click', () => {
-    showTicketModal({ chatId: chat.id });
-  });
+  document.getElementById('btn-ticket').addEventListener('click', () => showTicketModal({ chatId: chat.id }));
+  document.getElementById('btn-task').addEventListener('click', () => showTaskModal({ chatId: chat.id }));
 
   // Add note
   document.getElementById('btn-note').addEventListener('click', () => {
@@ -1845,28 +2565,22 @@ function renderThread(chat) {
       try {
         await Api.notes.create({ chat_id: chat.id, content });
         closeModal(); toast('Note saved', 'success');
-        loadMessages(chat.id);
+        loadMessages(chat.id, true);
       } catch(e) { toast(e.message, 'error'); }
     });
   });
 
-  // Flag toggle
-  document.getElementById('btn-flag').addEventListener('click', async () => {
-    try {
-      await Api.inbox.updateChat(chat.id, { is_flagged: !chat.is_flagged });
-      chat.is_flagged = !chat.is_flagged;
-      renderThread(chat);
-      loadChats();
-    } catch(e) { toast(e.message, 'error'); }
-  });
+  document.getElementById('btn-flag').addEventListener('click', () => cxToggleFlag(chat));
 
-  // Resolve/close chat
+  // Resolve / reopen chat
   document.getElementById('btn-close-chat').addEventListener('click', async () => {
+    const next = (chat.status || 'open') === 'resolved' ? 'open' : 'resolved';
     try {
-      await Api.inbox.updateChat(chat.id, { status: 'resolved' });
-      chat.status = 'resolved';
-      toast('Chat resolved', 'success');
-      loadChats();
+      await Api.inbox.updateChat(chat.id, { status: next });
+      chat.status = next;
+      toast(next === 'resolved' ? 'Chat resolved' : 'Chat reopened', 'success');
+      renderThreadHeaderState(chat);
+      if (State.inbox.statusFilter) loadChats(); else cxRerenderRow(chat);
     } catch(e) { toast(e.message, 'error'); }
   });
 
@@ -1878,25 +2592,16 @@ function renderThread(chat) {
     moreMenu.classList.toggle('open');
   });
   document.addEventListener('click', function closeMoreMenu(e) {
-    if (!moreMenu.contains(e.target) && e.target !== moreBtn) {
-      moreMenu.classList.remove('open');
-      document.removeEventListener('click', closeMoreMenu);
-    }
+    if (!moreMenu.isConnected) { document.removeEventListener('click', closeMoreMenu); return; }
+    if (!moreMenu.contains(e.target) && e.target !== moreBtn) moreMenu.classList.remove('open');
+    else if (moreMenu.contains(e.target) && e.target.closest('button')) moreMenu.classList.remove('open');
   });
 
   // Details panel toggle
   document.getElementById('btn-details-toggle').addEventListener('click', () => {
     const detailPanel = document.getElementById('detail-panel');
-    const layout = document.getElementById('inbox-layout');
-    const btn = document.getElementById('btn-details-toggle');
-    if (detailPanel.style.display === 'none' || !detailPanel.style.display) {
-      renderContactDetail(chat);
-      btn.classList.add('btn-details-active');
-    } else {
-      detailPanel.style.display = 'none';
-      layout.classList.remove('detail-open');
-      btn.classList.remove('btn-details-active');
-    }
+    if (detailPanel.style.display === 'none' || !detailPanel.style.display) renderContactDetail(chat);
+    else cxCloseDetail();
   });
 
   // Quick reply picker
@@ -1915,7 +2620,7 @@ function renderThread(chat) {
         </div>`);
       document.querySelectorAll('[data-qr]').forEach(el => {
         el.addEventListener('click', () => {
-          document.getElementById('reply-text').value = el.dataset.qr;
+          ta.value = el.dataset.qr; autosize();
           closeModal();
         });
       });
@@ -1934,30 +2639,29 @@ function renderThread(chat) {
     tabNote.classList.toggle('active', false);
     tabNote.classList.toggle('note-active', note);
     replyArea.classList.toggle('note-mode', note);
-    document.getElementById('reply-text').placeholder = note
-      ? 'Write a private note — only your team can see this…'
-      : 'Type a message… (Enter to send, Shift+Enter for newline)';
+    ta.placeholder = note ? 'Write a private note — only your team can see this…' : 'Message…';
+    ta.focus();
   };
   tabWA.addEventListener('click', () => setComposerMode('whatsapp'));
   tabNote.addEventListener('click', () => setComposerMode('note'));
 
   // Send message (or save private note)
   const sendMsg = async () => {
-    const text = document.getElementById('reply-text').value.trim();
+    const text = ta.value.trim();
     if (!text) return;
     const btn = document.getElementById('send-btn');
     btn.disabled = true;
     try {
       if (composerMode === 'note') {
         await Api.notes.create({ chat_id: chat.id, content: text });
-        document.getElementById('reply-text').value = '';
+        ta.value = ''; autosize();
         toast('Private note added — team only', 'success');
-        await loadMessages(chat.id);   // show the note in the thread
+        await loadMessages(chat.id, true);   // show the note in the thread
       } else {
         const phoneId = document.getElementById('phone-select')?.value;
         if (!phoneId) { btn.disabled = false; return toast('Select a phone', 'error'); }
         await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
-        document.getElementById('reply-text').value = '';
+        ta.value = ''; autosize();
         // WS new_message event from backend broadcasts the sent message to all agents in real time.
         // Only fall back to a full reload when WS is disconnected.
         if (!WS.alive) await loadMessages(chat.id);
@@ -1975,7 +2679,6 @@ function renderThread(chat) {
   const closeQrSuggest = () => { if (qrBox) { qrBox.remove(); qrBox = null; } };
 
   async function updateQrSuggest() {
-    const ta = document.getElementById('reply-text');
     const text = ta.value;
     if (!text.startsWith('/') || text.includes(' ') || composerMode === 'note') { closeQrSuggest(); return; }
     if (!qrCache) {
@@ -1997,28 +2700,28 @@ function renderThread(chat) {
       </div>`).join('');
     qrBox.querySelectorAll('.qr-row').forEach(row => row.addEventListener('mousedown', e => {
       e.preventDefault();
-      ta.value = matches[+row.dataset.i].message;
+      ta.value = matches[+row.dataset.i].message; autosize();
       closeQrSuggest();
       ta.focus();
     }));
     qrBox._matches = matches;
   }
 
-  document.getElementById('reply-text').addEventListener('input', updateQrSuggest);
-  document.getElementById('reply-text').addEventListener('blur', () => setTimeout(closeQrSuggest, 150));
-  document.getElementById('reply-text').addEventListener('keydown', e => {
+  ta.addEventListener('input', updateQrSuggest);
+  ta.addEventListener('blur', () => setTimeout(closeQrSuggest, 150));
+  ta.addEventListener('keydown', e => {
     if (qrBox && qrBox._matches?.length) {
       if (e.key === 'ArrowDown') { e.preventDefault(); qrSel = (qrSel + 1) % qrBox._matches.length; updateQrSuggest(); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); qrSel = (qrSel - 1 + qrBox._matches.length) % qrBox._matches.length; updateQrSuggest(); return; }
       if (e.key === 'Tab' || e.key === 'Enter') {
         e.preventDefault();
-        document.getElementById('reply-text').value = qrBox._matches[qrSel].message;
+        ta.value = qrBox._matches[qrSel].message; autosize();
         closeQrSuggest();
         return;
       }
       if (e.key === 'Escape') { closeQrSuggest(); return; }
     }
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMsg(); }
   });
 }
 
@@ -2074,9 +2777,12 @@ async function loadMessages(chatId, _alreadySynced) {
     area.innerHTML =
       `<div id="scroll-top-sentinel" style="height:1px;width:100%"></div>
        <div class="msg-spacer"></div>` +
-      (msgHtml || `<div style="text-align:center;padding:1rem;font-size:13px;color:var(--text-3)">No messages yet — send the first one!</div>`);
+      (msgHtml || `<div class="cx-empty-thread" style="text-align:center;padding:1rem;font-size:13px;color:var(--text-3)">No messages yet — send the first one!</div>`);
 
+    cxRedoDayChips(area);
     area.scrollTop = area.scrollHeight;
+    cxObserveMedia(area);
+    document.getElementById('thread-panel')?._cxRunSearch?.();
 
     // Attach IntersectionObserver for seamless infinite scroll upward
     _attachScrollSentinel(chatId, isGroup, area);
@@ -2150,7 +2856,7 @@ async function _fetchOlderMessages(chatId, isGroup, area, seq) {
       _msgNoMoreOlder = true;
       // Show a permanent "no more" tag at the top
       sentinel.insertAdjacentHTML('afterend',
-        `<div style="text-align:center;padding:.75rem;font-size:11px;color:var(--text-4);letter-spacing:.03em;opacity:.6">— beginning of conversation —</div>`);
+        `<div style="text-align:center;padding:.75rem;font-size:11px;color:var(--text-3);letter-spacing:.03em;opacity:.7">— beginning of conversation —</div>`);
       if (_msgScrollObserver) { _msgScrollObserver.disconnect(); _msgScrollObserver = null; }
       return;
     }
@@ -2159,6 +2865,9 @@ async function _fetchOlderMessages(chatId, isGroup, area, seq) {
     State.inbox.messages = older.concat(State.inbox.messages || []);
     const html = older.map(m => renderMessage(m, isGroup)).join('');
     sentinel.insertAdjacentHTML('afterend', html);
+    cxRedoDayChips(area);
+    cxObserveMedia(area);
+    document.getElementById('thread-panel')?._cxRunSearch?.();
 
     // Keep viewport anchored so content doesn't jump
     area.scrollTop = area.scrollHeight - prevScrollHeight;
@@ -2167,103 +2876,341 @@ async function _fetchOlderMessages(chatId, isGroup, area, seq) {
   }
 }
 
+// Date separator chips ("22-09-2026") before the first item of each day
+function cxRedoDayChips(area) {
+  area.querySelectorAll(':scope > .cx-day').forEach(e => e.remove());
+  let last = '';
+  area.querySelectorAll(':scope > [data-ts]').forEach(el => {
+    const ms = +el.dataset.ts;
+    if (!ms) return;
+    const d = new Date(ms);
+    const key = d.toDateString();
+    if (key !== last) {
+      last = key;
+      el.insertAdjacentHTML('beforebegin', `<div class="cx-day"><span>${cxDayLabel(d)}</span></div>`);
+    }
+  });
+}
+function cxTsAttr(ts) {
+  const d = parseServerDate(ts);
+  return d && !isNaN(d.getTime()) ? d.getTime() : '';
+}
+
+// WhatsApp formatting — XSS-safe: escape first, then apply markup to the escaped text
+function waFormat(text) {
+  let s = esc(String(text || '').replace(/\u0000/g, ''));
+  const codes = [];
+  s = s.replace(/```([\s\S]+?)```/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  const edge = '(^|[\\s(>\\u0000])', end = '(?=$|[\\s).,!?:;<\\u0000])';
+  s = s.replace(new RegExp(edge + '\\*(?!\\s)([^*\\n]+?)\\*' + end, 'g'), '$1<strong>$2</strong>');
+  s = s.replace(new RegExp(edge + '_(?!\\s)([^_\\n]+?)_' + end, 'g'), '$1<em>$2</em>');
+  s = s.replace(new RegExp(edge + '~(?!\\s)([^~\\n]+?)~' + end, 'g'), '$1<s>$2</s>');
+  s = s.replace(/\bhttps?:\/\/[^\s<]*[^\s<.,:;!?)\]]/g, u => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
+  s = s.replace(/\n/g, '<br>');
+  s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="cx-mono">${codes[+i] ?? ''}</code>`);
+  return s;
+}
+function cxTextBlock(body) {
+  const lines = (String(body).match(/\n/g) || []).length + 1;
+  const long = body.length > 900 || lines > 12;
+  return `<div class="cx-text${long ? ' cx-clamp' : ''}">${waFormat(body)}</div>${long ? '<button type="button" class="cx-readmore">… Read more</button>' : ''}`;
+}
+
+// Expand clamped messages; download document attachments (delegated, global)
+document.addEventListener('click', e => {
+  const more = e.target.closest('.cx-readmore');
+  if (more) {
+    more.previousElementSibling?.classList.remove('cx-clamp');
+    more.remove();
+    return;
+  }
+  const dl = e.target.closest('[data-dl-id]');
+  if (dl) {
+    e.stopPropagation();
+    Api.media.download(+dl.dataset.dlId, dl.dataset.dlName || 'file').catch(err => toast(err.message || 'Download failed', 'error'));
+    return;
+  }
+  const img = e.target.closest('.cx-mthumb.ready img, .cx-mimg');
+  if (img && img.closest('#messages-area')) cxLightbox(img.src);
+});
+
+function cxLightbox(src) {
+  const el = document.createElement('div');
+  el.className = 'cx-lightbox';
+  el.innerHTML = `<img src="${esc(src)}" alt=""><button class="cx-ibtn" title="Close">${cxIcon('x', 20)}</button>`;
+  el.addEventListener('click', () => el.remove());
+  document.body.appendChild(el);
+}
+
+// Media: files come through the authenticated /media/{id}/file proxy as blobs
+const _cxBlobCache = new Map();
+function cxMediaBlobUrl(id) {
+  if (_cxBlobCache.has(id)) return _cxBlobCache.get(id);
+  const p = Api.media.blob(id).then(b => URL.createObjectURL(b));
+  _cxBlobCache.set(id, p);
+  p.catch(() => _cxBlobCache.delete(id));
+  if (_cxBlobCache.size > 150) {
+    const [k, old] = _cxBlobCache.entries().next().value;
+    _cxBlobCache.delete(k);
+    old.then(u => URL.revokeObjectURL(u)).catch(() => {});
+  }
+  return p;
+}
+let _cxMediaObs = null;
+function cxObserveMedia(root) {
+  if (!root) return;
+  const pending = root.querySelectorAll('[data-media-id]:not([data-obs])');
+  if (!pending.length) return;
+  if (!('IntersectionObserver' in window)) { pending.forEach(el => { el.dataset.obs = '1'; cxHydrateMedia(el); }); return; }
+  if (!_cxMediaObs) {
+    _cxMediaObs = new IntersectionObserver(entries => entries.forEach(en => {
+      if (en.isIntersecting) { _cxMediaObs.unobserve(en.target); cxHydrateMedia(en.target); }
+    }), { rootMargin: '300px' });
+  }
+  pending.forEach(el => { el.dataset.obs = '1'; _cxMediaObs.observe(el); });
+}
+async function cxHydrateMedia(el) {
+  const id = +el.dataset.mediaId, kind = el.dataset.kind;
+  if (!id || !el.isConnected) return;
+  el.classList.add('loading');
+  try {
+    const url = await cxMediaBlobUrl(id);
+    if (!el.isConnected) return;
+    const area = el.closest('.messages-area');
+    const atBottom = area && area.scrollHeight - area.scrollTop - area.clientHeight < 80;
+    const keep = () => { if (atBottom && area.isConnected) area.scrollTop = area.scrollHeight; };
+    if (kind === 'image') {
+      const img = new Image();
+      img.alt = '';
+      img.onload = keep;
+      img.src = url;
+      el.replaceChildren(img);
+    } else if (kind === 'video') {
+      const v = document.createElement('video');
+      v.controls = !el.closest('.cx-tile'); v.preload = 'metadata'; v.muted = !!el.closest('.cx-tile');
+      v.src = url; v.onloadedmetadata = keep;
+      el.replaceChildren(v);
+      if (el.closest('.cx-tile')) el.insertAdjacentHTML('beforeend', `<span class="cx-play">${cxIcon('play', 18)}</span>`);
+    } else if (kind === 'audio') {
+      const a = document.createElement('audio');
+      a.controls = true; a.preload = 'metadata'; a.src = url;
+      el.replaceChildren(a);
+    }
+    el.classList.remove('loading');
+    el.classList.add('ready');
+  } catch (_) {
+    el.classList.remove('loading');
+    el.classList.add('failed');
+    el.title = 'Media not available (the WhatsApp number may be disconnected)';
+  }
+}
+
+function cxMediaBlock(m, mtype) {
+  const extUrl = m.media_source === 'external' && /^https:\/\//i.test(m.media_url || '') ? m.media_url : '';
+  const proxied = m.media_source === 'proxy' && m.id;
+  const kindOf = t => ['image', 'photo', 'sticker', 'gif'].includes(t) ? 'image'
+    : t === 'video' ? 'video' : ['audio', 'ptt', 'voice'].includes(t) ? 'audio'
+    : ['document', 'pdf', 'file'].includes(t) ? 'doc' : '';
+  const kind = kindOf(mtype);
+  if (kind === 'image') {
+    if (extUrl) return `<img class="cx-mimg" src="${esc(extUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer">`;
+    return proxied
+      ? `<div class="cx-mthumb${mtype === 'sticker' ? ' sticker' : ''}" data-media-id="${m.id}" data-kind="image">${cxIcon('image', 26)}<span>${mtype === 'sticker' ? 'Sticker' : 'Photo'}</span></div>`
+      : `<div class="msg-media-img">${cxIcon('image', 18)}<span>${mtype === 'sticker' ? 'Sticker' : 'Photo'}</span></div>`;
+  }
+  if (kind === 'video') {
+    return proxied
+      ? `<div class="cx-mthumb cx-mvideo" data-media-id="${m.id}" data-kind="video">${cxIcon('video', 26)}<span>Video</span></div>`
+      : `<div class="msg-media-img">${cxIcon('video', 18)}<span>Video</span></div>`;
+  }
+  if (kind === 'audio') {
+    return proxied
+      ? `<div class="cx-maudio" data-media-id="${m.id}" data-kind="audio">${cxIcon('mic', 16)}<span>${mtype === 'ptt' || mtype === 'voice' ? 'Voice message' : 'Audio'}</span></div>`
+      : `<div class="msg-media-audio">${cxIcon('mic', 16)}<span style="font-size:12px;opacity:.75">${mtype === 'ptt' ? 'Voice message' : 'Audio'}</span></div>`;
+  }
+  if (kind === 'doc') {
+    const name = m.media_filename || (m.body && !CX_MEDIA_LABEL_RE.test(m.body) ? m.body.split('\n')[0] : '') || 'Document';
+    const action = extUrl
+      ? `<a class="cx-ibtn sm" href="${esc(extUrl)}" target="_blank" rel="noopener noreferrer" title="Open">${cxIcon('download', 14)}</a>`
+      : proxied ? `<button type="button" class="cx-ibtn sm" data-dl-id="${m.id}" data-dl-name="${esc(name)}" title="Download">${cxIcon('download', 14)}</button>` : '';
+    return `<div class="cx-mdoc">${cxIcon('doc', 22)}<span class="cx-mdoc-name">${esc(name)}</span>${action}</div>`;
+  }
+  if (mtype === 'location') return `<div class="msg-media-doc">${cxIcon('location', 16)}<span>${esc(m.body || 'Location')}</span></div>`;
+  if (mtype === 'contact' || mtype === 'vcard') return `<div class="msg-media-doc">${cxIcon('user', 16)}<span>${esc(m.body || 'Contact')}</span></div>`;
+  return '';
+}
+
 function renderNoteBubble(n) {
-  const content = esc(n.content || '').replace(/@([\w.]+)/g, '<strong style="color:#a16207">@$1</strong>');
-  return `<div class="msg me note-inline">
+  const content = esc(n.content || '').replace(/\n/g, '<br>').replace(/@([\w.]+)/g, '<strong class="cx-mention">@$1</strong>');
+  return `<div class="msg me note-inline" data-ts="${cxTsAttr(n.created_at)}">
     <div class="msg-bubble">
       <div class="note-author">📝 Private note · ${esc(n.agent_name || 'Team')}</div>
       ${content}
+      <span class="cx-btime">${fmt(n.created_at)} · team only</span>
     </div>
-    <div class="msg-info">${fmt(n.created_at)} · team only</div>
   </div>`;
 }
 
 function renderMessage(m, isGroup) {
   if (m.body?.startsWith('[NOTE]') || m.message_type === 'note') {
     const content = m.body?.replace('[NOTE] ', '') || m.body;
-    return `<div class="note-msg">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+    return `<div class="note-msg" data-ts="${cxTsAttr(m.timestamp)}">
+      ${cxIcon('edit', 14)}
       <span><strong>Note:</strong> ${esc(content)}</span>
     </div>`;
   }
-  const cls = m.from_me ? 'me' : 'them';
-  let senderDisplay = '';
-  if (!m.from_me && (isGroup || m.sender_name)) {
-    senderDisplay = (m.sender_name || '').trim();
-    if (!senderDisplay && m.sender_number) {
-      // never show raw @lid ids as sender
-      senderDisplay = /^\d{6,}$/.test(m.sender_number) ? `+${m.sender_number}` : '';
-    }
-  }
-
-  let bubbleContent = '';
+  const me = !!m.from_me;
   const mtype = (m.message_type || 'text').toLowerCase();
 
-  if (mtype === 'image' || mtype === 'photo') {
-    bubbleContent = `<div class="msg-media-img">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-      <span>Photo</span>
-    </div>${m.body ? `<div style="font-size:12px;margin-top:.3rem">${esc(m.body)}</div>` : ''}`;
-  } else if (mtype === 'video') {
-    bubbleContent = `<div class="msg-media-img">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-      <span>Video</span>
-    </div>${m.body ? `<div style="font-size:12px;margin-top:.3rem">${esc(m.body)}</div>` : ''}`;
-  } else if (mtype === 'audio' || mtype === 'voice' || mtype === 'ptt') {
-    bubbleContent = `<div class="msg-media-audio">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
-      <div class="msg-audio-bars">${Array(5).fill(0).map(()=>`<span style="height:${8+Math.random()*12|0}px"></span>`).join('')}</div>
-      <span style="font-size:11px;color:inherit;opacity:.7">${mtype === 'ptt' ? 'Voice' : 'Audio'}</span>
-    </div>`;
-  } else if (mtype === 'document' || mtype === 'pdf') {
-    bubbleContent = `<div class="msg-media-doc">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-      <span>${esc(m.body || 'Document')}</span>
-    </div>`;
-  } else if (mtype === 'sticker') {
-    bubbleContent = `<span style="font-size:28px">🖼️</span>`;
-  } else if (mtype === 'location') {
-    bubbleContent = `<div class="msg-media-doc">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-      <span>${esc(m.body || 'Location')}</span>
-    </div>`;
-  } else if (mtype === 'contact' || mtype === 'vcard') {
-    bubbleContent = `<div class="msg-media-doc">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-      <span>${esc(m.body || 'Contact')}</span>
-    </div>`;
-  } else {
-    // Covers text, chat, gif, and any unknown types from WAHA
-    if (m.body) {
-      bubbleContent = esc(m.body).replace(/\n/g, '<br>');
-    } else if (m.has_media) {
-      // Media message where type string wasn't specifically matched above
-      const _fallbackLabel = {
-        gif: '🎞 GIF', image: '📷 Photo', photo: '📷 Photo',
-        video: '🎬 Video', audio: '🎤 Voice', ptt: '🎤 Voice',
-        document: '📄 Document', sticker: '🖼 Sticker',
-      }[mtype] || '📎 Media';
-      bubbleContent = `<div class="msg-media-doc">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-        <span>${_fallbackLabel}</span>
-      </div>`;
-    } else {
-      // Completely empty (deleted or system message) — show a dash so bubble is visible
-      bubbleContent = `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
+  // Incoming group messages: coloured sender name + their number on the right
+  let head = '';
+  if (!me && isGroup) {
+    const name = (m.sender_name || '').trim();
+    const num = /^\d{6,}$/.test(m.sender_number || '') ? cxFmtPhone(m.sender_number) : '';
+    const shown = name || num;
+    if (shown) {
+      head = `<div class="cx-bhead"><span class="cx-bname" style="color:${avatarColor(shown)}">${esc(shown)}</span>${name && num ? `<span class="cx-bnum">${esc(num)}</span>` : ''}</div>`;
     }
   }
 
-  // Skip rendering if somehow bubbleContent is still blank (defensive)
-  if (!bubbleContent) bubbleContent = `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
+  const media = cxMediaBlock(m, mtype);
+  let text = '';
+  const body = m.body || '';
+  const isAutoLabel = CX_MEDIA_LABEL_RE.test(body) || (mtype !== 'text' && mtype !== 'chat' && body === m.media_filename);
+  if (body && !(media && isAutoLabel) && !['location', 'contact', 'vcard'].includes(mtype)) text = cxTextBlock(body);
+  if (!media && !text) {
+    text = m.has_media
+      ? `<div class="msg-media-doc">${cxIcon('clip', 16)}<span>Media</span></div>`
+      : `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
+  }
 
-  return `<div class="msg ${cls}" data-mid="${m.id || ''}">
-    ${senderDisplay ? `<div class="msg-sender">${esc(senderDisplay)}</div>` : ''}
-    <div class="msg-bubble ${m.is_flagged ? 'flagged-msg' : ''}">
+  const byAgent = me && (m.sent_by_agent_id || m.sender_name === 'AI Agent') && m.sender_name ? `${esc(m.sender_name)} · ` : '';
+  const ticks = me ? (m.is_read ? '<span class="cx-ticks read">✓✓</span>' : '<span class="cx-ticks">✓</span>') : '';
+  return `<div class="msg ${me ? 'me' : 'them'}" data-mid="${m.id || ''}" data-ts="${cxTsAttr(m.timestamp)}">
+    <div class="msg-bubble ${m.is_flagged ? 'flagged-msg' : ''}${media ? ' has-media' : ''}">
       ${m.is_flagged ? '<div class="msg-flag-badge">🚩 AI Flagged</div>' : ''}
-      ${bubbleContent}
+      ${head}${media}${text}
+      <span class="cx-btime">${byAgent}${fmt(m.timestamp)} ${ticks}</span>
     </div>
-    <div class="msg-info">${fmt(m.timestamp)} ${m.from_me ? (m.is_read ? '<span style="color:#53bdeb">✓✓</span>' : '✓') : ''}</div>
   </div>`;
+}
+
+// ── MEDIA VIEW ─────────────────────────────────────────────────── //
+function cxMediaTile(m, opts = {}) {
+  const t = (m.message_type || '').toLowerCase();
+  const kind = ['image', 'photo', 'sticker', 'gif'].includes(t) ? 'image'
+    : t === 'video' ? 'video' : ['audio', 'ptt', 'voice'].includes(t) ? 'audio' : 'doc';
+  const extUrl = m.media_source === 'external' && /^https:\/\//i.test(m.media_url || '') ? m.media_url : '';
+  const proxied = m.media_source === 'proxy';
+  const name = m.media_filename || (m.body && !CX_MEDIA_LABEL_RE.test(m.body) ? m.body.split('\n')[0] : '');
+  let visual;
+  if (kind === 'image') {
+    visual = extUrl ? `<div class="cx-tile-media ready"><img src="${esc(extUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"></div>`
+      : `<div class="cx-tile-media" ${proxied ? `data-media-id="${m.id}" data-kind="image"` : ''}>${cxIcon('image', 26)}</div>`;
+  } else if (kind === 'video') {
+    visual = `<div class="cx-tile-media" ${proxied ? `data-media-id="${m.id}" data-kind="video"` : ''}>${cxIcon('video', 26)}</div>`;
+  } else if (kind === 'audio') {
+    visual = `<div class="cx-tile-media is-audio">${cxIcon('mic', 24)}<div class="cx-tile-audio" ${proxied ? `data-media-id="${m.id}" data-kind="audio"` : ''}><span>${t === 'ptt' || t === 'voice' ? 'Voice message' : 'Audio'}</span></div></div>`;
+  } else {
+    const dl = extUrl
+      ? `<a class="cx-ibtn sm" href="${esc(extUrl)}" target="_blank" rel="noopener noreferrer" title="Open">${cxIcon('download', 14)}</a>`
+      : proxied ? `<button type="button" class="cx-ibtn sm" data-dl-id="${m.id}" data-dl-name="${esc(name || 'document')}" title="Download">${cxIcon('download', 14)}</button>` : '';
+    visual = `<div class="cx-tile-media is-doc">${cxIcon('doc', 28)}<span class="cx-tile-docname">${esc(name || 'Document')}</span>${dl}</div>`;
+  }
+  const chatName = displayName({ name: m.chat_name, chat_wid: m.chat_wid });
+  return `<div class="cx-tile k-${kind}" data-cid="${m.chat_id}" data-mid="${m.id}" title="${esc(name || chatName)}">
+    ${visual}
+    ${opts.compact ? '' : `<div class="cx-tile-meta"><span class="cx-tile-chat">${m.chat_is_group ? cxIcon('users', 11) : ''}${esc(chatName || 'Chat')}</span><span class="cx-tile-date">${esc(cxFmtListDate(m.timestamp))}</span></div>`}
+  </div>`;
+}
+
+const _cxMP = { type: '', phone: '', search: '', before: null, done: false, loading: false, seq: 0 };
+async function renderMedia() {
+  const main = document.getElementById('main-content');
+  const types = [['', 'All'], ['image', 'Images'], ['video', 'Videos'], ['document', 'Docs'], ['audio', 'Audio']];
+  if (!State.phones.length) { try { State.phones = await Api.phones.list(); } catch (_) {} }
+  if (State.currentView !== 'media') return;
+  main.innerHTML = `
+    <div class="cx-media-page" id="cx-media-page">
+      <div class="cx-mp-head">
+        <div>
+          <h2>Media</h2>
+          <p>Photos, videos, documents and voice notes from every chat you can access</p>
+        </div>
+        <div class="cx-mp-filters">
+          <div class="cx-seg" id="cx-mp-type">${types.map(([v, l]) => `<button class="cx-seg-btn${_cxMP.type === v ? ' on' : ''}" data-type="${v}">${l}</button>`).join('')}</div>
+          <select id="cx-mp-phone" class="cx-select">
+            <option value="">All phones</option>
+            ${State.phones.map(p => `<option value="${p.id}" ${_cxMP.phone == p.id ? 'selected' : ''}>${esc(cxPhoneLabel(p))}</option>`).join('')}
+          </select>
+          <div class="cx-mp-search">${cxIcon('search', 14)}<input type="search" id="cx-mp-search" placeholder="Search by chat…" value="${esc(_cxMP.search)}"></div>
+        </div>
+      </div>
+      <div class="cx-mp-grid" id="cx-mp-grid"></div>
+      <div class="cx-mp-foot" id="cx-mp-foot"></div>
+    </div>`;
+
+  document.querySelectorAll('#cx-mp-type .cx-seg-btn').forEach(b => b.addEventListener('click', () => {
+    _cxMP.type = b.dataset.type;
+    document.querySelectorAll('#cx-mp-type .cx-seg-btn').forEach(x => x.classList.toggle('on', x === b));
+    cxLoadMedia(true);
+  }));
+  document.getElementById('cx-mp-phone').addEventListener('change', e => { _cxMP.phone = e.target.value; cxLoadMedia(true); });
+  document.getElementById('cx-mp-search').addEventListener('input', debounce(e => { _cxMP.search = e.target.value.trim(); cxLoadMedia(true); }, 300));
+  document.getElementById('cx-mp-grid').addEventListener('click', e => {
+    if (e.target.closest('audio,video,[data-dl-id],a')) return;
+    const tile = e.target.closest('.cx-tile');
+    if (tile) cxOpenChatAt(+tile.dataset.cid, +tile.dataset.mid);
+  });
+  await cxLoadMedia(true);
+}
+
+async function cxLoadMedia(reset) {
+  const grid = document.getElementById('cx-mp-grid');
+  const foot = document.getElementById('cx-mp-foot');
+  if (!grid) return;
+  if (reset) {
+    _cxMP.seq++; _cxMP.before = null; _cxMP.done = false; _cxMP.loading = false;
+    grid.innerHTML = '';
+    foot.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  }
+  if (_cxMP.loading || _cxMP.done) return;
+  _cxMP.loading = true;
+  const seq = _cxMP.seq;
+  const q = { limit: 60 };
+  if (_cxMP.type) q.type = _cxMP.type;
+  if (_cxMP.phone) q.phone_id = _cxMP.phone;
+  if (_cxMP.search) q.search = _cxMP.search;
+  if (_cxMP.before) q.before = _cxMP.before;
+  try {
+    const res = await Api.media.list(q);
+    if (seq !== _cxMP.seq || !grid.isConnected) return;
+    const items = res.items || [];
+    grid.insertAdjacentHTML('beforeend', items.map(m => cxMediaTile(m)).join(''));
+    cxObserveMedia(grid);
+    _cxMP.before = res.next_before;
+    _cxMP.done = !res.next_before;
+    if (!grid.children.length) {
+      foot.innerHTML = `<div class="empty-state">${cxIcon('image', 40)}<p>No media found${_cxMP.search || _cxMP.type || _cxMP.phone ? ' for these filters' : ' yet'}</p></div>`;
+    } else if (_cxMP.done) {
+      foot.innerHTML = '<div class="cx-mp-end">— end —</div>';
+    } else {
+      foot.innerHTML = '<div class="cx-mp-sentinel" id="cx-mp-sentinel"><div class="spinner" style="width:16px;height:16px"></div></div>';
+      const sentinel = document.getElementById('cx-mp-sentinel');
+      const obs = new IntersectionObserver(entries => {
+        if (!entries[0].isIntersecting) return;
+        obs.disconnect();
+        cxLoadMedia(false);
+      }, { root: document.getElementById('cx-media-page'), rootMargin: '400px' });
+      obs.observe(sentinel);
+    }
+  } catch (e) {
+    if (seq !== _cxMP.seq) return;
+    foot.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:.5rem"><span>${esc(e.message || 'Could not load media')}</span><button class="btn btn-secondary btn-sm" id="cx-mp-retry">Retry</button></div>`;
+    document.getElementById('cx-mp-retry')?.addEventListener('click', () => cxLoadMedia(!grid.children.length));
+  } finally {
+    if (seq === _cxMP.seq) _cxMP.loading = false;
+  }
 }
 
 // ── Right-click a message → Create Ticket / Create Task ──────────
@@ -2458,8 +3405,13 @@ function appendMessage(m) {
   // Keep state in sync so right-click context-menu actions work on real-time messages
   if (!State.inbox.messages) State.inbox.messages = [];
   State.inbox.messages.push(m);
+  const nearBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 160;
+  area.querySelector('.cx-empty-thread')?.remove();
   area.insertAdjacentHTML('beforeend', renderMessage(m, chat?.is_group || false));
-  area.scrollTop = area.scrollHeight;
+  cxRedoDayChips(area);
+  cxObserveMedia(area);
+  document.getElementById('thread-panel')?._cxRunSearch?.();
+  if (nearBottom || m.from_me) area.scrollTop = area.scrollHeight;
 }
 
 // ── TICKETS VIEW ────────────────────────────────────────────────── //
