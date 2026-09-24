@@ -1,49 +1,65 @@
-from fastapi import APIRouter, Body, Depends, HTTPException
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
+from app.services.access import get_accessible_chat
 from app.services.ai_agent_service import AIAgentService
 from app.services.gemini_service import GeminiService
 from app.services.mongo_chat_service import MongoInboxService
 
 router = APIRouter(prefix="/ai", tags=["ai-agent"])
+logger = logging.getLogger(__name__)
+
+_AI_ERROR = "The AI service failed to respond. Please try again."
 
 
 @router.post("/chat/{chat_id}/activate")
-async def activate_ai(chat_id: int):
+async def activate_ai(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+    await get_accessible_chat(db, agent, chat_id)
     await inbox.update_chat(chat_id, ai_active=True, ai_state="ACTIVE")
     return {"ok": True, "ai_state": "ACTIVE"}
 
 
 @router.post("/chat/{chat_id}/deactivate")
-async def deactivate_ai(chat_id: int):
+async def deactivate_ai(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+    await get_accessible_chat(db, agent, chat_id)
     await inbox.update_chat(chat_id, ai_active=False, ai_state="INACTIVE")
     return {"ok": True, "ai_state": "INACTIVE"}
 
 
 @router.post("/chat/{chat_id}/takeover")
-async def human_takeover(chat_id: int, db: Session = Depends(get_db)):
-    inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+async def human_takeover(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    chat = await get_accessible_chat(db, agent, chat_id)
     await AIAgentService(db).human_takeover(chat)
     return {"ok": True, "ai_state": "SNOOZED"}
 
 
 @router.post("/chat/{chat_id}/summarize")
-async def summarize_chat(chat_id: int):
+async def summarize_chat(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    await get_accessible_chat(db, agent, chat_id)
     inbox = MongoInboxService()
     msgs = await inbox.get_messages(chat_id=chat_id, limit=40)
     if not msgs:
@@ -52,12 +68,18 @@ async def summarize_chat(chat_id: int):
     try:
         summary = await GeminiService().summarize_chat(msg_list)
     except Exception as exc:
-        raise HTTPException(500, f"AI error: {exc}")
+        logger.exception("AI summarize failed: %s", exc)
+        raise HTTPException(500, _AI_ERROR)
     return {"summary": summary}
 
 
 @router.post("/chat/{chat_id}/suggest-reply")
-async def suggest_reply(chat_id: int):
+async def suggest_reply(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    await get_accessible_chat(db, agent, chat_id)
     inbox = MongoInboxService()
     msgs = await inbox.get_messages(chat_id=chat_id, limit=10)
     context = "\n".join(
@@ -67,7 +89,8 @@ async def suggest_reply(chat_id: int):
     try:
         reply = await GeminiService().generate_reply(context)
     except Exception as exc:
-        raise HTTPException(500, f"AI error: {exc}")
+        logger.exception("AI suggest-reply failed: %s", exc)
+        raise HTTPException(500, _AI_ERROR)
     return {"reply": reply}
 
 
@@ -81,7 +104,8 @@ async def translate_message(req: TranslateRequest):
     try:
         translated = await GeminiService().translate(req.text, req.target_language)
     except Exception as exc:
-        raise HTTPException(500, f"Translation error: {exc}")
+        logger.exception("AI translate failed: %s", exc)
+        raise HTTPException(500, _AI_ERROR)
     return {"translated": translated}
 
 
@@ -181,7 +205,8 @@ async def polish_reply(req: PolishRequest):
     try:
         polished = await GeminiService().polish_reply(req.text, req.tone)
     except Exception as exc:
-        raise HTTPException(500, f"AI error: {exc}")
+        logger.exception("AI polish failed: %s", exc)
+        raise HTTPException(500, _AI_ERROR)
     return {"polished": polished}
 
 
@@ -193,8 +218,8 @@ class AssistantRequest(BaseModel):
     recipe: str | None = None
 
 
-async def _org_context_pack(db: Session) -> str:
-    from datetime import datetime, timedelta
+async def _org_context_pack(db: Session, phone_ids: list[int] | None = None) -> str:
+    from datetime import datetime
     from app.models.agent import Agent as AgentModel
     from app.models.task import Task
     from app.models.ticket import Ticket, TicketStatus
@@ -209,7 +234,7 @@ async def _org_context_pack(db: Session) -> str:
     ]
     agents = {a.id: a.name for a in db.query(AgentModel).all()}
     inbox = MongoInboxService()
-    recent = await inbox.list_chats(is_archived=False, limit=20)
+    recent = await inbox.list_chats(is_archived=False, phone_ids=phone_ids, limit=20)
     lines.append("\nRecent chats (name | unread | flagged | assigned | last message):")
     for c in recent:
         lines.append(
@@ -263,21 +288,31 @@ RECIPES = {
 
 
 @router.post("/assistant")
-async def assistant(req: AssistantRequest, db: Session = Depends(get_db)):
+async def assistant(
+    req: AssistantRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    from app.core.permissions import allowed_phone_ids
     question = (RECIPES.get(req.recipe) or req.prompt or "").strip()
     if not question:
         raise HTTPException(400, "Ask a question or pick a recipe")
 
+    phone_ids = allowed_phone_ids(db, agent)
     if req.chat_id:
+        await get_accessible_chat(db, agent, req.chat_id)
         pack = await _chat_context_pack(req.chat_id)
     else:
-        pack = await _org_context_pack(db)
+        pack = await _org_context_pack(db, phone_ids)
         if req.recipe == "summarize_24h":
             from datetime import datetime, timedelta
             inbox = MongoInboxService()
             since = datetime.utcnow() - timedelta(hours=24)
+            msg_filter: dict = {"timestamp": {"$gte": since}}
+            if phone_ids is not None:
+                msg_filter["phone_id"] = {"$in": phone_ids}
             recent_msgs = await (
-                inbox.db.messages.find({"timestamp": {"$gte": since}})
+                inbox.db.messages.find(msg_filter)
                 .sort("timestamp", 1).limit(300).to_list(300)
             )
             lines = ["\nMessages in the last 24h:"]
@@ -291,5 +326,6 @@ async def assistant(req: AssistantRequest, db: Session = Depends(get_db)):
     try:
         answer = await GeminiService().assistant_answer(question, pack)
     except Exception as exc:
-        raise HTTPException(500, f"AI error: {exc}")
+        logger.exception("AI assistant failed: %s", exc)
+        raise HTTPException(500, _AI_ERROR)
     return {"answer": answer, "scope": "chat" if req.chat_id else "org"}

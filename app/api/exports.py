@@ -2,7 +2,7 @@ import csv
 import io
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -15,14 +15,35 @@ from app.models.activity_log import ActivityLog
 from app.services.activity_service import log_activity
 from app.services.mongo_chat_service import MongoInboxService
 
-router = APIRouter(prefix="/exports", tags=["exports"])
+from app.services.access import require_admin
+
+
+def _require_export_admin(agent: Agent = Depends(get_current_agent)) -> Agent:
+    require_admin(agent, "Only admins can export data")
+    return agent
+
+
+# Every export is admin-only (bulk PII / message history).
+router = APIRouter(
+    prefix="/exports", tags=["exports"], dependencies=[Depends(_require_export_admin)],
+)
+
+# Cells starting with these are interpreted as formulas by Excel/Sheets/LibreOffice
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell(value):
+    """Neutralise CSV/formula injection by prefixing a single quote."""
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return "'" + value
+    return value
 
 
 def _csv_response(filename: str, header: list[str], rows: list[list]) -> StreamingResponse:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(header)
-    writer.writerows(rows)
+    writer.writerow([_safe_cell(h) for h in header])
+    writer.writerows([[_safe_cell(v) for v in row] for row in rows])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]),
@@ -218,9 +239,6 @@ def export_logs(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    from app.models.agent import AgentRole
-    if agent.role != AgentRole.ADMIN:
-        raise HTTPException(403, "Only admins can export audit logs")
     since = datetime.utcnow() - timedelta(days=min(days, 365))
     logs = (
         db.query(ActivityLog)

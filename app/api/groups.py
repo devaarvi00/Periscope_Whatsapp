@@ -8,6 +8,7 @@ from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.phone import Phone
+from app.services.access import agent_can_access_chat, get_accessible_chat
 from app.services.mongo_chat_service import MongoInboxService
 from app.services.waha_service import WAHAService
 
@@ -54,10 +55,13 @@ async def list_groups(
 
 
 @router.get("/{chat_id}/participants")
-async def group_participants(chat_id: int, db: Session = Depends(get_db)):
-    inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat or not chat.get("is_group"):
+async def group_participants(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    chat = await get_accessible_chat(db, agent, chat_id)
+    if not chat.get("is_group"):
         raise HTTPException(404, "Group not found")
     phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
     if not phone:
@@ -101,7 +105,7 @@ async def add_participants(
     results = []
     for cid in req.chat_ids[:50]:
         chat = await inbox.get_chat_by_id(cid)
-        if not chat or not chat.get("is_group"):
+        if not agent_can_access_chat(db, agent, chat) or not chat.get("is_group"):
             results.append({"chat_id": cid, "ok": False, "error": "Not a group"})
             continue
         phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
@@ -124,11 +128,12 @@ async def group_analytics(
     chat_id: int,
     days: int = 30,
     db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
 ):
     """Group activity: daily message volume, top senders, in/out split."""
     inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat or not chat.get("is_group"):
+    chat = await get_accessible_chat(db, agent, chat_id)
+    if not chat.get("is_group"):
         raise HTTPException(404, "Group not found")
     since = datetime.utcnow() - timedelta(days=min(days, 180))
 

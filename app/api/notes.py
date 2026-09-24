@@ -8,6 +8,7 @@ from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.note import Note
 from app.schemas.ai_agent import NoteCreate
+from app.services.access import assert_chat_id_access, get_accessible_chat
 from app.services.activity_service import log_activity
 
 router = APIRouter(prefix="/notes", tags=["notes"])
@@ -42,11 +43,12 @@ def _find_mentions(db: Session, content: str) -> list[Agent]:
 
 
 @router.get("/chat/{chat_id}")
-def list_notes(
+async def list_notes(
     chat_id: int,
     db: Session = Depends(get_db),
     _agent: Agent = Depends(get_current_agent),
 ):
+    await get_accessible_chat(db, _agent, chat_id)
     notes = db.query(Note).filter(Note.chat_id == chat_id).order_by(Note.created_at).all()
     names = {a.id: a.name for a in db.query(Agent).all()}
     return [_serialize(n, names) for n in notes]
@@ -61,6 +63,7 @@ async def create_note(
 ):
     if not req.content.strip():
         raise HTTPException(400, "Note is empty")
+    await get_accessible_chat(db, current_agent, req.chat_id)
     note = Note(chat_id=req.chat_id, content=req.content, agent_id=current_agent.id)
     db.add(note)
     db.commit()
@@ -94,13 +97,17 @@ async def create_note(
 
 
 @router.delete("/{note_id}", status_code=204)
-def delete_note(
+async def delete_note(
     note_id: int,
     db: Session = Depends(get_db),
     _agent: Agent = Depends(get_current_agent),
 ):
     note = db.query(Note).filter(Note.id == note_id).first()
     if not note:
+        raise HTTPException(404, "Note not found")
+    try:
+        await assert_chat_id_access(db, _agent, note.chat_id)
+    except HTTPException:
         raise HTTPException(404, "Note not found")
     db.delete(note)
     db.commit()
