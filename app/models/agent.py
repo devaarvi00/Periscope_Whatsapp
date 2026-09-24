@@ -1,6 +1,6 @@
 import enum
 
-from sqlalchemy import Boolean, Enum as SAEnum, String
+from sqlalchemy import Boolean, Enum as SAEnum, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -22,3 +22,6 @@ class Agent(Base, TimestampMixin):
     role: Mapped[AgentRole] = mapped_column(SAEnum(AgentRole), default=AgentRole.AGENT)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     avatar_color: Mapped[str] = mapped_column(String(20), default="#0D8C7C")
+    # JSON-encoded per-agent notification settings (see schemas.auth.NotificationPrefs);
+    # NULL means "use defaults".
+    notification_prefs: Mapped[str | None] = mapped_column(Text, nullable=True)

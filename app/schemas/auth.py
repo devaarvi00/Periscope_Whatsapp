@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, StrictBool
 
 # bcrypt only hashes the first 72 bytes (bcrypt>=5 raises beyond that);
 # hash_password() also enforces the byte limit for multi-byte characters.
@@ -43,3 +43,50 @@ class AgentOut(BaseModel):
     avatar_color: str
 
     model_config = {"from_attributes": True}
+
+
+# ── Notification preferences ──────────────────────────────────────── #
+# StrictBool: reject "yes"/1 so a typo'd client can't silently flip a setting.
+
+class NotificationTypes(BaseModel):
+    new_messages: StrictBool = True
+    new_note: StrictBool = True
+    ticket_assign: StrictBool = True
+    task_assign: StrictBool = True
+    chat_assign: StrictBool = True
+    ticket_overdue: StrictBool = True
+    task_overdue: StrictBool = True
+
+    model_config = {"extra": "forbid"}
+
+
+class NotificationPrefs(BaseModel):
+    in_app: StrictBool = True
+    desktop: StrictBool = False
+    sound: StrictBool = False
+    types: NotificationTypes = Field(default_factory=NotificationTypes)
+
+    model_config = {"extra": "forbid"}
+
+
+class NotificationTypesUpdate(BaseModel):
+    new_messages: StrictBool | None = None
+    new_note: StrictBool | None = None
+    ticket_assign: StrictBool | None = None
+    task_assign: StrictBool | None = None
+    chat_assign: StrictBool | None = None
+    ticket_overdue: StrictBool | None = None
+    task_overdue: StrictBool | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class NotificationPrefsUpdate(BaseModel):
+    """Partial update: omitted keys keep their stored value."""
+
+    in_app: StrictBool | None = None
+    desktop: StrictBool | None = None
+    sound: StrictBool | None = None
+    types: NotificationTypesUpdate | None = None
+
+    model_config = {"extra": "forbid"}
