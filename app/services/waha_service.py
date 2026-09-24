@@ -317,6 +317,24 @@ class WAHAService:
             logger.warning("WAHA get_contact_picture error: %s", exc)
         return None
 
+    # ── Contacts (read-only) ────────────────────────────────────────────────
+
+    async def get_all_contacts(self, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
+        """One page of the session's WhatsApp contacts (address book + known
+        users). Raises WAHAError when the session is not WORKING."""
+        from urllib.parse import urlencode
+        q = urlencode({"session": self.session, "limit": limit, "offset": offset,
+                       "sortBy": "id", "sortOrder": "asc"})
+        data = await self._request("GET", f"/api/contacts/all?{q}")
+        return data if isinstance(data, list) else []
+
+    async def get_lids(self, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
+        """One page of known LID → phone-number mappings `[{lid, pn}]`."""
+        from urllib.parse import urlencode
+        q = urlencode({"limit": limit, "offset": offset})
+        data = await self._request("GET", f"/api/{self.session}/lids?{q}")
+        return data if isinstance(data, list) else []
+
     # Group administration — each raises WAHAError when WhatsApp refuses
     # (e.g. our number is not an admin of the group).
     _PARTICIPANT_ACTIONS = {
