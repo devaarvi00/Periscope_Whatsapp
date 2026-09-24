@@ -940,40 +940,74 @@ function handleWSEvent(data) {
       }
     }
 
-    // Show toast/notify when user is on another view
-    if (State.currentView !== 'inbox' && !d.from_me) {
-      const preview = (d.body || '').substring(0, 60);
-      toast(`💬 New message: ${preview}`, 'default');
-    }
+    // Show toast/notify for inbound messages (toast only when user is on another view)
     if (!d.from_me && typeof notifyUser === 'function') {
-      notifyUser('new_messages', displayName(d.sender_name || d.chat_wid || 'New message'), d.body || 'Media message');
+      notifyUser('new_messages', displayName(d.sender_name || d.chat_name || d.chat_wid || 'New message'), d.body || 'Media message', {
+        toast: State.currentView !== 'inbox',
+        toastText: `💬 New message: ${(d.body || 'Media message').substring(0, 60)}`,
+        tag: `chat-${d.chat_id}`,
+      });
     }
     return;
   }
 
-  if (event === 'note_mention') {
-    toast(`📝 ${d.by} mentioned you in ${displayName(d.chat_name)}`, 'default');
-    if (typeof notifyUser === 'function') {
-      notifyUser('new_note', `${d.by} mentioned you`, d.content || '');
-    }
+  // ── Notifications (each respects the agent's prefs via notifyUser) ──
+  if (event === 'note_mention' || event === 'note_added') {
+    const chat = displayName(d.chat_name);
+    const verb = event === 'note_mention' ? 'mentioned you' : 'added a private note';
+    notifyUser('new_note', `${d.by} ${verb}`, d.content || '', {
+      toastText: `📝 ${d.by} ${verb} in ${chat}`,
+      tag: `note-${d.note_id}`,
+    });
     return;
   }
 
   if (event === 'ticket_assigned') {
-    toast(`🎫 ${d.by} assigned you ticket #${d.ticket_id}: ${d.title}`, 'default');
-    if (typeof notifyUser === 'function') notifyUser('ticket_assign', 'Ticket assigned to you', d.title || '');
+    notifyUser('ticket_assign', 'Ticket assigned to you', d.title || '', {
+      toastText: `🎫 ${d.by} assigned you ticket #${d.ticket_id}: ${d.title}`,
+      tag: `ticket-${d.ticket_id}`,
+    });
     return;
   }
 
   if (event === 'task_assigned') {
-    toast(`✅ ${d.by} assigned you a task: ${d.title}`, 'default');
-    if (typeof notifyUser === 'function') notifyUser('task_assign', 'Task assigned to you', d.title || '');
+    notifyUser('task_assign', 'Task assigned to you', d.title || '', {
+      toastText: `✅ ${d.by} assigned you a task: ${d.title}`,
+      tag: `task-${d.task_id}`,
+    });
     return;
   }
 
   if (event === 'task_reminder') {
-    toast(`⏰ Task reminder: ${d.title}`, 'default');
-    if (typeof notifyUser === 'function') notifyUser('task_assign', '⏰ Task reminder', d.title || '');
+    notifyUser('task_assign', '⏰ Task reminder', d.title || '', {
+      toastText: `⏰ Task reminder: ${d.title}`,
+      tag: `task-reminder-${d.task_id}`,
+    });
+    return;
+  }
+
+  if (event === 'chat_assigned') {
+    const chat = displayName(d.chat_name || `Chat #${d.chat_id}`);
+    notifyUser('chat_assign', 'Chat assigned to you', chat, {
+      toastText: `💬 ${d.by || 'Someone'} assigned you ${chat}`,
+      tag: `chat-assign-${d.chat_id}`,
+    });
+    return;
+  }
+
+  if (event === 'ticket_overdue') {
+    notifyUser('ticket_overdue', 'Ticket overdue', d.title || '', {
+      toastText: `⚠️ Ticket #${d.ticket_id} is overdue: ${d.title}`,
+      tag: `ticket-overdue-${d.ticket_id}`,
+    });
+    return;
+  }
+
+  if (event === 'task_overdue') {
+    notifyUser('task_overdue', 'Task overdue', d.title || '', {
+      toastText: `⚠️ Task overdue: ${d.title}`,
+      tag: `task-overdue-${d.task_id}`,
+    });
     return;
   }
 
@@ -5325,11 +5359,130 @@ async function renderChatListView() {
 })();
 
 // ══ NOTIFICATION SETTINGS (topbar bell) ═══════════════════════════ //
+// Per-agent prefs live on the server (GET/PUT /auth/me/notification-prefs);
+// localStorage only caches them so the popover and early WS events don't wait.
 const NotifPrefs = {
-  get() {
-    try { return JSON.parse(localStorage.getItem('notif_prefs')) || {}; } catch(_) { return {}; }
+  DEFAULTS: {
+    in_app: true, desktop: false, sound: false,
+    types: {
+      new_messages: true, new_note: true, ticket_assign: true, task_assign: true,
+      chat_assign: true, ticket_overdue: true, task_overdue: true,
+    },
   },
-  save(p) { localStorage.setItem('notif_prefs', JSON.stringify(p)); },
+  LEGACY_KEY: 'notif_prefs',   // pre-server flat format: {desktop, sound, new_messages, ...}
+  _prefs: null,
+  _prefsFor: null,             // agent id _prefs belongs to
+  _loadedFor: null,            // agent id the server prefs were fetched for
+  _loading: null,
+
+  _cacheKey() { return `notif_prefs_v2:${State.agent?.id || 0}`; },
+  _normalize(p) {
+    const d = this.DEFAULTS;
+    const out = { ...d, types: { ...d.types } };
+    if (!p || typeof p !== 'object') return out;
+    ['in_app', 'desktop', 'sound'].forEach(k => { if (typeof p[k] === 'boolean') out[k] = p[k]; });
+    const t = p.types && typeof p.types === 'object' ? p.types : {};
+    Object.keys(d.types).forEach(k => { if (typeof t[k] === 'boolean') out.types[k] = t[k]; });
+    return out;
+  },
+  _writeCache(p) {
+    try { localStorage.setItem(this._cacheKey(), JSON.stringify(p)); } catch (_) {}
+  },
+  // Old flat localStorage prefs → new shape (null when there are none)
+  _readLegacy() {
+    let old = null;
+    try { old = JSON.parse(localStorage.getItem(this.LEGACY_KEY)); } catch (_) {}
+    if (!old || typeof old !== 'object') return null;
+    const patch = { types: {} };
+    ['desktop', 'sound'].forEach(k => { if (typeof old[k] === 'boolean') patch[k] = old[k]; });
+    Object.keys(this.DEFAULTS.types).forEach(k => { if (typeof old[k] === 'boolean') patch.types[k] = old[k]; });
+    return patch;
+  },
+
+  get() {
+    const id = State.agent?.id || 0;
+    if (!this._prefs || this._prefsFor !== id) {   // first use, or a different agent logged in
+      let cached = null;
+      try { cached = JSON.parse(localStorage.getItem(this._cacheKey())); } catch (_) {}
+      this._prefs = this._normalize(cached || this._readLegacy());
+      this._prefsFor = id;
+    }
+    return this._prefs;
+  },
+  isLoaded() { return !!State.agent && this._loadedFor === State.agent.id; },
+
+  // Fetch from the server (once per logged-in agent); migrates legacy local prefs.
+  load() {
+    if (!State.agent || !Api.getToken?.()) return Promise.resolve(this.get());
+    if (this.isLoaded()) return Promise.resolve(this._prefs);
+    if (this._loading) return this._loading;
+    const agentId = State.agent.id;
+    this._loading = (async () => {
+      try {
+        let server = await Api.auth.notificationPrefs();
+        const legacy = this._readLegacy();
+        if (legacy) {
+          server = await Api.auth.saveNotificationPrefs(legacy);
+          try { localStorage.removeItem(this.LEGACY_KEY); } catch (_) {}
+        }
+        if (State.agent?.id === agentId) {
+          this._prefs = this._normalize(server);
+          this._prefsFor = this._loadedFor = agentId;
+          this._writeCache(this._prefs);
+        }
+      } catch (_) {
+        // Offline / server error: keep the cached copy, retry on next call
+      } finally {
+        this._loading = null;
+      }
+      return this.get();
+    })();
+    return this._loading;
+  },
+
+  // Optimistic update; reverts (and rethrows) if the server rejects it.
+  async save(patch) {
+    const before = this.get();
+    const next = this._normalize({ ...before, ...patch, types: { ...before.types, ...(patch.types || {}) } });
+    this._prefs = next;
+    this._writeCache(next);
+    try {
+      const saved = await Api.auth.saveNotificationPrefs(patch);
+      this._prefs = this._normalize(saved);
+      this._writeCache(this._prefs);
+      return this._prefs;
+    } catch (e) {
+      this._prefs = before;
+      this._writeCache(before);
+      throw e;
+    }
+  },
+};
+
+function loadNotifPrefs() { return NotifPrefs.load(); }
+
+// One shared AudioContext (browsers cap how many a page may create)
+const NotifSound = {
+  _ctx: null,
+  play() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!this._ctx) this._ctx = new Ctx();
+      const ctx = this._ctx;
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.setValueAtTime(1175, ctx.currentTime + 0.09);
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.24);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(); osc.stop(ctx.currentTime + 0.25);
+    } catch (_) {}
+  },
 };
 
 (() => {
@@ -5337,7 +5490,14 @@ const NotifPrefs = {
   const pop = document.getElementById('notif-popover');
   if (!bell || !pop) return;
 
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', 'Notification settings');
+  bell.setAttribute('aria-haspopup', 'dialog');
+  bell.setAttribute('aria-controls', 'notif-popover');
+  bell.setAttribute('aria-expanded', 'false');
+
   const SETTINGS = [
+    ['in_app', 'In-App Notifications'],
     ['desktop', 'Desktop Notifications'],
     ['sound', 'Sound'],
   ];
@@ -5346,58 +5506,132 @@ const NotifPrefs = {
     ['new_note', 'New Private Note'],
     ['ticket_assign', 'Ticket Assignment'],
     ['task_assign', 'Task Assignment'],
+    ['chat_assign', 'Chat Assignment'],
+    ['ticket_overdue', 'Ticket Overdue'],
+    ['task_overdue', 'Task Overdue'],
   ];
+
+  const isOpen = () => pop.style.display !== 'none';
 
   function render() {
     const p = NotifPrefs.get();
     pop.innerHTML = `
-      <div class="np-title">Notification Settings</div>
-      ${SETTINGS.map(([k, label]) => `
-        <div class="notif-row">${label}
-          <label class="np-switch"><input type="checkbox" data-k="${k}" ${p[k] ? 'checked' : ''}><span class="np-slider"></span></label>
-        </div>`).join('')}
-      <div class="np-title">Notification Types</div>
-      ${TYPES.map(([k, label]) => `
-        <div class="notif-row">${label}
-          <input type="checkbox" class="np-check" data-k="${k}" ${p[k] !== false ? 'checked' : ''}>
-        </div>`).join('')}`;
-    pop.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('change', () => {
-      const prefs = NotifPrefs.get();
-      prefs[inp.dataset.k] = inp.checked;
-      NotifPrefs.save(prefs);
-      if (inp.dataset.k === 'desktop' && inp.checked && 'Notification' in window) {
-        Notification.requestPermission();
+      <div class="np-section" role="group" aria-labelledby="np-h-settings">
+        <div class="np-heading" id="np-h-settings">Notification Settings</div>
+        ${SETTINGS.map(([k, label]) => `
+          <label class="np-row">
+            <span class="np-label">${label}</span>
+            <span class="np-toggle">
+              <input type="checkbox" role="switch" data-setting="${k}" ${p[k] ? 'checked' : ''}>
+              <span class="np-track" aria-hidden="true"></span>
+            </span>
+          </label>`).join('')}
+      </div>
+      <div class="np-divider" role="separator"></div>
+      <div class="np-section" role="group" aria-labelledby="np-h-types">
+        <div class="np-heading" id="np-h-types">Notification Types</div>
+        ${TYPES.map(([k, label]) => `
+          <label class="np-row">
+            <span class="np-label">${label}</span>
+            <input type="checkbox" class="np-checkbox" data-type="${k}" ${p.types[k] ? 'checked' : ''}>
+          </label>`).join('')}
+      </div>`;
+
+    pop.querySelectorAll('input[data-setting]').forEach(inp =>
+      inp.addEventListener('change', () => onSettingChange(inp)));
+    pop.querySelectorAll('input[data-type]').forEach(inp =>
+      inp.addEventListener('change', () => persist({ types: { [inp.dataset.type]: inp.checked } }, inp)));
+  }
+
+  async function persist(patch, inp) {
+    try {
+      await NotifPrefs.save(patch);
+    } catch (e) {
+      if (inp) inp.checked = !inp.checked;
+      toast(`Couldn't save notification settings: ${e.message || e}`, 'error');
+    }
+  }
+
+  async function onSettingChange(inp) {
+    const key = inp.dataset.setting;
+    if (key === 'desktop' && inp.checked) {
+      const reason = await ensureDesktopPermission();
+      if (reason) {
+        inp.checked = false;
+        toast(reason, 'error');
+        return;
       }
-    }));
+    }
+    await persist({ [key]: inp.checked }, inp);
+    if (key === 'sound' && inp.checked) NotifSound.play();   // preview + unlocks audio via this gesture
+  }
+
+  // Returns an error message, or '' when desktop notifications may be shown.
+  async function ensureDesktopPermission() {
+    if (!('Notification' in window)) return 'This browser does not support desktop notifications';
+    if (Notification.permission === 'granted') return '';
+    if (Notification.permission === 'denied') {
+      return 'Desktop notifications are blocked. Allow them for this site in your browser settings.';
+    }
+    try {
+      const result = await Notification.requestPermission();
+      return result === 'granted' ? '' : 'Desktop notification permission was not granted';
+    } catch (_) {
+      return 'Could not request desktop notification permission';
+    }
+  }
+
+  function open() {
+    pop.style.display = 'block';
+    bell.setAttribute('aria-expanded', 'true');
+    render();
+    pop.querySelector('input')?.focus();
+    // Refresh from the server; re-render only if it changed while open
+    const shown = JSON.stringify(NotifPrefs.get());
+    loadNotifPrefs().then(p => {
+      if (isOpen() && JSON.stringify(p) !== shown) render();
+    });
+  }
+  function close(returnFocus) {
+    if (!isOpen()) return;
+    pop.style.display = 'none';
+    bell.setAttribute('aria-expanded', 'false');
+    if (returnFocus) bell.focus();
   }
 
   bell.addEventListener('click', e => {
     e.stopPropagation();
-    const open = pop.style.display !== 'none';
-    pop.style.display = open ? 'none' : 'block';
-    if (!open) render();
+    isOpen() ? close(false) : open();
   });
+  pop.addEventListener('click', e => e.stopPropagation());
   document.addEventListener('click', e => {
-    if (!pop.contains(e.target) && e.target !== bell) pop.style.display = 'none';
+    if (isOpen() && !pop.contains(e.target) && !bell.contains(e.target)) close(false);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && isOpen()) { e.stopPropagation(); close(true); }
   });
 })();
 
-// Called from the WS handler on incoming events
-function notifyUser(type, title, bodyText) {
+// Single entry point for every notification-worthy WS event.
+// type: a NotifPrefs.DEFAULTS.types key. opts.toast=false skips the in-app
+// toast (e.g. new message in the chat already on screen).
+function notifyUser(type, title, bodyText = '', opts = {}) {
+  if (!NotifPrefs.isLoaded()) loadNotifPrefs();   // lazy; this event uses the cached copy
   const p = NotifPrefs.get();
-  if (p[type] === false) return;
-  if (p.desktop && 'Notification' in window && Notification.permission === 'granted') {
-    try { new Notification(title, { body: bodyText.slice(0, 140) }); } catch(_) {}
+  if (p.types[type] === false) return;
+  const body = String(bodyText || '');
+
+  if (p.in_app && opts.toast !== false) {
+    toast(opts.toastText || (body ? `${title}: ${body.slice(0, 80)}` : title));
   }
-  if (p.sound) {
+  if (p.desktop && 'Notification' in window && Notification.permission === 'granted'
+      && (document.hidden || !document.hasFocus())) {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ctx.createOscillator(); const gain = ctx.createGain();
-      osc.connect(gain); gain.connect(ctx.destination);
-      osc.frequency.value = 880; gain.gain.value = 0.04;
-      osc.start(); osc.stop(ctx.currentTime + 0.12);
-    } catch(_) {}
+      const n = new Notification(title, { body: body.slice(0, 140), tag: opts.tag || undefined });
+      n.onclick = () => { window.focus(); n.close(); };
+    } catch (_) {}
   }
+  if (p.sound) NotifSound.play();
 }
 
 // ══ ASK AI (Org & Chat Assistant) ═════════════════════════════════ //

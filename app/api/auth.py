@@ -1,3 +1,4 @@
+import json
 import logging
 import threading
 import time
@@ -9,7 +10,15 @@ from sqlalchemy.orm import Session
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.schemas.auth import AgentCreate, AgentOut, ChangePasswordRequest, LoginRequest, TokenResponse
+from app.schemas.auth import (
+    AgentCreate,
+    AgentOut,
+    ChangePasswordRequest,
+    LoginRequest,
+    NotificationPrefs,
+    NotificationPrefsUpdate,
+    TokenResponse,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -175,6 +184,46 @@ def register(
 @router.get("/me", response_model=AgentOut)
 def get_me(agent: Agent = Depends(get_current_agent)):
     return agent
+
+
+def load_notification_prefs(agent: Agent) -> NotificationPrefs:
+    """Stored prefs merged over defaults. Unknown keys / bad values are ignored."""
+    prefs = NotificationPrefs().model_dump()
+    try:
+        stored = json.loads(agent.notification_prefs) if agent.notification_prefs else {}
+    except (TypeError, ValueError):
+        stored = {}
+    if isinstance(stored, dict):
+        for key in ("in_app", "desktop", "sound"):
+            if isinstance(stored.get(key), bool):
+                prefs[key] = stored[key]
+        types = stored.get("types")
+        if isinstance(types, dict):
+            for key in prefs["types"]:
+                if isinstance(types.get(key), bool):
+                    prefs["types"][key] = types[key]
+    return NotificationPrefs.model_validate(prefs)
+
+
+@router.get("/me/notification-prefs", response_model=NotificationPrefs)
+def get_notification_prefs(agent: Agent = Depends(get_current_agent)):
+    return load_notification_prefs(agent)
+
+
+@router.put("/me/notification-prefs", response_model=NotificationPrefs)
+def update_notification_prefs(
+    req: NotificationPrefsUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    prefs = load_notification_prefs(agent).model_dump()
+    changes = req.model_dump(exclude_none=True)
+    prefs["types"].update(changes.pop("types", {}))
+    prefs.update(changes)
+    result = NotificationPrefs.model_validate(prefs)
+    agent.notification_prefs = json.dumps(result.model_dump())
+    db.commit()
+    return result
 
 
 @router.get("/agents", response_model=list[AgentOut])

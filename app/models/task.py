@@ -26,3 +26,6 @@ class Task(Base, TimestampMixin):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     reminder_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     reminder_sent: Mapped[bool] = mapped_column(default=False)
+    # Set once the assignee has been told the task is overdue; cleared when the
+    # due date moves back into the future so it can fire again.
+    overdue_notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

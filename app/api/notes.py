@@ -86,6 +86,17 @@ async def create_note(
             "by": current_agent.name,
             "content": req.content[:200],
         })
+    # Tell the chat's assignee about the new note too (unless they wrote it or
+    # were already pinged via @mention above).
+    assignee_id = chat.get("assigned_to") if chat else None
+    if assignee_id and assignee_id != current_agent.id and assignee_id not in {a.id for a in mentioned}:
+        await ws_manager.send_to_agent(assignee_id, "note_added", {
+            "chat_id": req.chat_id,
+            "chat_name": chat_name,
+            "note_id": note.id,
+            "by": current_agent.name,
+            "content": req.content[:200],
+        })
     log_activity(
         db, "private_note_added", entity_type="chat", entity_id=req.chat_id,
         agent_id=current_agent.id,

@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +320,83 @@ async def check_task_reminders() -> None:
                 await ws_manager.send_to_agent(agent_id, "task_reminder", payload)
             task.reminder_sent = True
             logger.info("Task reminder fired for task %s", task.id)
+        db.commit()
+    finally:
+        db.close()
+    # Piggyback on this every-minute job (main.py owns job registration)
+    try:
+        await check_overdue_items()
+    except Exception as exc:
+        logger.warning("Overdue check failed: %s", exc)
+
+
+OVERDUE_LOOKBACK_DAYS = 7
+
+
+async def check_overdue_items() -> None:
+    """Tell assignees, once, about tickets and tasks that are past due.
+
+    `overdue_notified_at` makes it one-shot; the API clears it when the due
+    date moves into the future or the item is reassigned, re-arming it.
+    Items overdue for longer than OVERDUE_LOOKBACK_DAYS are skipped so the
+    first run after deploy doesn't flood agents with stale backlog.
+    """
+    from app.core.ws_manager import ws_manager
+    from app.db.session import SessionLocal
+    from app.models.task import Task
+    from app.models.ticket import Ticket, TicketStatus
+
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        oldest = now - timedelta(days=OVERDUE_LOOKBACK_DAYS)
+        tickets = (
+            db.query(Ticket)
+            .filter(
+                Ticket.due_date.isnot(None),
+                Ticket.due_date <= now,
+                Ticket.due_date >= oldest,
+                Ticket.status.in_([TicketStatus.OPEN, TicketStatus.IN_PROGRESS]),
+                Ticket.assigned_to.isnot(None),
+                Ticket.overdue_notified_at.is_(None),
+            )
+            .limit(100)
+            .all()
+        )
+        for ticket in tickets:
+            await ws_manager.send_to_agent(ticket.assigned_to, "ticket_overdue", {
+                "ticket_id": ticket.id,
+                "chat_id": ticket.chat_id,
+                "title": ticket.title,
+                "due_date": ticket.due_date.isoformat(),
+                "priority": ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority),
+            })
+            ticket.overdue_notified_at = now
+            logger.info("Overdue notice sent for ticket %s", ticket.id)
+
+        tasks = (
+            db.query(Task)
+            .filter(
+                Task.due_date.isnot(None),
+                Task.due_date <= now,
+                Task.due_date >= oldest,
+                Task.status == "open",
+                Task.assigned_to.isnot(None),
+                Task.overdue_notified_at.is_(None),
+            )
+            .limit(100)
+            .all()
+        )
+        for task in tasks:
+            await ws_manager.send_to_agent(task.assigned_to, "task_overdue", {
+                "task_id": task.id,
+                "chat_id": task.chat_id,
+                "title": task.title,
+                "due_date": task.due_date.isoformat(),
+                "priority": task.priority,
+            })
+            task.overdue_notified_at = now
+            logger.info("Overdue notice sent for task %s", task.id)
         db.commit()
     finally:
         db.close()
