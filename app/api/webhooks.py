@@ -478,13 +478,29 @@ async def _process_session_status(payload: dict[str, Any]) -> None:
             return
 
         phone.waha_status = db_status
+        # Track which WhatsApp account is linked: set after a QR scan, clear
+        # when the session is logged out and waiting for a new scan.
+        from app.api.phones import link_phone_number, unlink_phone_number
+        try:
+            if db_status == "WORKING":
+                me = status_payload.get("me") if isinstance(status_payload.get("me"), dict) else None
+                await link_phone_number(db, phone, me=me)
+            elif db_status == "SCAN_QR_CODE":
+                unlink_phone_number(phone)
+        except Exception as exc:
+            logger.warning("Could not sync linked number for session %s: %s", session_name, exc)
+            db.rollback()
+            phone = db.query(Phone).filter(Phone.session_name == session_name).first()
+            if not phone:
+                return
+            phone.waha_status = db_status
         db.commit()
-        logger.info("Session status: session=%s raw=%s db=%s phone_id=%d",
-                    session_name, raw_status, db_status, phone.id)
+        logger.info("Session status: session=%s raw=%s db=%s phone_id=%d number=%s",
+                    session_name, raw_status, db_status, phone.id, phone.phone_number)
 
         from app.core.ws_manager import ws_manager
         await ws_manager.broadcast("phone_status_changed", {
-            "phone_id": phone.id, "status": db_status,
+            "phone_id": phone.id, "status": db_status, "phone_number": phone.phone_number,
         })
         if db_status in ("STOPPED", "FAILED"):
             await ws_manager.broadcast("data_cleared", {"phone_id": phone.id, "reason": db_status})

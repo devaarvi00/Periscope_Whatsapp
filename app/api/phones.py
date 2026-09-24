@@ -81,6 +81,47 @@ async def _absorb_conflicting_phone(db: Session, conflict: Phone, target_id: int
     await inbox.db.messages.update_many({"phone_id": conflict_id}, {"$set": {"phone_id": target_id}})
 
 
+def _number_from_me(me: dict | None) -> str:
+    """Digits of the linked WhatsApp account, e.g. {'id': '919510715498@c.us'} -> '919510715498'."""
+    wid = (me or {}).get("id") or ""
+    if isinstance(wid, dict):
+        wid = wid.get("_serialized") or wid.get("user") or ""
+    return "".join(ch for ch in str(wid).split("@")[0] if ch.isdigit())
+
+
+def unlink_phone_number(phone: Phone) -> bool:
+    """Session is logged out / waiting for a QR scan: stop showing the old number."""
+    if str(phone.phone_number or "").startswith("pending"):
+        return False
+    phone.phone_number = f"pending_{phone.session_name}"
+    return True
+
+
+async def link_phone_number(db: Session, phone: Phone, me: dict | None = None,
+                            allow_absorb: bool = True) -> bool:
+    """Store the number of the WhatsApp account actually linked to the session.
+
+    Called whenever the session is WORKING (right after a QR scan, on restarts),
+    so a re-scan with a different phone updates the record. Another phone row
+    already holding that number is merged into this one (admin/system only).
+    """
+    from app.api.webhooks import logger
+    if me is None:
+        me = await WAHAService.from_phone(phone).get_me()
+    number = _number_from_me(me)
+    if not number or number == phone.phone_number:
+        return False
+    conflict = db.query(Phone).filter(Phone.phone_number == number, Phone.id != phone.id).first()
+    if conflict:
+        if not allow_absorb:
+            return False
+        logger.info("Phone %s now owns number %s; merging stale phone record %s",
+                    phone.id, number, conflict.id)
+        await _absorb_conflicting_phone(db, conflict, phone.id)
+    phone.phone_number = number
+    return True
+
+
 @router.get("/{phone_id}/status")
 async def get_status(
     phone_id: int,
@@ -97,26 +138,21 @@ async def get_status(
         status = "OFFLINE"
     phone.waha_status = status
 
-    # Auto-resolve stale "pending_*" placeholder when WAHA is connected.
-    # This can delete another phone record, so only admins trigger it.
-    if status == "WORKING" and is_admin(agent) and str(phone.phone_number or "").startswith("pending"):
-        try:
-            me = await waha.get_me()
-            number = me.get("id", "").split("@")[0] if me.get("id") else ""
-            if number:
-                conflict = db.query(Phone).filter(
-                    Phone.phone_number == number, Phone.id != phone.id
-                ).first()
-                if conflict:
-                    await _absorb_conflicting_phone(db, conflict, phone.id)
-                phone.phone_number = number
-        except Exception as exc:
-            from app.api.webhooks import logger
-            logger.warning("Failed to resolve conflict phone during get_status: %s", exc)
-            db.rollback()
-            phone = db.query(Phone).filter(Phone.id == phone_id).first()
-            if phone:
-                phone.waha_status = status
+    # Keep the stored number in step with the account actually linked to the
+    # session: set it once WORKING (after a QR scan), clear it when the session
+    # needs a new scan. Merging another phone record is admin-only.
+    try:
+        if status == "WORKING":
+            await link_phone_number(db, phone, allow_absorb=is_admin(agent))
+        elif status == "SCAN_QR_CODE":
+            unlink_phone_number(phone)
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to sync linked number for phone %s: %s", phone.session_name, exc)
+        db.rollback()
+        phone = db.query(Phone).filter(Phone.id == phone_id).first()
+        if phone:
+            phone.waha_status = status
 
     try:
         db.commit()
@@ -179,6 +215,7 @@ async def logout_session(
         logger.warning("Failed to logout WAHA session %s: %s", phone.session_name, exc)
         ok = False
     phone.waha_status = "STOPPED"
+    unlink_phone_number(phone)   # the account is no longer linked
     db.commit()
     from app.core.ws_manager import ws_manager
     await ws_manager.broadcast("phone_status_changed", {"phone_id": phone.id, "status": "STOPPED"})
@@ -302,20 +339,11 @@ async def sync_phone_number(
     phone = _get_phone(db, phone_id, agent)
     waha = WAHAService.from_phone(phone)
     try:
-        me = await waha.get_me()
-        number = me.get("id", "").split("@")[0] if me.get("id") else ""
-        if number:
-            conflict = db.query(Phone).filter(
-                Phone.phone_number == number, Phone.id != phone_id,
-            ).first()
-            if conflict:
-                logger.info(
-                    "Removing stale phone record %s (session=%s) — number %s now claimed by phone %s",
-                    conflict.id, conflict.session_name, number, phone_id,
-                )
-                await _absorb_conflicting_phone(db, conflict, phone_id)
-            phone.phone_number = number
         status = await waha.get_session_status()
+        if status == "WORKING":
+            await link_phone_number(db, phone)
+        elif status == "SCAN_QR_CODE":
+            unlink_phone_number(phone)
         phone.waha_status = status
         db.commit()
     except Exception as exc:

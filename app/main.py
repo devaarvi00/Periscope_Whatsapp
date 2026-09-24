@@ -300,11 +300,16 @@ if _FRONTEND.is_dir():
     app.mount("/static", StaticFiles(directory=str(_FRONTEND)), name="static")
 
 
+# index.html must always be revalidated so browsers pick up new ?v= asset URLs
+# after a deploy; the versioned /static assets themselves can be cached.
+_INDEX_HEADERS = {"Cache-Control": "no-cache, must-revalidate"}
+
+
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
     index = _FRONTEND / "index.html"
     if index.exists():
-        return FileResponse(str(index))
+        return FileResponse(str(index), headers=_INDEX_HEADERS)
     return {"message": "Hyperscope WhatsApp CRM API", "docs": "/docs"}
 
 
@@ -312,6 +317,6 @@ async def serve_frontend():
 async def spa_fallback(path: str):
     index = _FRONTEND / "index.html"
     if index.exists() and not path.startswith("api/"):
-        return FileResponse(str(index))
+        return FileResponse(str(index), headers=_INDEX_HEADERS)
     from fastapi import HTTPException
     raise HTTPException(404, "Not found")
