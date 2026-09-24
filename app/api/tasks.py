@@ -157,17 +157,32 @@ async def update_task(
                 raise HTTPException(400, f"Invalid {field}")
     if "reminder_at" in changes:
         task.reminder_sent = False   # re-arm the reminder when time changes
+    prev_assignee, prev_due = task.assigned_to, task.due_date
     for k, v in changes.items():
         if hasattr(task, k):
             setattr(task, k, v)
     if changes.get("status") == "done" and not task.completed_at:
         task.completed_at = datetime.utcnow()
+    # Re-arm the one-shot overdue notification when the deadline moves out
+    # (or is cleared), or when a new assignee takes over.
+    if task.due_date != prev_due and (task.due_date is None or task.due_date > datetime.utcnow()):
+        task.overdue_notified_at = None
+    if task.assigned_to != prev_assignee:
+        task.overdue_notified_at = None
     db.commit()
     db.refresh(task)
     log_activity(
         db, "task_updated", entity_type="task", entity_id=task.id,
         agent_id=agent.id, description=f"Task '{task.title}' updated: {', '.join(changes.keys())}",
     )
+    # Notify on an actual reassignment, never for self-assignment
+    if task.assigned_to and task.assigned_to != prev_assignee and task.assigned_to != agent.id:
+        from app.core.ws_manager import ws_manager
+        await ws_manager.send_to_agent(task.assigned_to, "task_assigned", {
+            "task_id": task.id, "title": task.title,
+            "by": agent.name, "priority": task.priority,
+            "due_date": task.due_date.isoformat() if task.due_date else None,
+        })
     return _serialize(task, _agent_names(db))
 
 

@@ -55,6 +55,7 @@ class TicketService:
         # None is meaningful for nullable fields: assigned_to=None unassigns,
         # due_date=None clears the deadline.
         nullable = {"assigned_to", "due_date"}
+        prev_due, prev_assignee = ticket.due_date, ticket.assigned_to
         for k, v in kwargs.items():
             if not hasattr(ticket, k):
                 continue
@@ -63,6 +64,12 @@ class TicketService:
             setattr(ticket, k, v)
         if kwargs.get("status") in (TicketStatus.RESOLVED, TicketStatus.CLOSED):
             ticket.resolved_at = datetime.utcnow()
+        # Re-arm the one-shot overdue notification when the deadline moves out
+        # (or is cleared), or when a new assignee takes over.
+        if ticket.due_date != prev_due and (ticket.due_date is None or ticket.due_date > datetime.utcnow()):
+            ticket.overdue_notified_at = None
+        if ticket.assigned_to != prev_assignee:
+            ticket.overdue_notified_at = None
         self.db.commit()
         self.db.refresh(ticket)
         return ticket

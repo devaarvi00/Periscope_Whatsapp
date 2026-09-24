@@ -113,7 +113,7 @@ async def update_ticket(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    await _get_accessible_ticket(db, agent, ticket_id)
+    prev_assignee = (await _get_accessible_ticket(db, agent, ticket_id)).assigned_to
     # exclude_unset: only fields the client sent; "assigned_to": null unassigns
     changes = req.model_dump(exclude_unset=True)
     from app.models.ticket import TicketPriority, TicketStatus
@@ -135,8 +135,9 @@ async def update_ticket(
     background.add_task(fire_trigger, "ticket_updated", _trigger_context(ticket))
     from app.services.webhook_dispatcher import dispatch_event
     background.add_task(dispatch_event, "ticket.updated", _trigger_context(ticket))
-    if changes.get("assigned_to") and changes["assigned_to"] != agent.id:
-        background.add_task(_notify_assignee, changes["assigned_to"], {
+    # Only on an actual reassignment, and never for self-assignment
+    if ticket.assigned_to and ticket.assigned_to != prev_assignee and ticket.assigned_to != agent.id:
+        background.add_task(_notify_assignee, ticket.assigned_to, {
             "ticket_id": ticket.id, "title": ticket.title,
             "by": agent.name,
             "priority": ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority),
