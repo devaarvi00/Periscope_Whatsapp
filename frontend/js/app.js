@@ -18,12 +18,48 @@ const State = {
 // ── Utils ──────────────────────────────────────────────────────── //
 function esc(s) {
   if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
+
+// Only allow hex colors into style attributes (label colors are user-controlled)
+const SAFE_COLOR_RE = /^#[0-9a-fA-F]{3,8}$/;
+function safeColor(c, fallback = '#9ca3af') {
+  return esc(typeof c === 'string' && SAFE_COLOR_RE.test(c) ? c : fallback);
+}
+
+// Only allow inline image data URLs (WAHA QR codes) into img src
+function safeImgSrc(src) {
+  return typeof src === 'string' && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=\s]+$/.test(src) ? src : '';
+}
+
+// Server datetimes are naive UTC (no Z / offset) — parse them as UTC
+function parseServerDate(ts) {
+  if (ts == null || ts === '') return null;
+  if (ts instanceof Date) return ts;
+  if (typeof ts === 'number') return new Date(ts * 1000);
+  let s = String(ts);
+  if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) s = s.replace(' ', 'T') + 'Z';
+  return new Date(s);
+}
+
+// Local datetime-local input value → ISO UTC string (or null when empty)
+function localInputToIso(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+// CSV cell: neutralize spreadsheet formulas and quote properly
+function csvCell(v) {
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+function csvRow(cells) { return cells.map(csvCell).join(','); }
 
 function timeAgo(ts) {
   if (!ts) return '';
-  const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  const d = parseServerDate(ts);
   const diff = Date.now() - d.getTime();
   if (diff < 60000) return 'now';
   if (diff < 3600000) return Math.floor(diff/60000) + 'm';
@@ -33,7 +69,7 @@ function timeAgo(ts) {
 
 function fmt(ts) {
   if (!ts) return '';
-  const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  const d = parseServerDate(ts);
   return d.toLocaleTimeString('en', {hour:'2-digit', minute:'2-digit'});
 }
 
@@ -102,7 +138,7 @@ function openLabelPicker(anchorEl, opts) {
     el.querySelector('.lp-list').innerHTML =
       matches.map(l => `
         <div class="lp-row" data-lid="${l.id}">
-          <span class="lp-dot" style="background:${l.color}"></span>
+          <span class="lp-dot" style="background:${safeColor(l.color)}"></span>
           <span style="flex:1">${esc(l.name)}</span>
           ${opts.applied.has(l.id) ? '<span style="color:var(--accent)">✓</span>' : ''}
         </div>`).join('') +
@@ -393,7 +429,7 @@ function navigateTo(view) {
     el.classList.toggle('active', el.dataset.view === view);
   });
   const bc = document.getElementById('app-breadcrumb');
-  if (bc) bc.innerHTML = `<strong>${VIEW_LABELS[view] || view}</strong>`;
+  if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS[view] || view)}</strong>`;
   const main = document.getElementById('main-content');
   main.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
   ({
@@ -543,7 +579,7 @@ function handleWSEvent(data) {
   }
 
   if (event === 'note_mention') {
-    toast(`📝 ${esc(d.by)} mentioned you in ${esc(displayName(d.chat_name))}`, 'default');
+    toast(`📝 ${d.by} mentioned you in ${displayName(d.chat_name)}`, 'default');
     if (typeof notifyUser === 'function') {
       notifyUser('new_note', `${d.by} mentioned you`, d.content || '');
     }
@@ -551,19 +587,19 @@ function handleWSEvent(data) {
   }
 
   if (event === 'ticket_assigned') {
-    toast(`🎫 ${esc(d.by)} assigned you ticket #${d.ticket_id}: ${esc(d.title)}`, 'default');
+    toast(`🎫 ${d.by} assigned you ticket #${d.ticket_id}: ${d.title}`, 'default');
     if (typeof notifyUser === 'function') notifyUser('ticket_assign', 'Ticket assigned to you', d.title || '');
     return;
   }
 
   if (event === 'task_assigned') {
-    toast(`✅ ${esc(d.by)} assigned you a task: ${esc(d.title)}`, 'default');
+    toast(`✅ ${d.by} assigned you a task: ${d.title}`, 'default');
     if (typeof notifyUser === 'function') notifyUser('task_assign', 'Task assigned to you', d.title || '');
     return;
   }
 
   if (event === 'task_reminder') {
-    toast(`⏰ Task reminder: ${esc(d.title)}`, 'default');
+    toast(`⏰ Task reminder: ${d.title}`, 'default');
     if (typeof notifyUser === 'function') notifyUser('task_assign', '⏰ Task reminder', d.title || '');
     return;
   }
@@ -943,7 +979,7 @@ function renderChatList(chats, hasMore) {
     if (c.labels && c.labels.length) {
       labelsHtml = `<div class="chat-item-labels">${c.labels.slice(0,4).map(lbl => {
         const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
-        const color2 = labelObj ? labelObj.color : '#9ca3af';
+        const color2 = safeColor(labelObj?.color);
         const name = labelObj ? labelObj.name : (lbl || '');
         return `<span class="chat-label-mini" style="background:${color2}22;color:${color2};border:1px solid ${color2}44">${esc(name)}</span>`;
       }).join('')}</div>`;
@@ -1039,7 +1075,7 @@ async function renderContactDetail(chat) {
   // Build label chips
   const labelsMarkup = chatLabels.map(lbl => {
     const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
-    const lColor = labelObj ? labelObj.color : '#9ca3af';
+    const lColor = safeColor(labelObj?.color);
     const lName = labelObj ? labelObj.name : String(lbl);
     return `<span class="detail-label-chip" style="background:${lColor}22;color:${lColor};border:1px solid ${lColor}44" data-label="${esc(lbl)}">
       ${esc(lName)}<span class="chip-remove" data-remove-label="${esc(lbl)}">×</span>
@@ -1113,7 +1149,7 @@ async function renderContactDetail(chat) {
     <div class="detail-section">
       <div class="detail-section-label">Status</div>
       <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
-        <span class="${pillClass(chat.status||'open')}" style="font-size:11px">${chat.status||'open'}</span>
+        <span class="${pillClass(chat.status||'open')}" style="font-size:11px">${esc(chat.status||'open')}</span>
         ${chat.ai_active ? '<span class="ai-badge" style="font-size:10px">AI Active</span>' : ''}
         ${chat.is_flagged ? '<span style="font-size:10px;font-weight:600;background:#fffbeb;color:#d97706;border:1px solid #fde68a;border-radius:10px;padding:1px 7px">Flagged</span>' : ''}
       </div>
@@ -1887,7 +1923,7 @@ async function showTicketModal(opts) {
   const labelOpts = State.labels.map(l =>
     `<label style="display:flex;align-items:center;gap:.35rem;font-size:12.5px;font-weight:400;padding:.12rem 0">
       <input type="checkbox" class="tk-label" value="${l.id}">
-      <span class="lp-dot" style="width:9px;height:9px;border-radius:3px;background:${l.color};display:inline-block"></span>${esc(l.name)}
+      <span class="lp-dot" style="width:9px;height:9px;border-radius:3px;background:${safeColor(l.color)};display:inline-block"></span>${esc(l.name)}
     </label>`).join('');
 
   const propFields = defs.map(d => {
@@ -2096,8 +2132,8 @@ async function loadTickets(status = '') {
       <tr>
         <td style="color:var(--text-3);font-size:12px">#${t.id}</td>
         <td><a href="#" class="ticket-link text-accent" data-tid="${t.id}" style="font-weight:600">${esc(t.title)}</a></td>
-        <td><span class="${pillClass(t.status)}">${t.status?.replace('_',' ')}</span></td>
-        <td><span class="${pillClass(t.priority)}">${t.priority}</span></td>
+        <td><span class="${pillClass(t.status)}">${esc(t.status?.replace('_',' '))}</span></td>
+        <td><span class="${pillClass(t.priority)}">${esc(t.priority)}</span></td>
         <td style="font-size:12px;color:var(--text-3)">${t.assigned_to ? esc(agentMap[t.assigned_to] || 'Agent #'+t.assigned_to) : '—'}</td>
         <td style="font-size:12px;color:var(--text-3)">${t.due_date ? new Date(t.due_date).toLocaleDateString() : '—'}</td>
         <td>${t.sla_breached ? '<span class="pill" style="background:#FEF2F2;color:#DC2626">Breached</span>' : '<span class="pill" style="background:var(--success-bg);color:var(--success)">OK</span>'}</td>
@@ -2796,7 +2832,7 @@ async function loadBulkTab(tab) {
         <thead><tr><th>Name</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Repeat</th><th>Runs</th><th>Next / Scheduled</th><th></th></tr></thead>
         <tbody>${jobs.map(j => `<tr>
           <td style="font-weight:600">${esc(j.name)}</td>
-          <td><span class="${pillClass(j.status==='done'?'resolved':j.status==='running'?'in_progress':j.status==='failed'||j.status==='cancelled'?'urgent':'open')}">${j.status}</span>${j.error_message ? ` <span title="${esc(j.error_message)}">⚠️</span>` : ''}</td>
+          <td><span class="${pillClass(j.status==='done'?'resolved':j.status==='running'?'in_progress':j.status==='failed'||j.status==='cancelled'?'urgent':'open')}">${esc(j.status)}</span>${j.error_message ? ` <span title="${esc(j.error_message)}">⚠️</span>` : ''}</td>
           <td>${(j.recipient_chat_ids||[]).length}</td>
           <td>${j.sent_count||0}</td>
           <td>${j.failed_count||0}</td>
@@ -2929,7 +2965,7 @@ async function showBulkLogs(jobId) {
         <thead><tr><th>Chat</th><th>Status</th><th>Run</th><th>Time</th><th>Remarks</th></tr></thead>
         <tbody>${res.logs.map(r => `<tr>
           <td>${esc(displayName(r.chat_name) || ('#' + (r.chat_id || '?')))}</td>
-          <td><span class="${pillClass(r.status === 'sent' ? 'resolved' : 'urgent')}">${r.status}</span></td>
+          <td><span class="${pillClass(r.status === 'sent' ? 'resolved' : 'urgent')}">${esc(r.status)}</span></td>
           <td>${r.run}</td>
           <td style="font-size:11.5px;color:var(--text-3)">${r.at ? new Date(r.at).toLocaleString() : ''}</td>
           <td style="font-size:11.5px;color:var(--text-3)">${esc(r.error || '—')}</td>
@@ -2943,7 +2979,7 @@ async function showBulkLogs(jobId) {
     document.getElementById('modal-title').textContent = `Logs — ${res.job.name}`;
     document.getElementById('bl-export').addEventListener('click', () => {
       const csv = ['chat,status,run,time,error'].concat(res.logs.map(r =>
-        `"${(r.chat_name || '').replace(/"/g, '""')}",${r.status},${r.run},${r.at || ''},"${(r.error || '').replace(/"/g, '""')}"`)).join('\n');
+        csvRow([r.chat_name || '', r.status, r.run, r.at || '', r.error || '']))).join('\n');
       const a = document.createElement('a');
       a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
       a.download = `campaign_${jobId}_logs.csv`;
@@ -3296,7 +3332,7 @@ async function loadSettingsTab(tab) {
                     <h4 style="margin:0;font-size:14px;font-weight:600">${esc(p.name)}</h4>
                     <span style="font-size:11px;color:var(--text-3);font-family:monospace">session: ${esc(p.session_name)}</span>
                   </div>
-                  <span class="pill" style="background:${statusBg};color:${statusColor};border:1px solid ${statusColor}33;padding:1px 6px;font-size:10px">${statusText}</span>
+                  <span class="pill" style="background:${statusBg};color:${statusColor};border:1px solid ${statusColor}33;padding:1px 6px;font-size:10px">${esc(statusText)}</span>
                 </div>
                 
                 <div style="margin-bottom:0.75rem">
@@ -3343,7 +3379,7 @@ async function loadSettingsTab(tab) {
             const r = await Api.phones.qr(phoneId);
             if (r && r.qr) {
               area.innerHTML = `
-                <img src="${r.qr}" style="max-width:200px;border-radius:8px;border:1px solid var(--border);display:block;margin:0 auto">
+                <img src="${safeImgSrc(r.qr)}" style="max-width:200px;border-radius:8px;border:1px solid var(--border);display:block;margin:0 auto">
                 <p style="font-size:11px;color:var(--text-2);margin:.6rem 0 0;text-align:center">Open WhatsApp → Linked Devices → Link a Device → Scan</p>`;
               if (!_syncTimer) {
                 _syncTimer = setInterval(async () => {
@@ -3486,7 +3522,7 @@ async function loadSettingsTab(tab) {
                 ${lbls.map(l => `
                   <tr>
                     <td>
-                      <div style="width:18px;height:18px;border-radius:4px;background:${esc(l.color)};border:1px solid rgba(0,0,0,0.15)"></div>
+                      <div style="width:18px;height:18px;border-radius:4px;background:${safeColor(l.color)};border:1px solid rgba(0,0,0,0.15)"></div>
                     </td>
                     <td style="font-weight:600;font-size:13.5px;color:var(--text)">${esc(l.name)}</td>
                     <td style="text-align: right;">
@@ -3602,7 +3638,7 @@ async function loadSettingsTab(tab) {
             <div class="agent-avatar" style="background:${avatarColor(a.name)};width:32px;height:32px;font-size:12px">${initials(a.name)}</div>
             <div style="flex:1">
               <div style="font-weight:600;font-size:13px">${esc(a.name)}</div>
-              <div style="font-size:11px;color:var(--text-3)">${esc(a.email)} · ${a.role}</div>
+              <div style="font-size:11px;color:var(--text-3)">${esc(a.email)} · ${esc(a.role)}</div>
             </div>
             <span class="pill ${a.is_active ? 'pill-resolved' : 'pill-closed'}">${a.is_active ? 'Active' : 'Inactive'}</span>
             <button class="btn btn-secondary btn-sm agent-numbers" data-aid="${a.id}" data-name="${esc(a.name)}">Numbers</button>
@@ -3838,7 +3874,7 @@ async function _updateDashWaha(phoneId) {
         const boxNow = document.getElementById('dash-waha-box');
         const lblNow = document.getElementById('dash-waha-label');
         if (qrData && qrData.qr && boxNow) {
-          boxNow.innerHTML = `<img src="${qrData.qr}" style="width:100%;height:100%;display:block;object-fit:contain;" alt="WhatsApp QR">`;
+          boxNow.innerHTML = `<img src="${safeImgSrc(qrData.qr)}" style="width:100%;height:100%;display:block;object-fit:contain;" alt="WhatsApp QR">`;
           if (lblNow) lblNow.innerHTML = `Scan to connect WhatsApp<br><span style="font-size:11px;color:var(--text-3)">Settings → Linked Devices → Link a Device</span>`;
         }
       } catch(_) {}
@@ -3872,7 +3908,7 @@ async function _updateDashWaha(phoneId) {
           <div style="width:64px;height:64px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center">
             <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
           </div>
-          <span style="font-size:12px;color:var(--text-3)">${status}</span>
+          <span style="font-size:12px;color:var(--text-3)">${esc(status)}</span>
         </div>`;
         label.innerHTML = `Unknown state`;
         actions.innerHTML = `<button class="btn btn-secondary btn-sm" id="dash-btn-start">Start Session</button>`;
@@ -3924,7 +3960,7 @@ async function _dashShowQR(phoneId) {
         const b = document.getElementById('dash-waha-box');
         const l = document.getElementById('dash-waha-label');
         const a = document.getElementById('dash-waha-actions');
-        if (b) b.innerHTML = `<img src="${r.qr}" style="width:100%;height:100%;object-fit:contain;display:block" alt="QR">`;
+        if (b) b.innerHTML = `<img src="${safeImgSrc(r.qr)}" style="width:100%;height:100%;object-fit:contain;display:block" alt="QR">`;
         if (l) l.innerHTML = `Scan with WhatsApp<br><span style="font-size:11px;color:var(--text-3)">Settings → Linked Devices → Link a Device</span>`;
         if (a) {
           a.innerHTML = `<button class="btn btn-danger btn-sm" id="dash-btn-cancel-qr">Cancel</button>`;
@@ -4259,7 +4295,7 @@ async function showGroupAnalytics(gid, name) {
         <div class="stat-mini"><div class="stat-mini-num">${a.outgoing}</div><div class="stat-mini-label">Outgoing</div></div>
       </div>
       <div style="display:flex;align-items:flex-end;gap:2px;height:60px;margin-bottom:1rem">
-        ${a.daily_volume.map(d => `<div title="${d.date}: ${d.count}" style="flex:1;background:var(--accent);opacity:.75;border-radius:2px 2px 0 0;height:${Math.max(4, Math.round(d.count / maxDay * 60))}px"></div>`).join('') || '<span class="text-muted">No activity</span>'}
+        ${a.daily_volume.map(d => `<div title="${esc(d.date)}: ${+d.count || 0}" style="flex:1;background:var(--accent);opacity:.75;border-radius:2px 2px 0 0;height:${Math.max(4, Math.round(d.count / maxDay * 60))}px"></div>`).join('') || '<span class="text-muted">No activity</span>'}
       </div>
       <p style="font-size:12px;font-weight:600;margin-bottom:.35rem">Top senders</p>
       <div class="table-wrap" style="max-height:200px;overflow-y:auto"><table class="data-table">
@@ -4301,7 +4337,7 @@ async function loadScheduled() {
         <td style="font-size:12px">${new Date(m.send_at).toLocaleString()}</td>
         <td style="font-size:12px">${esc(m.repeat_summary || (m.repeat === 'none' ? 'Once' : m.repeat))}</td>
         <td style="font-size:12px;color:var(--text-3)">${m.end_date ? new Date(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
-        <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${m.status}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
+        <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${esc(m.status)}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
         <td>${m.sent_count}</td>
         <td style="white-space:nowrap;text-align:right">${m.status === 'pending' ? `
           <button class="btn btn-secondary btn-sm sched-edit" data-sid="${m.id}">Edit</button>
@@ -4629,7 +4665,9 @@ async function renderChatListView() {
           <td style="font-weight:600">${esc(displayName(c))}</td>
           <td>${(c.labels || []).map(id => {
             const l = State.labels.find(x => x.id === id);
-            return l ? `<span class="chat-label-mini" style="background:${l.color}22;color:${l.color};border:1px solid ${l.color}44">${esc(l.name)}</span>` : '';
+            if (!l) return '';
+            const lc = safeColor(l.color);
+            return `<span class="chat-label-mini" style="background:${lc}22;color:${lc};border:1px solid ${lc}44">${esc(l.name)}</span>`;
           }).join(' ') || '<span class="text-muted" style="font-size:11px">—</span>'}</td>
           <td style="font-size:12.5px">${agentNames[c.assigned_to] ? esc(agentNames[c.assigned_to]) : '<span class="text-muted">Unassigned</span>'}</td>
           <td style="font-size:12px;color:var(--text-3)">${c.last_message_at ? timeAgo(c.last_message_at) : '—'}</td>
@@ -4728,15 +4766,15 @@ async function renderChatListView() {
   document.getElementById('bt-export').addEventListener('click', () => {
     const picked = rows.filter(c => selected.has(c.id));
     const header = ['id', 'name', 'type', 'labels', 'unread', 'flagged', 'last_active'];
-    const csv = [header.join(',')].concat(picked.map(c => [
+    const csv = [header.join(',')].concat(picked.map(c => csvRow([
       c.id,
-      '"' + displayName(c).replace(/"/g, '""') + '"',
+      displayName(c),
       c.is_group ? 'group' : 'user',
-      '"' + (c.labels || []).map(id => State.labels.find(l => l.id === id)?.name || id).join('; ') + '"',
+      (c.labels || []).map(id => State.labels.find(l => l.id === id)?.name || id).join('; '),
       c.unread_count || 0,
       c.is_flagged ? 'yes' : 'no',
       c.last_message_at || '',
-    ].join(','))).join('\n');
+    ]))).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = 'chat_list.csv';
