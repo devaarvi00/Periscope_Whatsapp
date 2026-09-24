@@ -43,6 +43,7 @@ def _serialize_chat(doc: dict) -> dict:
         "ai_active": bool(doc.get("ai_active")),
         "ai_state": doc.get("ai_state") or "INACTIVE",
         "ai_snoozed_at": doc.get("ai_snoozed_at"),
+        "ai_flagging": doc.get("ai_flagging") is not False,
         "assigned_to": doc.get("assigned_to"),
         "status": doc.get("status") or "open",
         "last_message_from_me": doc.get("last_message_from_me"),
@@ -213,7 +214,7 @@ class MongoInboxService:
     async def update_chat(self, chat_id: int, **kwargs: Any) -> dict | None:
         allowed = {
             "name", "is_archived", "is_pinned", "is_flagged",
-            "ai_active", "ai_state", "ai_snoozed_at",
+            "ai_active", "ai_state", "ai_snoozed_at", "ai_flagging",
             "assigned_to", "unread_count", "last_message", "last_message_at",
             "custom_properties", "status", "picture_url", "picture_checked_at",
         }

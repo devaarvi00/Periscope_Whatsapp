@@ -106,6 +106,12 @@ async def update_chat(
             description=f"Chat '{prev.get('name')}' marked {updates['status']}",
         )
 
+    if "ai_flagging" in updates and updates["ai_flagging"] != (prev.get("ai_flagging") is not False):
+        log_activity(
+            db, "chat_ai_flagging", entity_type="chat", entity_id=chat_id, agent_id=agent.id,
+            description=f"AI flagging {'allowed' if updates['ai_flagging'] else 'turned off'} for '{prev.get('name')}'",
+        )
+
     if "assigned_to" in updates and updates["assigned_to"] is None and prev_assigned is not None:
         log_activity(
             db, "chat_unassigned", entity_type="chat", entity_id=chat_id,
@@ -179,6 +185,31 @@ async def chat_activity(
         "agent_name": names.get(r.agent_id, "") if r.agent_id else "",
         "created_at": r.created_at.isoformat() if r.created_at else None,
     } for r in rows]
+
+
+@router.get("/chats/{chat_id}/team")
+async def chat_team(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Active agents who can open this chat (admins, unrestricted agents and
+    agents granted its number), with live online state."""
+    from app.core.ws_manager import ws_manager
+    from app.models.agent_phone import AgentPhone
+    chat = await get_accessible_chat(db, agent, chat_id)
+    phone_id = chat.get("phone_id")
+    grants: dict[int, set[int]] = {}
+    for aid, pid in db.query(AgentPhone.agent_id, AgentPhone.phone_id).all():
+        grants.setdefault(aid, set()).add(pid)
+    online = ws_manager.online_agent_ids()
+    out = []
+    for a in db.query(Agent).filter(Agent.is_active.is_(True)).order_by(Agent.name).all():
+        role = getattr(a.role, "value", a.role)
+        if role != "admin" and a.id in grants and phone_id not in grants[a.id]:
+            continue
+        out.append({"id": a.id, "name": a.name, "role": role, "online": a.id in online})
+    return out
 
 
 @router.get("/chats/{chat_id}/picture")
