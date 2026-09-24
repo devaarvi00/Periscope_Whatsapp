@@ -153,9 +153,9 @@ async def group_analytics(
     daily message volume, top senders, in/out split.
 
     Window: `from`/`to` (ISO date or datetime, UTC) or the last `days` days.
-    Reactions and joins/exits come from webhook events stored in
-    `group_events`; a metric is null (not tracked) until the first such
-    event has ever been stored for this number.
+    Reactions come from `message_reactions`, joins/exits from `group_events`
+    (both filled by WAHA webhooks); a metric is null (not tracked) until
+    that feed has stored anything for this number.
     """
     inbox = MongoInboxService()
     chat = await get_accessible_chat(db, agent, chat_id)
@@ -198,18 +198,16 @@ async def group_analytics(
         for d in sender_docs
     ]
 
-    phone_id, wid = chat["phone_id"], chat["chat_wid"]
-
-    async def _event_metric(etype: str, family: list[str]):
-        tracked_since = await inbox.group_event_tracking_since(phone_id, family)
-        if tracked_since is None:
-            return None, None
-        n = await inbox.count_group_events(phone_id, wid, etype, since, until)
-        return n, tracked_since.isoformat()
-
-    reactions, reactions_since = await _event_metric("reaction", ["reaction"])
-    joined, members_since = await _event_metric("join", ["join", "leave"])
-    exited, _ = await _event_metric("leave", ["join", "leave"])
+    phone_id = chat["phone_id"]
+    reactions_since = await inbox.tracking_since("message_reactions", phone_id)
+    members_since = await inbox.tracking_since("group_events", phone_id)
+    reactions = await inbox.count_reactions(chat_id, since, until) if reactions_since else None
+    joined = left = removed = exited = None
+    if members_since:
+        joined = await inbox.count_group_events(chat_id, ["join", "add"], since, until)
+        left = await inbox.count_group_events(chat_id, ["leave"], since, until)
+        removed = await inbox.count_group_events(chat_id, ["remove"], since, until)
+        exited = left + removed
 
     return {
         "group": chat.get("name") or "",
@@ -222,9 +220,14 @@ async def group_analytics(
         "messages": total,
         "reactions": reactions,
         "members_joined": joined,
-        "members_exited": exited,
+        "members_exited": exited,       # left + removed
+        "members_left": left,
+        "members_removed": removed,
         # When each event feed started (null = never received on this number)
-        "tracked_since": {"reactions": reactions_since, "members": members_since},
+        "tracked_since": {
+            "reactions": reactions_since.isoformat() if reactions_since else None,
+            "members": members_since.isoformat() if members_since else None,
+        },
         "daily_volume": daily,
         "top_senders": top_senders,
     }

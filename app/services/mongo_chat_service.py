@@ -47,7 +47,10 @@ def _serialize_chat(doc: dict) -> dict:
         "status": doc.get("status") or "open",
         "last_message_from_me": doc.get("last_message_from_me"),
         "labels": doc.get("label_ids") or [],
+        "last_message_type": doc.get("last_message_type") or "",
+        "last_message_sender": doc.get("last_message_sender") or "",
         "picture_url": doc.get("picture_url") or None,
+        "picture_checked": doc.get("picture_checked_at") is not None,
         "created_at": _iso(doc.get("created_at")),
     }
 
@@ -353,6 +356,7 @@ class MongoInboxService:
             data.get("message_type") or "text",
             ts,
             bool(data.get("from_me")),
+            data.get("sender_name") or data.get("sender_number") or "",
         )
         return doc
 
@@ -365,6 +369,7 @@ class MongoInboxService:
         message_type: str,
         ts: datetime,
         from_me: bool | None = None,
+        sender: str | None = None,
     ) -> None:
         preview = body[:200] if body else _MEDIA_LABELS.get(message_type, "📎 Media")
         filt: dict = {"id": chat_id} if chat_id else {"chat_wid": chat_wid, "phone_id": phone_id}
@@ -376,6 +381,10 @@ class MongoInboxService:
         fields: dict = {"last_message": preview, "last_message_at": ts, "updated_at": datetime.utcnow()}
         if from_me is not None:
             fields["last_message_from_me"] = from_me
+        fields["last_message_type"] = (message_type or "text").lower()
+        if sender is not None:
+            # "Mrs:" prefix in the chat list for group previews
+            fields["last_message_sender"] = str(sender)[:80]
         await self.db.chats.update_one(filt, {"$set": fields})
 
     async def get_messages(
@@ -484,24 +493,30 @@ class MongoInboxService:
             .to_list(length=limit)
         )
 
-    # ── Group / reaction events ─────────────────────────────────────────── #
+    # ── Group events & reactions ────────────────────────────────────────── #
+    # Shared storage format (also read by the analytics charts):
+    #   group_events:      {phone_id, chat_id, chat_wid, type, participant,
+    #                       actor, timestamp, source_event_id}
+    #                      type ∈ join|add|leave|remove|promote|demote
+    #   message_reactions: {phone_id, chat_id, message_wid, reactor, emoji,
+    #                       timestamp, from_me} — one live reaction per reactor
+
+    GROUP_EVENT_TYPES = ("join", "add", "leave", "remove", "promote", "demote")
 
     async def add_group_event(self, data: dict[str, Any]) -> bool:
-        """Store one reaction / join / leave event. Returns False on duplicate.
-
-        `event_key` makes webhook retries idempotent (unique per phone).
-        """
+        """Store one participant event. Returns False when source_event_id
+        was already stored (webhook retry)."""
+        if data["type"] not in self.GROUP_EVENT_TYPES:
+            raise ValueError(f"unknown group event type {data['type']!r}")
         doc = {
             "phone_id": data["phone_id"],
-            "chat_id": data.get("chat_id"),
+            "chat_id": data["chat_id"],
             "chat_wid": data.get("chat_wid") or "",
-            "type": data["type"],                # reaction | join | leave
-            "event_key": data["event_key"],
+            "type": data["type"],
             "participant": data.get("participant") or "",
-            "emoji": data.get("emoji") or "",
-            "message_wid": data.get("message_wid") or "",
+            "actor": data.get("actor") or None,
             "timestamp": data.get("timestamp") or datetime.utcnow(),
-            "created_at": datetime.utcnow(),
+            "source_event_id": data.get("source_event_id") or None,
         }
         try:
             await self.db.group_events.insert_one(doc)
@@ -509,18 +524,40 @@ class MongoInboxService:
             return False
         return True
 
-    async def count_group_events(self, phone_id: int, chat_wid: str, etype: str,
+    async def set_reaction(self, data: dict[str, Any]) -> None:
+        """Upsert a reactor's reaction on a message; an empty emoji removes it."""
+        key = {
+            "phone_id": data["phone_id"],
+            "message_wid": data["message_wid"],
+            "reactor": data["reactor"],
+        }
+        emoji = data.get("emoji") or ""
+        if not emoji:
+            await self.db.message_reactions.delete_one(key)
+            return
+        await self.db.message_reactions.update_one(key, {"$set": {
+            "chat_id": data["chat_id"],
+            "emoji": emoji,
+            "timestamp": data.get("timestamp") or datetime.utcnow(),
+            "from_me": bool(data.get("from_me")),
+        }}, upsert=True)
+
+    async def count_group_events(self, chat_id: int, etypes: list[str],
                                  since: datetime, until: datetime) -> int:
         return await self.db.group_events.count_documents({
-            "phone_id": phone_id, "chat_wid": chat_wid, "type": etype,
+            "chat_id": chat_id, "type": {"$in": etypes},
             "timestamp": {"$gte": since, "$lt": until},
         })
 
-    async def group_event_tracking_since(self, phone_id: int, etypes: list[str]) -> datetime | None:
-        """Earliest stored event of these types on this number (None = never tracked)."""
-        doc = await self.db.group_events.find_one(
-            {"phone_id": phone_id, "type": {"$in": etypes}},
-            {"timestamp": 1}, sort=[("timestamp", 1)],
+    async def count_reactions(self, chat_id: int, since: datetime, until: datetime) -> int:
+        return await self.db.message_reactions.count_documents({
+            "chat_id": chat_id, "timestamp": {"$gte": since, "$lt": until},
+        })
+
+    async def tracking_since(self, collection: str, phone_id: int) -> datetime | None:
+        """Earliest stored row for this number (None = feed never received)."""
+        doc = await self.db[collection].find_one(
+            {"phone_id": phone_id}, {"timestamp": 1}, sort=[("timestamp", 1)],
         )
         return doc["timestamp"] if doc else None
 
@@ -531,3 +568,4 @@ class MongoInboxService:
         await self.db.messages.delete_many({"phone_id": phone_id})
         await self.db.chats.delete_many({"phone_id": phone_id})
         await self.db.group_events.delete_many({"phone_id": phone_id})
+        await self.db.message_reactions.delete_many({"phone_id": phone_id})

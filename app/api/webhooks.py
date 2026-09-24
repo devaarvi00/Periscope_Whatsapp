@@ -355,7 +355,8 @@ def _wid(v: Any) -> str:
 
 
 async def _record_reaction_event(payload: dict[str, Any]) -> None:
-    """Store every reaction (any emoji) in group_events for chat analytics."""
+    """Keep message_reactions in sync: one live reaction per (message, reactor);
+    an empty reaction text means the reactor removed it."""
     db = SessionLocal()
     try:
         session = payload.get("session", settings.waha_session_name)
@@ -363,30 +364,31 @@ async def _record_reaction_event(payload: dict[str, Any]) -> None:
         reaction = data.get("reaction") or {}
         emoji = str(reaction.get("text") or "").strip()
         target_wid = _wid(reaction.get("messageId") or data.get("messageId"))
-        if not emoji or not target_wid:
-            return  # empty text = reaction removed; nothing to count
+        if not target_wid:
+            return
         phone = db.query(Phone).filter(Phone.session_name == session).first()
         if not phone:
             return
         inbox = MongoInboxService()
+        from_me = bool(data.get("fromMe"))
+        reactor = _wid(data.get("participant") or data.get("from"))
+        if from_me:
+            reactor = reactor or (f"{phone.phone_number}@c.us" if phone.phone_number else "me")
+        if not reactor:
+            return
         target = await inbox.get_message_by_wid(target_wid, phone.id)
-        chat_wid = (target or {}).get("chat_wid") or ""
         chat_id = (target or {}).get("chat_id")
-        if not chat_wid:
-            chat_wid = _wid(data.get("to") if data.get("fromMe") else data.get("from"))
+        if chat_id is None:
+            chat_wid = _wid(data.get("to") if from_me else data.get("from"))
             chat = await inbox.get_chat_by_wid(chat_wid, phone.id) if chat_wid else None
             chat_id = (chat or {}).get("id")
-        if not chat_wid:
-            return
-        participant = _wid(data.get("participant") or data.get("from"))
+        if chat_id is None:
+            return  # reaction on a message in a chat we don't know
         ts_raw = data.get("timestamp")
         ts = datetime.utcfromtimestamp(ts_raw) if isinstance(ts_raw, (int, float)) else datetime.utcnow()
-        key = _wid(data.get("id")) or f"{target_wid}|{participant}|{emoji}|{int(ts.timestamp())}"
-        await inbox.add_group_event({
-            "phone_id": phone.id, "chat_id": chat_id, "chat_wid": chat_wid,
-            "type": "reaction", "event_key": f"reaction:{key}",
-            "participant": participant, "emoji": emoji[:16],
-            "message_wid": target_wid, "timestamp": ts,
+        await inbox.set_reaction({
+            "phone_id": phone.id, "chat_id": chat_id, "message_wid": target_wid,
+            "reactor": reactor, "emoji": emoji[:16], "timestamp": ts, "from_me": from_me,
         })
     except Exception as exc:
         logger.exception("Reaction record error: %s", exc)
@@ -394,33 +396,59 @@ async def _record_reaction_event(payload: dict[str, Any]) -> None:
         db.close()
 
 
+def _participant_event_type(waha_type: str, raw_type: str, participant: str, actor: str) -> str | None:
+    """WAHA's join/leave plus the engine's raw notification type → our type.
+
+    join via invite link / community → "join"; added by someone → "add"
+    (self-add counts as join); left → "leave"; removed by an admin → "remove".
+    """
+    if waha_type == "join":
+        if raw_type == "add" and actor and actor != participant:
+            return "add"
+        return "join"
+    if waha_type == "leave":
+        if raw_type == "remove" and actor and actor != participant:
+            return "remove"
+        return "leave"
+    if waha_type in ("promote", "demote"):
+        return waha_type
+    return None
+
+
 async def _process_group_participants(payload: dict[str, Any]) -> None:
-    """group.v2.participants → one join/leave row per participant."""
+    """group.v2.participants → one group_events row per participant."""
     db = SessionLocal()
     try:
         session = payload.get("session", settings.waha_session_name)
         data = payload.get("payload") or {}
-        etype = str(data.get("type") or "").lower()
-        if etype not in ("join", "leave"):
-            return  # promote / demote aren't membership changes
-        group_wid = _wid((data.get("group") or {}).get("id") if isinstance(data.get("group"), dict) else data.get("group"))
+        group = data.get("group")
+        group_wid = _wid(group.get("id") if isinstance(group, dict) else group)
         if not group_wid:
             return
         phone = db.query(Phone).filter(Phone.session_name == session).first()
         if not phone:
             return
+        raw = data.get("_data") if isinstance(data.get("_data"), dict) else {}
+        raw_type = str(raw.get("type") or "").lower()
+        actor = _wid(raw.get("author")) or None
+        source_id = _wid(raw.get("id")) or None
+
         inbox = MongoInboxService()
         chat = await inbox.get_chat_by_wid(group_wid, phone.id)
+        if not chat:
+            chat = await inbox.upsert_chat({"chat_wid": group_wid, "phone_id": phone.id, "is_group": True})
         ts_raw = data.get("timestamp")
         ts = datetime.utcfromtimestamp(ts_raw) if isinstance(ts_raw, (int, float)) else datetime.utcnow()
         for p in data.get("participants") or []:
             pid = _wid(p.get("id") if isinstance(p, dict) else p)
-            if not pid:
+            etype = _participant_event_type(str(data.get("type") or "").lower(), raw_type, pid, actor or "")
+            if not pid or not etype:
                 continue
             await inbox.add_group_event({
-                "phone_id": phone.id, "chat_id": (chat or {}).get("id"), "chat_wid": group_wid,
-                "type": etype, "event_key": f"{etype}:{group_wid}|{pid}|{int(ts.timestamp())}",
-                "participant": pid, "timestamp": ts,
+                "phone_id": phone.id, "chat_id": chat["id"], "chat_wid": group_wid,
+                "type": etype, "participant": pid, "actor": actor, "timestamp": ts,
+                # one notification can list several participants
+                "source_event_id": f"{source_id}:{pid}" if source_id else None,
             })
     except Exception as exc:
         logger.exception("group.v2.participants error: %s", exc)
