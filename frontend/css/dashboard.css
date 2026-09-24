@@ -1,1 +1,178 @@
-/* dashboard — see feature commit */
+/* ── Dashboard + topbar ─────────────────────────────────────────
+   Loaded after app.css; everything here uses theme tokens so the
+   dark theme (:root[data-theme="dark"]) applies automatically. */
+
+/* ── Dashboard layout ─────────────────────────────────────────── */
+.dsh-wrap{flex:1;overflow-y:auto;background:var(--bg);}
+.dsh-inner{max-width:1460px;margin:0 auto;padding:1.5rem 1.75rem 2.5rem;}
+.dsh-grid{
+  display:grid;grid-template-columns:minmax(0,1000px) minmax(300px,420px);
+  gap:1.5rem;align-items:start;
+}
+@media (max-width:1180px){
+  .dsh-grid{grid-template-columns:minmax(0,1fr);}
+}
+@media (max-width:640px){
+  .dsh-inner{padding:1rem 16px 2rem;}
+}
+
+.dsh-card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:8px;box-shadow:var(--shadow-card);
+}
+.dsh-muted{font-size:12.5px;color:var(--text-3);}
+
+/* Header */
+.dsh-head{display:flex;align-items:center;gap:.85rem;margin-bottom:1.35rem;}
+.dsh-ws-avatar{
+  width:44px;height:44px;border-radius:10px;flex-shrink:0;
+  background:var(--accent);color:#fff;
+  display:flex;align-items:center;justify-content:center;
+  font-size:20px;font-weight:700;text-transform:lowercase;
+}
+.dsh-ws-meta{min-width:0;}
+.dsh-ws-name{
+  font-size:22px;font-weight:700;letter-spacing:-.02em;color:var(--text);line-height:1.2;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.dsh-ws-uid{
+  display:block;margin-top:.1rem;padding:0;border:none;background:none;cursor:pointer;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:11.5px;color:var(--text-3);
+}
+.dsh-ws-uid:hover{color:var(--text-2);text-decoration:underline;}
+
+/* Stat cards */
+.dsh-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.9rem;margin-bottom:.9rem;}
+.dsh-stat{padding:.9rem 1rem;}
+.dsh-stat-label{display:flex;align-items:center;gap:.45rem;font-size:13px;color:var(--text-2);}
+.dsh-stat-label svg{width:15px;height:15px;color:var(--text-3);flex-shrink:0;}
+.dsh-stat-flagged .dsh-stat-label svg{color:var(--danger);}
+.dsh-stat-num{font-size:26px;font-weight:700;letter-spacing:-.02em;color:var(--text);margin-top:.4rem;line-height:1.1;}
+@media (max-width:640px){
+  .dsh-stats{grid-template-columns:minmax(0,1fr);}
+}
+
+/* Team + tickets */
+.dsh-duo{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:.9rem;margin-bottom:1.75rem;}
+@media (max-width:760px){ .dsh-duo{grid-template-columns:minmax(0,1fr);} }
+.dsh-panel-head{
+  display:flex;align-items:center;gap:.45rem;padding:.7rem 1rem;
+  font-size:13.5px;font-weight:600;color:var(--text);
+  border-bottom:1px solid var(--border-light);
+}
+.dsh-panel-head svg{width:15px;height:15px;color:var(--text-2);}
+.dsh-panel-body{padding:.85rem 1rem;}
+.dsh-avatars{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.55rem;align-items:center;}
+.dsh-avatar{
+  position:relative;width:28px;height:28px;border-radius:50%;
+  display:inline-flex;align-items:center;justify-content:center;
+  color:#fff;font-size:10.5px;font-weight:700;
+}
+.dsh-online-dot{
+  position:absolute;right:-1px;bottom:-1px;width:9px;height:9px;border-radius:50%;
+  background:var(--online);border:2px solid var(--surface);
+}
+.dsh-ticket-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;}
+.dsh-ticket-col{
+  display:flex;flex-direction:column;align-items:flex-start;gap:.3rem;
+  padding:.15rem .25rem;margin:-.15rem -.25rem;border:none;background:none;border-radius:6px;
+  font:inherit;text-align:left;cursor:pointer;color:inherit;
+}
+.dsh-ticket-col:hover{background:var(--surface-2);}
+.dsh-ticket-col:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+.dsh-ticket-label{display:flex;align-items:center;gap:.4rem;font-size:12.5px;color:var(--text-2);}
+.dsh-ticket-label svg{width:14px;height:14px;color:var(--accent);}
+.dsh-ring{width:10px;height:10px;border-radius:50%;border:2px solid var(--danger);}
+.dsh-ticket-num{font-size:20px;font-weight:700;color:var(--text);}
+
+/* Section titles with a hairline to the right */
+.dsh-section-title{
+  display:flex;align-items:center;gap:.75rem;
+  font-size:14px;font-weight:600;color:var(--text);margin:0 0 1rem;
+}
+.dsh-main > .dsh-section-title::after{content:'';flex:1;height:1px;background:var(--border);}
+
+/* Quick links */
+.dsh-links{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1.5rem 1.75rem;}
+@media (max-width:900px){ .dsh-links{grid-template-columns:repeat(2,minmax(0,1fr));} }
+@media (max-width:560px){ .dsh-links{grid-template-columns:minmax(0,1fr);} }
+.dsh-link p{font-size:12.5px;color:var(--text-2);line-height:1.45;margin:.3rem 0 .65rem;}
+.dsh-link-title{
+  display:inline-flex;align-items:center;gap:.4rem;padding:0;border:none;background:none;cursor:pointer;
+  font:inherit;font-size:13.5px;font-weight:600;color:var(--text);text-align:left;
+}
+.dsh-link-title > svg{width:15px;height:15px;color:var(--text-2);flex-shrink:0;}
+.dsh-link-title .dsh-arrow{width:12px;height:12px;color:var(--text-3);}
+.dsh-link-title:hover span{text-decoration:underline;}
+.dsh-link-title:disabled{cursor:default;}
+.dsh-link-title:disabled:hover span{text-decoration:none;}
+.dsh-link-title:disabled .dsh-arrow{display:none;}
+.dsh-link-actions{display:flex;flex-wrap:wrap;gap:.45rem;}
+
+/* Small outline button */
+.dsh-btn{
+  display:inline-flex;align-items:center;gap:.35rem;height:28px;padding:0 .7rem;
+  background:var(--surface);color:var(--text-2);
+  border:1px solid var(--border);border-radius:6px;
+  font:inherit;font-size:12px;font-weight:500;cursor:pointer;white-space:nowrap;
+}
+.dsh-btn:hover:not(:disabled){background:var(--surface-2);color:var(--text);}
+.dsh-btn:focus-visible,.dsh-link-title:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+.dsh-btn:disabled{opacity:.5;cursor:not-allowed;background:var(--surface-2);}
+.dsh-btn svg{width:12px;height:12px;}
+
+/* ── Phone status column ──────────────────────────────────────── */
+.dsh-side-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-bottom:.9rem;}
+.dsh-side-head .dsh-section-title{margin:0;}
+.dsh-phones{display:flex;flex-direction:column;gap:.6rem;}
+.dsh-phone{display:flex;align-items:center;gap:.75rem;padding:.7rem .8rem;}
+.dsh-phone-empty{justify-content:space-between;}
+.dsh-phone-avatar{
+  width:36px;height:36px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-size:12.5px;font-weight:700;
+}
+.dsh-phone-meta{flex:1;min-width:0;}
+.dsh-phone-num{font-size:13.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.dsh-phone-name{font-size:12px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.dsh-phone-status{display:flex;align-items:center;gap:.5rem;flex-shrink:0;}
+.dsh-status-dot{width:9px;height:9px;border-radius:50%;background:var(--danger);}
+.dsh-status-dot.ok{background:var(--online);}
+.dsh-status-dot.wait{background:#f59e0b;}
+.dsh-restart{
+  padding:0;border:none;background:none;cursor:pointer;
+  font:inherit;font-size:12.5px;color:var(--text-2);text-decoration:underline;text-underline-offset:2px;
+}
+.dsh-restart:hover:not(:disabled){color:var(--text);}
+.dsh-restart:disabled{cursor:wait;opacity:.6;}
+
+.dsh-menu-wrap{position:relative;flex-shrink:0;}
+.dsh-menu-btn{
+  width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+  border:none;background:none;border-radius:6px;color:var(--text-3);cursor:pointer;
+}
+.dsh-menu-btn:hover,.dsh-menu-btn[aria-expanded="true"]{background:var(--surface-3);color:var(--text);}
+.dsh-menu-btn svg{width:15px;height:15px;}
+.dsh-menu{
+  position:absolute;right:0;top:calc(100% + 4px);z-index:50;min-width:170px;padding:.3rem;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg);
+}
+.dsh-menu[hidden]{display:none;}
+.dsh-menu button{
+  display:block;width:100%;padding:.45rem .6rem;border:none;background:none;border-radius:5px;
+  font:inherit;font-size:12.5px;color:var(--text-2);text-align:left;cursor:pointer;
+}
+.dsh-menu button:hover,.dsh-menu button:focus-visible{background:var(--surface-3);color:var(--text);outline:none;}
+.dsh-menu button.danger{color:var(--danger);}
+
+/* Connection panel (QR / session state) under the phone cards */
+.dsh-connect{
+  margin-top:.6rem;padding:1rem;
+  display:flex;flex-direction:column;align-items:center;gap:.55rem;text-align:center;
+}
+.dsh-connect[hidden]{display:none;}
+.dsh-connect-title{align-self:stretch;text-align:left;font-size:12.5px;font-weight:600;color:var(--text-2);}
+.dsh-qr{display:flex;align-items:center;justify-content:center;}
+.dsh-connect-label{font-size:12px;color:var(--text-3);}
+.dsh-connect-actions{display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;}
