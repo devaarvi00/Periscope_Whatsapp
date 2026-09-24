@@ -7,6 +7,8 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.schemas.ai_agent import BulkJobCreate, BulkJobOut
+from app.schemas.common import parse_client_datetime
+from app.services.access import assert_phone_access
 from app.services.activity_service import log_activity
 from app.services.bulk_service import BulkService
 
@@ -34,20 +36,23 @@ def create_job(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    from datetime import datetime, timezone
+    assert_phone_access(db, agent, req.phone_id)
     scheduled_at = None
     if req.scheduled_at:
         try:
-            dt = datetime.fromisoformat(req.scheduled_at)
-            if dt.tzinfo is not None:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            scheduled_at = dt
+            scheduled_at = parse_client_datetime(req.scheduled_at)
         except ValueError:
             raise HTTPException(400, "Invalid scheduled_at format (use ISO 8601)")
     if req.message_type == "poll" and not (req.poll_options and len(req.poll_options) >= 2):
         raise HTTPException(400, "Polls need at least 2 options")
     if req.message_type in ("image", "file") and not req.media_url:
         raise HTTPException(400, f"media_url is required for {req.message_type} messages")
+    if req.media_url:
+        from app.services.url_safety import UnsafeURLError, check_public_url
+        try:
+            check_public_url(req.media_url)  # sync route: runs in threadpool
+        except UnsafeURLError as exc:
+            raise HTTPException(400, f"Invalid media_url: {exc}")
     if req.repeat not in ("none", "daily", "weekly", "monthly"):
         raise HTTPException(400, "repeat must be none|daily|weekly|monthly")
     if req.repeat != "none" and not scheduled_at:
@@ -55,10 +60,7 @@ def create_job(
     end_date = None
     if req.end_date:
         try:
-            dt = datetime.fromisoformat(req.end_date)
-            if dt.tzinfo is not None:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            end_date = dt
+            end_date = parse_client_datetime(req.end_date)
         except ValueError:
             raise HTTPException(400, "Invalid end_date (use ISO 8601)")
     job = BulkService(db).create_job(
@@ -99,10 +101,20 @@ async def _run_bulk_job(job_id: int) -> None:
 
 
 @router.post("/jobs/{job_id}/send")
-async def send_job(job_id: int, background: BackgroundTasks, db: Session = Depends(get_db)):
+async def send_job(
+    job_id: int,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     job = BulkService(db).get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+    assert_phone_access(db, agent, job.phone_id)
+    if job.status != "pending":
+        raise HTTPException(409, f"Job is {job.status}; only pending jobs can be sent")
+    # execute_job claims the job atomically, so a concurrent scheduler tick
+    # and this request can never both send it.
     background.add_task(_run_bulk_job, job_id)
     return {"ok": True, "message": "Bulk job queued"}
 

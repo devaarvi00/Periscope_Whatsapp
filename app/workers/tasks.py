@@ -126,8 +126,22 @@ async def check_no_reply_timeouts() -> None:
         db.close()
 
 
+def _add_months(dt: datetime, months: int, day: int) -> datetime:
+    import calendar
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    return dt.replace(year=year, month=month, day=min(day, calendar.monthrange(year, month)[1]))
+
+
 def _next_occurrence(item, after: datetime):
-    """Compute the next send time for a recurring schedule, or None if finished.
+    """Next send time (naive UTC) strictly after `after`, or None if finished.
+
+    Missed runs are skipped rather than replayed, so a schedule that was
+    offline for a while fires once and then resumes its cadence.
+
+    Weekday / day-of-month rules are evaluated in the business timezone
+    (BUSINESS_TIMEZONE), not UTC.
 
     Supports: daily (optionally restricted to days_of_week, every N days),
     weekly (every N weeks), monthly (every N months, optionally pinned to
@@ -135,38 +149,52 @@ def _next_occurrence(item, after: datetime):
     """
     from datetime import timedelta
 
-    interval = max(1, item.interval or 1)
-    nxt = item.send_at
+    from app.services.business_time import local_to_utc_naive, utc_naive_to_local
 
-    if item.repeat == "daily":
-        allowed = set(item.days_of_week or [])
-        step = timedelta(days=interval)
-        nxt = nxt + step
-        if allowed:
-            # advance day-by-day to the next allowed weekday (Mon=0)
-            for _ in range(0, 8):
-                if nxt.weekday() in allowed and nxt > after:
-                    break
-                nxt = nxt + timedelta(days=1)
+    interval = max(1, item.interval or 1)
+    start = utc_naive_to_local(item.send_at)
+    after_local = utc_naive_to_local(after)
+    max_steps = 100_000  # hard guard against pathological input
+
+    if item.repeat in ("daily", "weekly"):
+        step = timedelta(days=interval) if item.repeat == "daily" else timedelta(weeks=interval)
+        allowed = set(item.days_of_week or []) if item.repeat == "daily" else set()
+        allowed = {int(d) for d in allowed if 0 <= int(d) <= 6}
+        cand = start
+        # Fast-forward close to `after` without iterating every missed step
+        if after_local > start:
+            skip = int((after_local - start) / step) - 1
+            if skip > 0:
+                cand = start + step * skip
+        for _ in range(max_steps):
+            cand = cand + step
+            if allowed:
+                # advance day-by-day to the next allowed weekday (Mon=0)
+                for _ in range(7):
+                    if cand.weekday() in allowed:
+                        break
+                    cand = cand + timedelta(days=1)
+            if cand > after_local:
+                break
         else:
-            while nxt <= after:
-                nxt = nxt + step
-    elif item.repeat == "weekly":
-        step = timedelta(weeks=interval)
-        nxt = nxt + step
-        while nxt <= after:
-            nxt = nxt + step
+            return None
     elif item.repeat == "monthly":
-        import calendar
-        month_index = nxt.month - 1 + interval
-        year = nxt.year + month_index // 12
-        month = month_index % 12 + 1
-        day = item.day_of_month or nxt.day
-        day = min(day, calendar.monthrange(year, month)[1])
-        nxt = nxt.replace(year=year, month=month, day=day)
+        day = item.day_of_month or start.day
+        cand = None
+        # jump straight to roughly the right month, then step forward
+        months_between = (after_local.year - start.year) * 12 + (after_local.month - start.month)
+        k = max(interval, (months_between // interval) * interval)
+        for _ in range(max_steps):
+            cand = _add_months(start, k, day)
+            if cand > after_local:
+                break
+            k += interval
+        else:
+            return None
     else:
         return None
 
+    nxt = local_to_utc_naive(cand)
     if item.end_date and nxt > item.end_date:
         return None
     return nxt
@@ -210,7 +238,8 @@ async def run_scheduled_messages() -> None:
                 continue
 
             # Daily schedules restricted to specific weekdays: skip disallowed days
-            if item.repeat == "daily" and item.days_of_week and now.weekday() not in item.days_of_week:
+            from app.services.business_time import business_now
+            if item.repeat == "daily" and item.days_of_week and business_now().weekday() not in item.days_of_week:
                 nxt = _next_occurrence(item, now)
                 if nxt is None:
                     item.status = "sent"
@@ -304,6 +333,13 @@ async def run_scheduled_bulk_jobs() -> None:
 
     db = SessionLocal()
     try:
+        # Recover jobs orphaned in 'running' by a crash/restart
+        try:
+            BulkService(db).fail_stale_running_jobs()
+        except Exception as exc:
+            db.rollback()
+            logger.warning("Stale bulk job check failed: %s", exc)
+
         now = datetime.utcnow()
         from sqlalchemy import or_
         jobs = (
