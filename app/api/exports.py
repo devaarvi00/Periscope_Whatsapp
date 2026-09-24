@@ -1,8 +1,8 @@
 import csv
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -52,6 +52,41 @@ def _csv_response(filename: str, header: list[str], rows: list[list]) -> Streami
     )
 
 
+def _parse_dt(value: str | None, name: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(422, f"Invalid '{name}' datetime")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _range(from_: str | None, to: str | None, days: int | None) -> tuple[datetime | None, datetime | None]:
+    """Optional [from, to) window: explicit ISO bounds win, else the last `days` days."""
+    start, end = _parse_dt(from_, "from"), _parse_dt(to, "to")
+    if start is None and days:
+        start = (end or datetime.utcnow()) - timedelta(days=min(max(days, 1), 365))
+    if start and end and start >= end:
+        raise HTTPException(422, "'from' must be before 'to'")
+    return start, end
+
+
+def _window(start: datetime | None, end: datetime | None) -> dict:
+    w: dict = {}
+    if start:
+        w["$gte"] = start
+    if end:
+        w["$lt"] = end
+    return w
+
+
+def _iso(v) -> str:
+    return v.isoformat() if isinstance(v, datetime) else (v or "")
+
+
 def _log_export(db: Session, agent: Agent, entity: str, count: int) -> None:
     log_activity(
         db, "data_exported", entity_type=entity, agent_id=agent.id,
@@ -61,47 +96,50 @@ def _log_export(db: Session, agent: Agent, entity: str, count: int) -> None:
 
 @router.get("/chats.csv")
 async def export_chats(
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
+    """All chats (archived included); with a range, chats active in it."""
+    start, end = _range(from_, to, None)
+    filt: dict = {}
+    if start or end:
+        filt["last_message_at"] = _window(start, end)
     inbox = MongoInboxService()
-    chats = await inbox.list_chats(limit=10000)
+    chats = await inbox.db.chats.find(filt).sort("last_message_at", -1).limit(50000).to_list(50000)
     agents_map = {a.id: a.name for a in db.query(Agent).all()}
 
     from app.models.label import Label
     from app.models.property_definition import PropertyDefinition
 
+    label_names_by_id = {lbl.id: lbl.name for lbl in db.query(Label).all()}
     prop_defs = {str(p.id): p.name for p in db.query(PropertyDefinition).filter(PropertyDefinition.entity == "chat").all()}
 
     rows = []
     for c in chats:
-        label_ids = c.get("label_ids") or []
-        label_names = []
-        for lid in label_ids:
-            lbl = db.query(Label).filter(Label.id == lid).first()
-            if lbl:
-                label_names.append(lbl.name)
+        label_names = [label_names_by_id[lid] for lid in (c.get("label_ids") or []) if lid in label_names_by_id]
 
         props_list = []
         for pid, val in (c.get("custom_properties") or {}).items():
             pname = prop_defs.get(str(pid), f"Property {pid}")
             props_list.append(f"{pname}: {val}")
 
-        lma = c.get("last_message_at")
         rows.append([
             c["id"], c["chat_wid"], c.get("name") or "", "group" if c.get("is_group") else "1:1",
             c["phone_id"], c.get("unread_count") or 0, bool(c.get("is_flagged")), bool(c.get("is_archived")),
             agents_map.get(c.get("assigned_to"), "") if c.get("assigned_to") else "",
             ", ".join(label_names),
             "; ".join(props_list),
-            lma.isoformat() if isinstance(lma, datetime) else (lma or ""),
+            _iso(c.get("created_at")),
+            _iso(c.get("last_message_at")),
         ])
 
     _log_export(db, agent, "chats", len(rows))
     return _csv_response(
         "chats.csv",
         ["id", "chat_wid", "name", "type", "phone_id", "unread", "flagged",
-         "archived", "assigned_agent", "labels", "custom_properties", "last_message_at"],
+         "archived", "assigned_agent", "labels", "custom_properties", "created_at", "last_message_at"],
         rows,
     )
 
@@ -110,46 +148,61 @@ async def export_chats(
 async def export_messages(
     days: int = 30,
     chat_id: int | None = None,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    flagged_only: bool = False,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
     inbox = MongoInboxService()
-    since = datetime.utcnow() - timedelta(days=min(days, 365))
-    filt: dict = {"timestamp": {"$gte": since}}
+    start, end = _range(from_, to, days)
+    filt: dict = {"timestamp": _window(start, end)}
     if chat_id:
         filt["chat_id"] = chat_id
+    if flagged_only:
+        filt["is_flagged"] = True
     msg_docs = await (
         inbox.db.messages.find(filt)
         .sort("timestamp", 1)
         .limit(50000)
         .to_list(50000)
     )
+    agents_map = {a.id: a.name for a in db.query(Agent).all()}
     rows = []
     for m in msg_docs:
-        ts = m.get("timestamp")
         rows.append([
             m["id"], m.get("chat_id"), m.get("phone_id"), m.get("message_wid") or "",
             "out" if m.get("from_me") else "in",
             m.get("sender_name") or "", m.get("sender_number") or "",
+            agents_map.get(m.get("sent_by_agent_id"), "") if m.get("sent_by_agent_id") else "",
             (m.get("body") or "").replace("\n", " "),
             m.get("message_type") or "text",
-            ts.isoformat() if isinstance(ts, datetime) else (ts or ""),
+            bool(m.get("is_flagged")),
+            _iso(m.get("timestamp")),
         ])
     _log_export(db, agent, "messages", len(rows))
     return _csv_response(
         "messages.csv",
         ["id", "chat_id", "phone_id", "message_wid", "direction", "sender_name",
-         "sender_number", "body", "type", "timestamp"],
+         "sender_number", "sent_by_agent", "body", "type", "flagged", "timestamp"],
         rows,
     )
 
 
 @router.get("/tickets.csv")
 def export_tickets(
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    tickets = db.query(Ticket).order_by(Ticket.created_at.desc()).all()
+    start, end = _range(from_, to, None)
+    tq = db.query(Ticket)
+    if start:
+        tq = tq.filter(Ticket.created_at >= start)
+    if end:
+        tq = tq.filter(Ticket.created_at < end)
+    tickets = tq.order_by(Ticket.created_at.desc()).all()
     agents = {a.id: a.name for a in db.query(Agent).all()}
 
     from app.models.label import Label
@@ -236,13 +289,17 @@ def export_contacts(
 @router.get("/logs.csv")
 def export_logs(
     days: int = 30,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    since = datetime.utcnow() - timedelta(days=min(days, 365))
+    start, end = _range(from_, to, days)
+    lq = db.query(ActivityLog).filter(ActivityLog.created_at >= start)
+    if end:
+        lq = lq.filter(ActivityLog.created_at < end)
     logs = (
-        db.query(ActivityLog)
-        .filter(ActivityLog.created_at >= since)
+        lq
         .order_by(ActivityLog.created_at.desc())
         .limit(50000)
         .all()
@@ -257,5 +314,97 @@ def export_logs(
     return _csv_response(
         "audit_logs.csv",
         ["id", "action", "entity_type", "entity_id", "agent_id", "description", "created_at"],
+        rows,
+    )
+
+
+@router.get("/notes.csv")
+async def export_notes(
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Private team notes (never sent to customers)."""
+    from app.models.note import Note
+    start, end = _range(from_, to, None)
+    nq = db.query(Note)
+    if start:
+        nq = nq.filter(Note.created_at >= start)
+    if end:
+        nq = nq.filter(Note.created_at < end)
+    notes = nq.order_by(Note.created_at.desc()).limit(50000).all()
+    agents_map = {a.id: a.name for a in db.query(Agent).all()}
+    chat_ids = list({n.chat_id for n in notes})
+    chats = {}
+    if chat_ids:
+        async for c in MongoInboxService().db.chats.find(
+            {"id": {"$in": chat_ids}}, {"id": 1, "name": 1, "chat_wid": 1, "phone_id": 1}
+        ):
+            chats[c["id"]] = c
+    rows = []
+    for n in notes:
+        c = chats.get(n.chat_id) or {}
+        rows.append([
+            n.id, n.chat_id, c.get("name") or c.get("chat_wid") or "", c.get("phone_id") or "",
+            agents_map.get(n.agent_id, ""), (n.content or "").replace("\n", " "), _iso(n.created_at),
+        ])
+    _log_export(db, agent, "notes", len(rows))
+    return _csv_response(
+        "private_notes.csv",
+        ["id", "chat_id", "chat_name", "phone_id", "author", "content", "created_at"],
+        rows,
+    )
+
+
+@router.get("/phones.csv")
+def export_phones(
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    from app.models.phone import Phone
+    phones = db.query(Phone).order_by(Phone.id.asc()).all()
+    rows = [
+        [p.id, p.name, p.phone_number, p.session_name, p.waha_status, bool(p.is_active), _iso(p.created_at)]
+        for p in phones
+    ]
+    _log_export(db, agent, "phones", len(rows))
+    return _csv_response(
+        "phones.csv",
+        ["id", "name", "phone_number", "session_name", "status", "active", "created_at"],
+        rows,
+    )
+
+
+@router.get("/chat_actions.csv")
+async def export_chat_actions(
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    days: int = 30,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Group membership events (join / add / leave / remove / promote / demote)."""
+    start, end = _range(from_, to, days)
+    mdb = MongoInboxService().db
+    events = await (
+        mdb.group_events.find({"timestamp": _window(start, end)})
+        .sort("timestamp", 1).limit(50000).to_list(50000)
+    )
+    chat_ids = list({e.get("chat_id") for e in events if e.get("chat_id") is not None})
+    names = {}
+    if chat_ids:
+        async for c in mdb.chats.find({"id": {"$in": chat_ids}}, {"id": 1, "name": 1}):
+            names[c["id"]] = c.get("name") or ""
+    rows = [
+        [_iso(e.get("timestamp")), e.get("phone_id") or "", e.get("chat_id") or "",
+         names.get(e.get("chat_id"), "") or e.get("chat_wid") or "",
+         e.get("type") or "", e.get("participant") or "", e.get("actor") or ""]
+        for e in events
+    ]
+    _log_export(db, agent, "chat_actions", len(rows))
+    return _csv_response(
+        "chat_actions.csv",
+        ["timestamp", "phone_id", "chat_id", "chat_name", "action", "participant", "actor"],
         rows,
     )
