@@ -74,6 +74,14 @@ async def _configure_waha_webhook() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging()
+    if not settings.is_production:
+        logger.warning(
+            "=" * 70 + "\n"
+            "ENVIRONMENT=%r (not 'production'). Development behaviours are active "
+            "(e.g. simulated sends, /docs enabled). Set ENVIRONMENT=production for "
+            "a real deployment.\n" + "=" * 70,
+            settings.environment,
+        )
     init_db()
     from app.db.mongo import init_mongo_indexes
     await init_mongo_indexes()
@@ -114,10 +122,14 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Browsers reject credentialed CORS with a wildcard origin, and pairing them is
+# unsafe anyway; only send credentials when origins are explicitly listed.
+# (Auth uses a Bearer header, so the frontend does not need cookies.)
+_cors_wildcard = "*" in settings.allowed_origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_credentials=True,
+    allow_credentials=not _cors_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -157,27 +169,61 @@ app.include_router(tasks_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(properties_router, prefix=PREFIX, dependencies=_auth)
 
 
+WS_AUTH_TIMEOUT_SECONDS = 10
+WS_CLOSE_UNAUTHORIZED = 4001
+
+
+async def _receive_ws_auth_token(websocket: WebSocket) -> str | None:
+    """Wait for the first-message auth frame: {"type": "auth", "token": "<jwt>"}."""
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=WS_AUTH_TIMEOUT_SECONDS)
+        msg = json.loads(raw)
+    except (asyncio.TimeoutError, WebSocketDisconnect, ValueError, RuntimeError):
+        return None
+    if not isinstance(msg, dict) or msg.get("type") != "auth":
+        return None
+    token = msg.get("token")
+    return token if isinstance(token, str) and token else None
+
+
+async def _register_ws(websocket: WebSocket, agent_id: int) -> None:
+    """Register an already-accepted socket (ws_manager.connect() would accept again)."""
+    ws_manager._connections.setdefault(agent_id, []).append(websocket)
+    logger.info("WS connected: agent_id=%s  total_agents=%s", agent_id, len(ws_manager._connections))
+    await ws_manager._send(websocket, {"type": "connected", "agent_id": agent_id})
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = ""):
     """
     Authenticated WebSocket endpoint.
-    Client must pass ?token=<JWT> in the URL.
+
+    Preferred: connect without credentials in the URL, then send
+    {"type":"auth","token":"<JWT>"} as the first message within 10 s.
+    Legacy: ?token=<JWT> in the URL is still accepted (it leaks into proxy logs).
+    Failed auth closes the socket with code 4001.
     Heartbeat: server sends {"type":"ping"} every 25 s; client must reply {"type":"pong"}.
     """
     from app.core.security import decode_access_token
     from app.db.session import SessionLocal
     from app.models.agent import Agent
 
+    # Accept first so auth failures can be reported with a 4001 close code
+    # (closing before accept yields a bare HTTP 403 to the client).
+    await websocket.accept()
+
     # ── Authenticate ──────────────────────────────────────────────── #
+    if not token:
+        token = await _receive_ws_auth_token(websocket) or ""
     payload = decode_access_token(token) if token else None
     if not payload:
-        await websocket.close(code=4001, reason="Unauthorized")
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Unauthorized")
         return
 
     try:
         agent_id = int(payload.get("sub", 0))
     except (TypeError, ValueError):
-        await websocket.close(code=4001, reason="Invalid token")
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Invalid token")
         return
 
     db = SessionLocal()
@@ -187,10 +233,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
         db.close()
 
     if not agent:
-        await websocket.close(code=4001, reason="Agent not found")
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Agent not found")
         return
 
-    await ws_manager.connect(websocket, agent_id)
+    await _register_ws(websocket, agent_id)
 
     # ── Message loop with heartbeat ───────────────────────────────── #
     PING_INTERVAL = 25  # seconds
@@ -219,21 +265,34 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
         ws_manager.disconnect(websocket, agent_id)
 
 
-@app.get("/health")
-async def health():
+def _check_mysql() -> None:
     db_gen = get_db()
     try:
         db = next(db_gen)
         db.execute(text("SELECT 1"))
-        return {"status": "ok", "app": settings.app_name}
-    except Exception:
-        from fastapi import HTTPException
-        raise HTTPException(503, "Database unavailable")
     finally:
         try:
             next(db_gen)
         except StopIteration:
             pass
+
+
+@app.get("/health")
+async def health():
+    from fastapi import HTTPException
+    from starlette.concurrency import run_in_threadpool
+
+    from app.db.mongo import get_mongo_db
+
+    try:
+        await run_in_threadpool(_check_mysql)
+    except Exception:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        await asyncio.wait_for(get_mongo_db().command("ping"), timeout=5)
+    except Exception:
+        raise HTTPException(503, "MongoDB unavailable")
+    return {"status": "ok", "app": settings.app_name}
 
 
 if _FRONTEND.is_dir():
