@@ -59,6 +59,14 @@ const Api = (() => {
     register: (data)            => post('/auth/register', data),
     agentPhones:    (id)        => get(`/auth/agents/${id}/phones`),
     setAgentPhones: (id, ids)   => req('PUT', `/auth/agents/${id}/phones`, ids),
+    changePassword: (current_password, new_password) =>
+      post('/auth/change-password', { current_password, new_password }),
+  };
+
+  // Organization (workspace identity for the sidebar switcher)
+  const org = {
+    get:    ()  => get('/org'),
+    update: (b) => patch('/org', b),
   };
 
   // Inbox
@@ -252,6 +260,6 @@ const Api = (() => {
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
     phones, analytics, automation, bulk, ai, search,
     logs, groups, scheduled, exports: exportsApi,
-    tasks, properties,
+    tasks, properties, org,
   };
 })();

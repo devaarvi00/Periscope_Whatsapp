@@ -266,6 +266,7 @@ function showApp() {
   renderAgent();
   const hashView = decodeURIComponent(location.hash.replace('#', ''));
   navigateTo(VIEW_LABELS[hashView] ? hashView : 'dashboard');
+  loadOrg();
   loadLabels();
   loadPhones();
   connectWS();
@@ -292,6 +293,14 @@ function renderAgent() {
   const dae = document.getElementById('dropdown-agent-email');
   if (dan) dan.textContent = a.name;
   if (dae) dae.textContent = a.email || '';
+
+  // Workspace menu user row
+  const mua = document.getElementById('ws-menu-user-avatar');
+  const mue = document.getElementById('ws-menu-user-email');
+  if (mua) { mua.textContent = initials(a.name); mua.style.background = avatarColor(a.name); }
+  if (mue) mue.textContent = a.email || a.name;
+  const disp = document.getElementById('agent-display');
+  if (disp) disp.title = `${a.name} · ${a.role}`;
 }
 
 // ── Topbar: global search with dropdown results ──────────────────
@@ -401,6 +410,7 @@ function logoutFn() {
   _stopAllPhoneQrFlows();
   clearTimeout(_chatDebounce);
   closeLabelPicker();
+  closeWsMenu();
   closeModal();
   Api.clearToken();
   // Reset in-memory state so the next login starts clean
@@ -440,6 +450,295 @@ if (taAgent && taDropdown) {
   });
 }
 
+// ── Sidebar: workspace menu, theme, collapse ──────────────────────
+function _store(key, val) {
+  try { val == null ? localStorage.removeItem(key) : localStorage.setItem(key, val); } catch (_) {}
+}
+
+function wsInitial(name) {
+  return (String(name || '').trim()[0] || 'h').toLowerCase();
+}
+
+function renderOrg() {
+  const org = State.org || { name: 'Hyperscope', uid: '' };
+  const letter = wsInitial(org.name);
+  for (const id of ['ws-avatar', 'ws-menu-avatar', 'ws-menu-current-avatar']) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = letter;
+  }
+  for (const id of ['ws-name', 'ws-menu-name', 'ws-menu-current-name']) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = org.name;
+  }
+  const uid = document.getElementById('ws-menu-uid');
+  if (uid) { uid.textContent = org.uid || ''; uid.style.display = org.uid ? '' : 'none'; }
+}
+
+async function loadOrg() {
+  try { State.org = await Api.org.get(); }
+  catch (_) { State.org = State.org || null; }  // keep the default label if the call fails
+  renderOrg();
+}
+
+const wsSwitch = document.getElementById('ws-switch');
+const wsMenu = document.getElementById('ws-menu');
+
+function closeWsMenu(focusButton) {
+  if (!wsMenu || wsMenu.hidden) return;
+  wsMenu.hidden = true;
+  wsSwitch?.setAttribute('aria-expanded', 'false');
+  if (focusButton) wsSwitch?.focus();
+}
+
+function openWsMenu() {
+  if (!wsMenu || !wsSwitch) return;
+  // Fixed positioning so the menu isn't clipped by the sidebar (esp. when collapsed)
+  const r = wsSwitch.getBoundingClientRect();
+  const collapsed = document.documentElement.getAttribute('data-sidebar') === 'collapsed'
+    || window.matchMedia('(max-width:760px)').matches;
+  wsMenu.style.top = (collapsed ? r.top : r.bottom + 4) + 'px';
+  wsMenu.style.left = (collapsed ? r.right + 8 : Math.max(8, r.left)) + 'px';
+  wsMenu.hidden = false;
+  wsSwitch.setAttribute('aria-expanded', 'true');
+  // Keep the menu on screen on short viewports
+  const mr = wsMenu.getBoundingClientRect();
+  if (mr.bottom > window.innerHeight - 8) {
+    wsMenu.style.top = Math.max(8, window.innerHeight - 8 - mr.height) + 'px';
+  }
+  wsMenu.querySelector('.ws-menu-item')?.focus();
+}
+
+wsSwitch?.addEventListener('click', e => {
+  e.stopPropagation();
+  wsMenu.hidden ? openWsMenu() : closeWsMenu();
+});
+document.addEventListener('click', e => {
+  if (wsMenu && !wsMenu.hidden && !wsMenu.contains(e.target)) closeWsMenu();
+});
+window.addEventListener('resize', () => closeWsMenu());
+wsMenu?.addEventListener('keydown', e => {
+  const items = [...wsMenu.querySelectorAll('.ws-menu-item')];
+  const i = items.indexOf(document.activeElement);
+  if (e.key === 'Escape') { e.preventDefault(); closeWsMenu(true); }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length]?.focus(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length]?.focus(); }
+  else if (e.key === 'Tab') closeWsMenu();
+});
+
+document.getElementById('ws-menu-uid')?.addEventListener('click', async e => {
+  e.stopPropagation();
+  const uid = State.org?.uid;
+  if (!uid) return;
+  try { await navigator.clipboard.writeText(uid); toast('Workspace ID copied', 'success'); }
+  catch (_) { toast(uid); }
+});
+
+wsMenu?.addEventListener('click', e => {
+  const btn = e.target.closest('[data-ws-action]');
+  if (!btn) return;
+  const action = btn.dataset.wsAction;
+  closeWsMenu();
+  ({
+    'org-settings': showOrgSettingsModal,
+    invite:         openInviteTeam,
+    help:           showHelpModal,
+    current:        () => {},
+    create:         showCreateWorkspaceModal,
+    password:       showChangePasswordModal,
+    logout:         logoutFn,
+  }[action] || (() => {}))();
+});
+
+function showOrgSettingsModal() {
+  const org = State.org || {};
+  const admin = isAdmin();
+  const ro = admin ? '' : 'disabled';
+  showModal('Organization settings', `
+    <div class="form-group">
+      <label for="org-name">Workspace name</label>
+      <input type="text" id="org-name" maxlength="120" value="${esc(org.name || '')}" ${ro}>
+    </div>
+    <div class="form-group">
+      <label for="org-support-email">Support email</label>
+      <input type="email" id="org-support-email" maxlength="255" placeholder="support@yourcompany.com" value="${esc(org.support_email || '')}" ${ro}>
+      <small class="text-muted">Shown to your team under Help &amp; Support</small>
+    </div>
+    <div class="form-group">
+      <label for="org-support-url">Help centre URL</label>
+      <input type="url" id="org-support-url" maxlength="500" placeholder="https://" value="${esc(org.support_url || '')}" ${ro}>
+    </div>
+    <div class="form-group">
+      <label>Workspace ID</label>
+      <div class="text-muted" style="font-family:ui-monospace,monospace;font-size:12.5px;word-break:break-all">${esc(org.uid || '—')}</div>
+    </div>
+    ${admin ? '' : '<p class="text-muted" style="font-size:12.5px;margin-bottom:.75rem">Only admins can change organization settings.</p>'}
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">${admin ? 'Cancel' : 'Close'}</button>
+      ${admin ? '<button class="btn btn-primary" id="org-save">Save</button>' : ''}
+    </div>
+  `);
+  document.getElementById('org-save')?.addEventListener('click', async ev => {
+    const name = document.getElementById('org-name').value.trim();
+    if (!name) return toast('Workspace name is required', 'error');
+    const url = document.getElementById('org-support-url').value.trim();
+    if (url && !/^https?:\/\//i.test(url)) return toast('Help centre URL must start with http:// or https://', 'error');
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      State.org = await Api.org.update({
+        name,
+        support_email: document.getElementById('org-support-email').value.trim(),
+        support_url: url,
+      });
+      renderOrg();
+      closeModal();
+      toast('Organization settings saved', 'success');
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false;
+    }
+  });
+}
+
+function openInviteTeam() {
+  if (!isAdmin()) return toast('Only admins can invite team members', 'error');
+  navigateTo('settings');
+  document.querySelector('#settings-tabs .tab[data-tab="agents"]')?.click();
+  // The agents tab renders asynchronously; open the invite form once its button exists
+  const started = Date.now();
+  (function waitForInvite() {
+    const b = document.getElementById('invite-agent-btn');
+    if (b) return b.click();
+    if (State.currentView === 'settings' && Date.now() - started < 5000) setTimeout(waitForInvite, 100);
+  })();
+}
+
+function showHelpModal() {
+  const org = State.org || {};
+  const safeUrl = /^https?:\/\//i.test(org.support_url || '') ? org.support_url : '';
+  const contact = [
+    org.support_email ? `<a class="btn btn-secondary btn-sm" href="mailto:${esc(org.support_email)}">✉️ ${esc(org.support_email)}</a>` : '',
+    safeUrl ? `<a class="btn btn-secondary btn-sm" href="${esc(safeUrl)}" target="_blank" rel="noopener noreferrer">Open help centre ↗</a>` : '',
+  ].filter(Boolean).join(' ');
+  showModal('Help & Support', `
+    <div class="form-group">
+      <label>Contact support</label>
+      ${contact
+        ? `<div style="display:flex;gap:.5rem;flex-wrap:wrap">${contact}</div>`
+        : `<p class="text-muted" style="font-size:13px">No support contact is set yet.${isAdmin() ? ' Add one in Organization settings.' : ' Ask your admin to add one.'}</p>`}
+    </div>
+    <div class="form-group">
+      <label>Keyboard shortcuts</label>
+      <div style="font-size:13px;line-height:1.9">
+        <div><kbd>Ctrl</kbd> + <kbd>K</kbd> &nbsp;Ask AI</div>
+        <div><kbd>Esc</kbd> &nbsp;Close menus and dialogs</div>
+      </div>
+    </div>
+    <div class="form-group" style="margin-bottom:.5rem">
+      <label>Workspace ID</label>
+      <div class="text-muted" style="font-family:ui-monospace,monospace;font-size:12.5px;word-break:break-all">${esc(org.uid || '—')}</div>
+      <small class="text-muted">Include this when you contact support.</small>
+    </div>
+    <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Done</button></div>
+  `);
+}
+
+function showCreateWorkspaceModal() {
+  showModal('Create workspace', `
+    <p style="font-size:13.5px;line-height:1.6;margin-bottom:.75rem">
+      This installation runs a single workspace. Each Hyperscope server hosts one workspace with its own
+      WhatsApp numbers, team and data.
+    </p>
+    <p class="text-muted" style="font-size:13px;line-height:1.6;margin-bottom:1rem">
+      To run another workspace, deploy a separate Hyperscope instance${State.org?.support_email ? ` or contact <a href="mailto:${esc(State.org.support_email)}">${esc(State.org.support_email)}</a>` : ''}.
+    </p>
+    <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Got it</button></div>
+  `);
+}
+
+function showChangePasswordModal() {
+  showModal('Update password', `
+    <div class="form-group">
+      <label for="pw-current">Current password</label>
+      <input type="password" id="pw-current" autocomplete="current-password" maxlength="256">
+    </div>
+    <div class="form-group">
+      <label for="pw-new">New password</label>
+      <input type="password" id="pw-new" autocomplete="new-password" minlength="8" maxlength="72">
+      <small class="text-muted">8–72 characters</small>
+    </div>
+    <div class="form-group">
+      <label for="pw-confirm">Confirm new password</label>
+      <input type="password" id="pw-confirm" autocomplete="new-password" maxlength="72">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="pw-save">Update password</button>
+    </div>
+  `);
+  document.getElementById('pw-current')?.focus();
+  document.getElementById('pw-save')?.addEventListener('click', async ev => {
+    const cur = document.getElementById('pw-current').value;
+    const nw = document.getElementById('pw-new').value;
+    const cf = document.getElementById('pw-confirm').value;
+    if (!cur) return toast('Enter your current password', 'error');
+    if (nw.length < 8 || nw.length > 72) return toast('New password must be 8–72 characters', 'error');
+    if (new TextEncoder().encode(nw).length > 72) return toast('New password is too long', 'error');
+    if (nw !== cf) return toast('New passwords do not match', 'error');
+    if (nw === cur) return toast('New password must be different', 'error');
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      await Api.auth.changePassword(cur, nw);
+      closeModal();
+      toast('Password updated', 'success');
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false;
+    }
+  });
+}
+
+// Theme (light/dark) — stored per browser
+function applyTheme(theme) {
+  const dark = theme === 'dark';
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const label = document.getElementById('theme-label');
+  const icon = document.getElementById('theme-icon');
+  const btn = document.getElementById('theme-toggle');
+  if (label) label.textContent = dark ? 'Dark' : 'Light';
+  if (btn) btn.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+  if (icon) icon.innerHTML = dark
+    ? '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>'
+    : '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+}
+applyTheme(document.documentElement.getAttribute('data-theme'));
+document.getElementById('theme-toggle')?.addEventListener('click', () => {
+  const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  _store('theme', next);
+});
+
+// Collapse to an icon rail — stored per browser
+function applySidebarCollapsed(collapsed) {
+  const root = document.documentElement;
+  collapsed ? root.setAttribute('data-sidebar', 'collapsed') : root.removeAttribute('data-sidebar');
+  const btn = document.getElementById('sidebar-collapse');
+  if (btn) {
+    btn.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+    btn.setAttribute('aria-expanded', String(!collapsed));
+    const lbl = btn.querySelector('.nav-label');
+    if (lbl) lbl.textContent = collapsed ? 'Expand' : 'Collapse';
+  }
+}
+applySidebarCollapsed(document.documentElement.getAttribute('data-sidebar') === 'collapsed');
+document.getElementById('sidebar-collapse')?.addEventListener('click', () => {
+  const collapsed = document.documentElement.getAttribute('data-sidebar') !== 'collapsed';
+  closeWsMenu();
+  applySidebarCollapsed(collapsed);
+  _store('sidebar', collapsed ? 'collapsed' : null);
+});
+
 // ── Navigation ─────────────────────────────────────────────────── //
 const VIEW_LABELS = {
   dashboard: 'Dashboard', inbox: 'Chats', tickets: 'Tickets',
@@ -457,7 +756,7 @@ function navigateTo(view) {
   _stopDashQrPoll();
   _stopAllPhoneQrFlows();
   State.currentView = view;
-  document.querySelectorAll('.nav-item').forEach(el => {
+  document.querySelectorAll('.nav-item[data-view]').forEach(el => {
     el.classList.toggle('active', el.dataset.view === view);
   });
   const bc = document.getElementById('app-breadcrumb');
@@ -482,7 +781,7 @@ function navigateTo(view) {
   }[view] || (() => { main.innerHTML = `<div class="loading-center">View not found</div>`; }))();
 }
 
-document.querySelectorAll('.nav-item').forEach(el => {
+document.querySelectorAll('.nav-item[data-view]').forEach(el => {
   el.addEventListener('click', e => { e.preventDefault(); navigateTo(el.dataset.view); });
 });
 
@@ -1191,7 +1490,7 @@ async function renderContactDetail(chat) {
       </div>
       ${availableLabels.length ? `
       <div style="display:flex;gap:.4rem;align-items:center;margin-top:.4rem">
-        <select id="detail-add-label-select" style="font-size:11.5px;padding:2px 5px;border:1px solid var(--border);border-radius:4px;flex:1;height:26px;background:#fff">
+        <select id="detail-add-label-select" style="font-size:11.5px;padding:2px 5px;border:1px solid var(--border);border-radius:4px;flex:1;height:26px;background:var(--surface)">
           <option value="">+ Add label…</option>
           ${addLabelOpts}
         </select>
@@ -2171,7 +2470,7 @@ async function renderTickets() {
       <div class="section-header">
         <h2>Tickets</h2>
         <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem;align-items:center">
-          <select id="ticket-filter" style="font-size:12.5px;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:#ffffff;color:var(--text-2);font-weight:500;outline:none;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.05);transition:border-color 0.15s, box-shadow 0.15s;">
+          <select id="ticket-filter" style="font-size:12.5px;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text-2);font-weight:500;outline:none;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.05);transition:border-color 0.15s, box-shadow 0.15s;">
             <option value="">All statuses</option>
             <option value="open">Open</option>
             <option value="in_progress">In Progress</option>
