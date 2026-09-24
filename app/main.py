@@ -16,6 +16,7 @@ from app.api.auth import router as auth_router
 from app.api.automation import router as automation_router
 from app.api.bulk_messaging import router as bulk_router
 from app.api.contacts import router as contacts_router
+from app.api.dashboard import router as dashboard_router
 from app.api.inbox import router as inbox_router
 from app.api.knowledge_base import router as kb_router
 from app.api.developer import router as developer_router
@@ -157,6 +158,7 @@ app.include_router(notes_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(qr_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(bulk_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(analytics_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(dashboard_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(automation_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(ai_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(kb_router, prefix=PREFIX, dependencies=_auth)
