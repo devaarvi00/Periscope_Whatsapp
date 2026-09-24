@@ -1,6 +1,8 @@
 import uuid
+from datetime import datetime
 
-from sqlalchemy import String
+from sqlalchemy import DateTime, LargeBinary, String
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -20,3 +22,10 @@ class OrgSettings(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(120), default="Hyperscope")
     support_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     support_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Workspace logo (PNG/JPEG, <= 512 KB) — small enough to keep in the row,
+    # so it survives container rebuilds without a volume.
+    logo_data: Mapped[bytes | None] = mapped_column(
+        LargeBinary().with_variant(MEDIUMBLOB(), "mysql"), nullable=True, deferred=True
+    )
+    logo_mime: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    logo_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

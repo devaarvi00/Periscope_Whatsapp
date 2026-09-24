@@ -247,9 +247,33 @@ async def mark_read(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    await get_accessible_chat(db, agent, chat_id)
-    await MongoInboxService().mark_chat_read(chat_id)
-    return {"ok": True}
+    """Mark a chat read, per the agent's "Sync unread count" preference.
+
+    shared (default) – clear the team-wide unread count in Hyperscope only.
+    phone            – also send a WhatsApp read receipt (the phone's unread
+                       badge clears and the contact sees blue ticks).
+    personal         – leave the shared count and WhatsApp untouched; only this
+                       agent's own read marker (Mongo agent_chat_reads) is kept.
+    """
+    from app.api.auth import load_ui_prefs
+
+    chat = await get_accessible_chat(db, agent, chat_id)
+    mode = load_ui_prefs(agent).unread_sync or "shared"
+    inbox = MongoInboxService()
+    if mode == "personal":
+        await inbox.db.agent_chat_reads.update_one(
+            {"agent_id": agent.id, "chat_id": chat_id},
+            {"$set": {"read_at": datetime.utcnow()}},
+            upsert=True,
+        )
+        return {"ok": True, "mode": mode}
+    await inbox.mark_chat_read(chat_id)
+    if mode == "phone" and chat.get("chat_wid"):
+        phone = db.query(Phone).filter(Phone.id == chat.get("phone_id")).first()
+        if phone and phone.is_active:
+            # Best effort: send_seen swallows WAHA errors
+            await WAHAService.from_phone(phone).send_seen(chat["chat_wid"])
+    return {"ok": True, "mode": mode}
 
 
 @router.get("/chats/{chat_id}/messages", response_model=list[dict])

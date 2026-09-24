@@ -11,13 +11,18 @@ from app.core.security import create_access_token, hash_password, verify_passwor
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.schemas.auth import (
+    AgentAdminUpdate,
     AgentCreate,
+    AgentListOut,
     AgentOut,
     ChangePasswordRequest,
     LoginRequest,
     NotificationPrefs,
     NotificationPrefsUpdate,
+    ProfileUpdate,
     TokenResponse,
+    UiPrefs,
+    UiPrefsUpdate,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -226,12 +231,158 @@ def update_notification_prefs(
     return result
 
 
-@router.get("/agents", response_model=list[AgentOut])
-def list_agents(
+@router.patch("/me", response_model=AgentOut)
+def update_me(
+    req: ProfileUpdate,
     db: Session = Depends(get_db),
-    _agent: Agent = Depends(get_current_agent),
+    agent: Agent = Depends(get_current_agent),
 ):
-    return db.query(Agent).filter(Agent.is_active == True).all()
+    """Edit your own display name / avatar colour."""
+    changes = req.model_dump(exclude_none=True)
+    if "name" in changes:
+        name = changes["name"].strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        agent.name = name
+    if "avatar_color" in changes:
+        agent.avatar_color = changes["avatar_color"]
+    db.commit()
+    db.refresh(agent)
+    return agent
+
+
+def load_ui_prefs(agent: Agent) -> UiPrefs:
+    """Stored interface prefs; keys that no longer validate are dropped."""
+    try:
+        stored = json.loads(agent.ui_prefs) if agent.ui_prefs else {}
+    except (TypeError, ValueError):
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    clean = {}
+    for key in UiPrefs.model_fields:
+        if key in stored:
+            try:
+                UiPrefs.model_validate({key: stored[key]})
+                clean[key] = stored[key]
+            except ValueError:
+                pass
+    return UiPrefs.model_validate(clean)
+
+
+@router.get("/me/preferences", response_model=UiPrefs)
+def get_ui_prefs(agent: Agent = Depends(get_current_agent)):
+    return load_ui_prefs(agent)
+
+
+@router.put("/me/preferences", response_model=UiPrefs)
+def update_ui_prefs(
+    req: UiPrefsUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    prefs = load_ui_prefs(agent).model_dump()
+    prefs.update(req.model_dump(exclude_none=True))
+    result = UiPrefs.model_validate(prefs)
+    agent.ui_prefs = json.dumps(result.model_dump(exclude_none=True))
+    db.commit()
+    return result
+
+
+@router.get("/agents", response_model=list[AgentListOut])
+def list_agents(
+    include_inactive: bool = False,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_agent),
+):
+    """Team members with live online state and number restrictions.
+
+    include_inactive (admins only) also returns deactivated members.
+    """
+    from app.core.ws_manager import ws_manager
+    from app.models.agent import AgentRole
+    from app.models.agent_phone import AgentPhone
+
+    q = db.query(Agent)
+    if not (include_inactive and current_agent.role == AgentRole.ADMIN):
+        q = q.filter(Agent.is_active == True)
+    agents = q.order_by(Agent.id).all()
+    phones: dict[int, list[int]] = {}
+    for aid, pid in db.query(AgentPhone.agent_id, AgentPhone.phone_id).all():
+        phones.setdefault(aid, []).append(pid)
+    online = ws_manager.online_agent_ids()
+    return [
+        AgentListOut(
+            id=a.id, email=a.email, name=a.name, role=a.role, is_active=a.is_active,
+            avatar_color=a.avatar_color or "#0D8C7C",
+            online=a.id in online, phone_ids=sorted(phones.get(a.id, [])),
+        )
+        for a in agents
+    ]
+
+
+@router.patch("/agents/{agent_id}", response_model=AgentOut)
+def update_agent(
+    agent_id: int,
+    req: AgentAdminUpdate,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_agent),
+):
+    """Change a team member's role, active state or name (admin only).
+
+    Guards: you can't demote or deactivate yourself, and the workspace always
+    keeps at least one active admin.
+    """
+    from app.models.agent import AgentRole
+    from app.services.activity_service import log_activity
+
+    if current_agent.role != AgentRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only admins can manage team members")
+    target = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    changes = req.model_dump(exclude_none=True)
+    new_role = AgentRole(changes["role"]) if "role" in changes else target.role
+    new_active = changes.get("is_active", target.is_active)
+    loses_admin = target.role == AgentRole.ADMIN and target.is_active and (
+        new_role != AgentRole.ADMIN or not new_active
+    )
+    if target.id == current_agent.id and (
+        new_role != AgentRole.ADMIN or not new_active
+    ):
+        raise HTTPException(status_code=400, detail="You can't demote or deactivate yourself")
+    if loses_admin:
+        other_admins = (
+            db.query(Agent)
+            .filter(Agent.role == AgentRole.ADMIN, Agent.is_active == True, Agent.id != target.id)
+            .count()
+        )
+        if not other_admins:
+            raise HTTPException(status_code=400, detail="The workspace needs at least one active admin")
+
+    described = []
+    if "name" in changes:
+        name = changes["name"].strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        if name != target.name:
+            described.append(f"name → {name}")
+        target.name = name
+    if new_role != target.role:
+        described.append(f"role {target.role.value} → {new_role.value}")
+        target.role = new_role
+    if new_active != target.is_active:
+        described.append("reactivated" if new_active else "deactivated")
+        target.is_active = new_active
+    db.commit()
+    db.refresh(target)
+    if described:
+        log_activity(
+            db, "agent_updated", entity_type="agent", entity_id=target.id,
+            agent_id=current_agent.id,
+            description=f"Team member {target.email}: {', '.join(described)}",
+        )
+    return target
 
 
 @router.get("/agents/{agent_id}/phones")

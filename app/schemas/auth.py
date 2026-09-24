@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, EmailStr, Field, StrictBool
 
 # bcrypt only hashes the first 72 bytes (bcrypt>=5 raises beyond that);
@@ -90,3 +92,56 @@ class NotificationPrefsUpdate(BaseModel):
     types: NotificationTypesUpdate | None = None
 
     model_config = {"extra": "forbid"}
+
+
+# ── Profile / team management ─────────────────────────────────────── #
+
+AVATAR_COLOR_PATTERN = r"^#[0-9a-fA-F]{6}$"
+
+
+class ProfileUpdate(BaseModel):
+    """PATCH /auth/me — an agent editing their own profile."""
+
+    name: str | None = Field(None, min_length=1, max_length=255)
+    avatar_color: str | None = Field(None, pattern=AVATAR_COLOR_PATTERN)
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentAdminUpdate(BaseModel):
+    """PATCH /auth/agents/{id} — admin-only role / status / name change."""
+
+    name: str | None = Field(None, min_length=1, max_length=255)
+    role: Literal["admin", "agent", "viewer"] | None = None
+    is_active: StrictBool | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentListOut(AgentOut):
+    online: bool = False
+    phone_ids: list[int] = Field(default_factory=list)  # empty = every number
+
+
+# ── Interface preferences (per agent) ─────────────────────────────── #
+# Every key is optional: None = "not chosen yet", so the browser keeps its
+# local value. unread_sync decides what opening a chat does:
+#   shared   – clear the team-wide unread count in Hyperscope (default)
+#   phone    – also send a read receipt to WhatsApp (sendSeen)
+#   personal – touch neither; only this agent's read marker is recorded
+
+UnreadSync = Literal["shared", "phone", "personal"]
+
+
+class UiPrefs(BaseModel):
+    sidebar_expanded: StrictBool | None = None
+    detail_panel_open: StrictBool | None = None
+    theme: Literal["light", "dark"] | None = None
+    ask_ai_visible: StrictBool | None = None
+    unread_sync: UnreadSync | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class UiPrefsUpdate(UiPrefs):
+    """Partial update: omitted keys keep their stored value."""
