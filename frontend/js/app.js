@@ -951,10 +951,20 @@ function handleWSEvent(data) {
         }
         // Chat is on screen: keep it read on the server too
         if (!d.from_me && isOpen) Api.inbox.markRead(d.chat_id).catch(() => {});
-        // Bubble this chat to the top
-        State.inbox.chats = [chatEntry, ...State.inbox.chats.filter(c => c.id !== d.chat_id)];
-        renderChatList(State.inbox.chats, _chatHasMore);
+        if (_cxPaused) {
+          // Paused: refresh the row where it is, remember it for resume
+          cxRerenderRow(chatEntry);
+          _cxPending.set(chatEntry.id, true);
+          cxRenderPauseBtn();
+        } else {
+          // Bubble this chat to the top
+          State.inbox.chats = [chatEntry, ...State.inbox.chats.filter(c => c.id !== d.chat_id)];
+          renderChatList(State.inbox.chats, _chatHasMore);
+        }
         _updateUnreadBadge(State.inbox.chats);
+      } else if (_cxPaused) {
+        _cxPending.set(+d.chat_id, false);
+        cxRenderPauseBtn();
       } else {
         // New chat not yet in state — full refresh
         refreshChatList();
@@ -1060,6 +1070,9 @@ function handleWSEvent(data) {
     if (ph) ph.waha_status = d.status;
     updatePhoneBadge();
     if (State.currentView === 'dashboard') _dashSetPhoneStatus(d.phone_id, d.status);
+    // Open chat on that number: re-evaluate the composer's disconnected banner
+    const openChatEntry = State.currentView === 'inbox' && State.inbox.chats?.find(c => c.id == State.inbox.selectedChatId);
+    if (openChatEntry && openChatEntry.phone_id === d.phone_id) cxUpdateComposerState(openChatEntry);
     // If phone became WORKING and we're on inbox, reload chats
     if (d.status === 'WORKING' && State.currentView === 'inbox') {
       _chatAutoSynced = false;
@@ -1185,6 +1198,16 @@ const CX_ICONS = {
   trash:     '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
   play:      '<polygon points="6 4 20 12 6 20 6 4"/>',
   calendar:  '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+  list:      '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/>',
+  props:     '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="7" y1="8" x2="7.01" y2="8"/><line x1="11" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="7.01" y2="12"/><line x1="11" y1="12" x2="17" y2="12"/><line x1="7" y1="16" x2="7.01" y2="16"/><line x1="11" y1="16" x2="17" y2="16"/>',
+  pause:     '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
+  copy:      '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  link:      '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  userMinus: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="22" y1="11" x2="16" y2="11"/>',
+  shield:    '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  alert:     '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
+  plus:      '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+  chevUpDown:'<polyline points="7 9 12 4 17 9"/><polyline points="7 15 12 20 17 15"/>',
 };
 function cxIcon(name, size = 16) {
   return `<svg class="cx-ico" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${CX_ICONS[name] || ''}</svg>`;
@@ -1203,11 +1226,31 @@ function cxFmtListDate(ts) {
 function cxDayLabel(d) {
   return `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
 }
-// "+91 95107 15498" for Indian numbers, "+<digits>" otherwise
+// International display: "+91 95107 15498", "+44 7721 135624", "+61 492 972 562",
+// "+1 415 555 0123"; other countries "+<cc> <rest in 3s>" when the code is known.
+const CX_CC_GROUPS = {
+  '1': [3, 3, 4], '7': [3, 3, 2, 2], '20': [3, 3, 4], '27': [2, 3, 4], '31': [1, 4, 4], '33': [1, 2, 2, 2, 2],
+  '34': [3, 3, 3], '39': [3, 3, 4], '44': [4, 6], '49': [3, 4, 4], '52': [2, 4, 4], '55': [2, 5, 4],
+  '60': [2, 3, 4], '61': [3, 3, 3], '62': [3, 4, 4], '63': [3, 3, 4], '64': [2, 3, 4], '65': [4, 4],
+  '66': [2, 3, 4], '81': [2, 4, 4], '86': [3, 4, 4], '90': [3, 3, 4], '91': [5, 5], '92': [3, 7],
+  '94': [2, 3, 4], '234': [3, 3, 4], '254': [3, 6], '880': [4, 6], '966': [2, 3, 4], '971': [2, 3, 4],
+  '974': [4, 4], '977': [3, 7],
+};
 function cxFmtPhone(num) {
   const d = String(num || '').replace(/\D/g, '');
   if (!d) return '';
-  if (d.length === 12 && d.startsWith('91')) return `+91 ${d.slice(2, 7)} ${d.slice(7)}`;
+  for (const len of [3, 2, 1]) {
+    const cc = d.slice(0, len), groups = CX_CC_GROUPS[cc];
+    if (!groups) continue;
+    let rest = d.slice(len);
+    // Only lengths that fit the country's plan (LIDs / group ids stay raw)
+    const want = groups.reduce((a, b) => a + b, 0);
+    if (d.length > 15 || rest.length < want - (cc === '1' ? 0 : 2) || rest.length > want + (cc === '1' ? 0 : 1)) break;
+    const parts = [];
+    for (const g of groups) { if (!rest) break; parts.push(rest.slice(0, g)); rest = rest.slice(g); }
+    if (rest) parts[parts.length - 1] += rest;
+    return `+${cc} ${parts.join(' ')}`;
+  }
   return '+' + d;
 }
 function cxPhoneOf(chat) { return State.phones.find(p => p.id === chat?.phone_id); }
@@ -1269,13 +1312,35 @@ async function cxLoadAgents() {
   } catch (_) {}
   return Object.values(_cxAgentMap);
 }
-function cxAssigneeAvatar(agentId, size = 20) {
+function cxAssigneeAvatar(agentId, size = 20, opts = {}) {
   const a = agentId != null ? _cxAgentMap[agentId] : null;
   if (agentId == null) {
     return `<span class="cx-assignee none" style="width:${size}px;height:${size}px" title="Unassigned">${cxIcon('user', Math.round(size * .6))}</span>`;
   }
   const name = a?.name || `Agent #${agentId}`;
-  return `<span class="cx-assignee" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .42)}px;background:${avatarColor(name)}" title="Assigned to ${esc(name)}">${esc(initials(name))}</span>`;
+  const dot = opts.dot ? `<i class="cx-odot${_cxOnline.has(+agentId) ? ' on' : ''}"></i>` : '';
+  const tip = opts.title || `Assigned to ${name}${opts.dot ? (_cxOnline.has(+agentId) ? ' · online' : ' · offline') : ''}`;
+  return `<span class="cx-assignee" data-agent-av="${+agentId}" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .42)}px;background:${avatarColor(name)}" title="${esc(tip)}">${esc(initials(name))}${dot}</span>`;
+}
+
+// Agents who can open a chat (its number's team) + live online state, per phone
+let _cxOnline = new Set();
+const _cxTeam = new Map();   // phone id → { at, promise }
+function cxTeam(chat) {
+  const hit = _cxTeam.get(chat.phone_id);
+  if (hit && Date.now() - hit.at < 60e3) return hit.promise;
+  const promise = Api.inbox.team(chat.id).then(list => {
+    (list || []).forEach(a => { if (a.online) _cxOnline.add(a.id); else _cxOnline.delete(a.id); });
+    return list || [];
+  }).catch(e => { _cxTeam.delete(chat.phone_id); throw e; });
+  _cxTeam.set(chat.phone_id, { at: Date.now(), promise });
+  return promise;
+}
+// Repaint online dots once presence is known
+function cxRefreshOnlineDots() {
+  document.querySelectorAll('.cx-assignee[data-agent-av] .cx-odot').forEach(d => {
+    d.classList.toggle('on', _cxOnline.has(+d.parentElement.dataset.agentAv));
+  });
 }
 
 // Generic anchored popover (one at a time)
@@ -1302,9 +1367,10 @@ function cxPopover(anchor, html, opts = {}) {
   return el;
 }
 
+// 'all' already excludes archived chats (the API defaults to is_archived=false),
+// so it is the "Inbox"; the legacy 'inbox' value still resolves to it.
 const CX_FOLDERS = [
-  { f: 'all', label: 'All chats' },
-  { f: 'inbox', label: 'Inbox' },
+  { f: 'all', label: 'Inbox' },
   { f: 'mine', label: 'Assigned to me' },
   { f: 'unread', label: 'Unread' },
   { f: 'flagged', label: 'Flagged' },
@@ -1316,6 +1382,10 @@ function cxFolderLabel() {
     return l ? l.name : 'Label';
   }
   return (CX_FOLDERS.find(x => x.f === State.inbox.filter) || CX_FOLDERS[0]).label;
+}
+function cxFolderSelected(f) {
+  const cur = State.inbox.filter === 'inbox' ? 'all' : State.inbox.filter;
+  return !State.inbox.labelFilter && cur === f;
 }
 function cxFiltersActive() {
   return !!(State.inbox.typeFilter || State.inbox.statusFilter || State.inbox.showArchived);
@@ -1356,14 +1426,14 @@ async function renderInbox() {
     <div class="inbox-layout cx-layout h-full" id="inbox-layout">
       <div class="chat-list-panel cx-list-panel" id="chat-list-panel">
         <div class="cx-list-head">
-          <button type="button" class="cx-ibtn" id="cx-phone-btn" title="All phones">${cxIcon('phone')}</button>
-          <button type="button" class="cx-folder-btn" id="cx-folder-btn">
-            ${cxIcon('folder', 15)}<span id="cx-folder-label">${esc(cxFolderLabel())}</span>${cxIcon('chevDown', 14)}
+          <button type="button" class="cx-hbtn" id="cx-phone-btn" title="All phones" aria-label="Phone filter">${cxIcon('phone')}</button>
+          <button type="button" class="cx-folder-btn" id="cx-folder-btn" aria-haspopup="menu">
+            ${cxIcon('folder', 16)}<span id="cx-folder-label">${esc(cxFolderLabel())}</span>${cxIcon('chevDown', 14)}
           </button>
           <span class="cx-grow"></span>
-          <button type="button" class="cx-ibtn" id="cx-search-toggle" title="Search chats">${cxIcon('search')}</button>
-          <button type="button" class="cx-ibtn" id="cx-filter-btn" title="Filters">${cxIcon('filter')}</button>
-          <button type="button" class="cx-ibtn" id="sync-btn" title="Sync chats from WhatsApp">${cxIcon('sync')}</button>
+          <button type="button" class="cx-hbtn" id="cx-pause-btn" aria-pressed="false"></button>
+          <button type="button" class="cx-hbtn" id="cx-search-toggle" title="Search chats" aria-label="Search chats">${cxIcon('search')}</button>
+          <button type="button" class="cx-hbtn" id="cx-filter-btn" title="Filters" aria-label="Filters">${cxIcon('filter')}</button>
         </div>
         <div class="cx-search-row" id="cx-search-row" ${State.inbox.search ? '' : 'hidden'}>
           ${cxIcon('search', 14)}
@@ -1416,7 +1486,7 @@ async function renderInbox() {
     const btn = e.currentTarget;
     const pop = cxPopover(btn, `
       ${CX_FOLDERS.map(x => {
-        const sel = !State.inbox.labelFilter && State.inbox.filter === x.f;
+        const sel = cxFolderSelected(x.f);
         return `<button class="cx-pop-item${sel ? ' sel' : ''}" data-folder="${x.f}">${cxIcon('folder', 14)}<span>${x.label}</span>${sel ? cxIcon('check', 14) : ''}</button>`;
       }).join('')}
       <div class="cx-pop-sep"></div>
@@ -1456,8 +1526,11 @@ async function renderInbox() {
       <div class="cx-pop-title">Status</div>
       <div class="cx-seg">${opt('status', '', 'Any', i.statusFilter)}${opt('status', 'open', 'Open', i.statusFilter)}${opt('status', 'resolved', 'Resolved', i.statusFilter)}</div>
       <label class="cx-pop-check"><input type="checkbox" id="cx-f-archived" ${i.showArchived ? 'checked' : ''}> Show archived chats only</label>
-      ${cxFiltersActive() ? `<button class="cx-pop-item" data-reset="1">${cxIcon('x', 14)}<span>Reset filters</span></button>` : ''}`,
+      ${cxFiltersActive() ? `<button class="cx-pop-item" data-reset="1">${cxIcon('x', 14)}<span>Reset filters</span></button>` : ''}
+      <div class="cx-pop-sep"></div>
+      <button class="cx-pop-item" id="sync-btn">${cxIcon('sync', 14)}<span>Sync chats from WhatsApp</span></button>`,
       { alignRight: true, cls: 'cx-pop-wide' });
+    pop.querySelector('#sync-btn').addEventListener('click', ev => { ev.stopPropagation(); cxSyncChats(ev.currentTarget); });
     pop.querySelectorAll('.cx-seg-btn').forEach(b => b.addEventListener('click', () => {
       if (b.dataset.g === 'type') i.typeFilter = b.dataset.v || null;
       else i.statusFilter = b.dataset.v || null;
@@ -1474,20 +1547,8 @@ async function renderInbox() {
     });
   });
 
-  document.getElementById('sync-btn').addEventListener('click', async () => {
-    const phone = State.phones.find(p => p.id == State.inbox.phoneFilter && p.waha_status === 'WORKING')
-      || State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
-    if (!phone) return toast('No WhatsApp connected', 'error');
-    const btn = document.getElementById('sync-btn');
-    if (btn) { btn.disabled = true; btn.classList.add('spinning'); }
-    try {
-      await Api.inbox.sync(phone.id);
-      _chatAutoSynced = false;
-      toast('Synced from WhatsApp', 'success');
-      await loadChats();
-    } catch(e) { toast(e.message || 'Sync failed — is WhatsApp connected?', 'error'); }
-    finally { if (btn) { btn.disabled = false; btn.classList.remove('spinning'); } }
-  });
+  document.getElementById('cx-pause-btn').addEventListener('click', () => cxSetPaused(!_cxPaused));
+  cxRenderPauseBtn();
 
   // Chat rows (delegated): "+ Label" / label chips open the picker, else open chat
   document.getElementById('chat-list').addEventListener('click', e => {
@@ -1504,6 +1565,57 @@ async function renderInbox() {
 
   cxUpdateListHeader();
   await _inboxReady;
+}
+
+async function cxSyncChats(btn) {
+  const phone = State.phones.find(p => p.id == State.inbox.phoneFilter && p.waha_status === 'WORKING')
+    || State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
+  if (!phone) return toast('No WhatsApp connected', 'error');
+  if (btn) { btn.disabled = true; btn.classList.add('spinning'); }
+  try {
+    await Api.inbox.sync(phone.id);
+    _chatAutoSynced = false;
+    toast('Synced from WhatsApp', 'success');
+    cxClosePop();
+    await loadChats();
+  } catch(e) { toast(e.message || 'Sync failed — is WhatsApp connected?', 'error'); }
+  finally { if (btn && btn.isConnected) { btn.disabled = false; btn.classList.remove('spinning'); } }
+}
+
+// ── Pause live re-ordering ─────────────────────────────────────── //
+// While paused, new activity still updates each row in place (preview,
+// unread count) but nothing moves; resuming bubbles those chats up.
+let _cxPaused = false;
+const _cxPending = new Map();     // chat id → true (known) / false (not in the list yet)
+function cxRenderPauseBtn() {
+  const b = document.getElementById('cx-pause-btn');
+  if (!b) return;
+  const n = _cxPending.size;
+  b.classList.toggle('on', _cxPaused);
+  b.setAttribute('aria-pressed', String(_cxPaused));
+  b.title = _cxPaused
+    ? (n ? `Paused — ${n} chat${n === 1 ? '' : 's'} with new activity. Resume to update the list` : 'Paused — resume live updates')
+    : 'Pause live updates (stop the list from re-ordering)';
+  b.setAttribute('aria-label', b.title);
+  b.innerHTML = _cxPaused
+    ? `${cxIcon('play', 15)}${n ? `<span class="cx-pause-count">${n > 99 ? '99+' : n}</span>` : ''}`
+    : cxIcon('pause', 15);
+}
+function cxSetPaused(on) {
+  _cxPaused = !!on;
+  if (!_cxPaused && _cxPending.size) {
+    const unknown = [..._cxPending.values()].some(v => !v);
+    const ids = new Set(_cxPending.keys());
+    _cxPending.clear();
+    if (unknown) loadChats();
+    else {
+      const moved = State.inbox.chats.filter(c => ids.has(c.id))
+        .sort((a, b) => (parseServerDate(b.last_message_at) || 0) - (parseServerDate(a.last_message_at) || 0));
+      State.inbox.chats = moved.concat(State.inbox.chats.filter(c => !ids.has(c.id)));
+      renderChatList(State.inbox.chats, _chatHasMore);
+    }
+  }
+  cxRenderPauseBtn();
 }
 
 function cxOpenChatLabelPicker(anchor, chat) {
@@ -1542,6 +1654,8 @@ async function loadChats() {
   const seq = ++_chatListSeq;
   _chatLoadOffset = 0;
   _chatLoadingMore = false;
+  // A full reload re-orders everything anyway
+  if (_cxPending.size) { _cxPending.clear(); cxRenderPauseBtn(); }
 
   // Refresh phone state from server so status is always current
   try { State.phones = await Api.phones.list(); } catch(_) {}
@@ -1859,36 +1973,52 @@ async function cxAssign(chat, agentId) {
     cxRerenderRow(chat);
     if (State.inbox.selectedChatId == chat.id) {
       const hb = document.getElementById('cx-assign-btn');
-      if (hb) hb.innerHTML = cxAssigneeAvatar(chat.assigned_to, 26);
+      if (hb) hb.innerHTML = cxAssigneeAvatar(chat.assigned_to, 28, { dot: true });
+      const dh = document.getElementById('cx-dp-assign');
+      if (dh) dh.innerHTML = cxAssigneeAvatar(chat.assigned_to, 26, { dot: true });
       const sel = document.getElementById('detail-assign-select');
       if (sel) sel.value = agentId == null ? '' : String(agentId);
+      const sa = document.getElementById('cx-set-assign');
+      if (sa) sa.innerHTML = cxSettingsAssignHtml(chat);
     }
   } catch (err) { toast(err.message, 'error'); }
 }
 
 // ── Contact Detail Panel (tabbed) ──────────────────────────────── //
 const CX_TABS = [
-  { id: 'details',    icon: 'info',    label: 'Details' },
-  { id: 'properties', icon: 'sliders', label: 'Properties' },
-  { id: 'ai',         icon: 'bot',     label: 'AI' },
+  { id: 'details',    icon: 'list',    label: 'Details' },
+  { id: 'properties', icon: 'props',   label: 'Properties' },
+  { id: 'ai',         icon: 'sparkle', label: 'AI' },
   { id: 'tickets',    icon: 'ticket',  label: 'Tickets & Tasks' },
   { id: 'members',    icon: 'users',   label: 'Members', group: true },
   { id: 'media',      icon: 'image',   label: 'Media' },
-  { id: 'analytics',  icon: 'chart',   label: 'Group Analytics', group: true },
-  { id: 'history',    icon: 'history', label: 'History' },
+  { id: 'analytics',  icon: 'chart',   label: 'Analytics', group: true },
+  { id: 'history',    icon: 'clock',   label: 'History' },
   { id: 'notes',      icon: 'note',    label: 'Notes' },
+  { id: 'settings',   icon: 'sliders', label: 'Settings' },
 ];
 let _cxDetailTab = 'details';
 let _cxDetailSeq = 0;
 const _cxParticipants = new Map();   // chat id → participants promise
 
-function cxParticipants(chat) {
-  if (!_cxParticipants.has(chat.id)) {
-    const p = Api.groups.participants(chat.id).catch(e => { _cxParticipants.delete(chat.id); throw e; });
+function cxParticipants(chat, refresh) {
+  if (refresh || !_cxParticipants.has(chat.id)) {
+    const p = Api.groups.participants(chat.id, refresh).catch(e => { _cxParticipants.delete(chat.id); throw e; });
     _cxParticipants.set(chat.id, p);
   }
   return _cxParticipants.get(chat.id);
 }
+// Group subject / description / settings + whether our number is a member
+// or admin (server caches WAHA for ~5 min; this keeps one request per chat)
+const _cxGroupInfo = new Map();
+function cxGroupInfo(chat, refresh) {
+  if (refresh || !_cxGroupInfo.has(chat.id)) {
+    const p = Api.groups.info(chat.id, refresh).catch(e => { _cxGroupInfo.delete(chat.id); throw e; });
+    _cxGroupInfo.set(chat.id, p);
+  }
+  return _cxGroupInfo.get(chat.id);
+}
+function cxForgetGroup(chatId) { _cxParticipants.delete(chatId); _cxGroupInfo.delete(chatId); }
 
 function cxCloseDetail(savePref = true) {
   const panel = document.getElementById('detail-panel');
@@ -1927,29 +2057,42 @@ async function renderContactDetail(chat, tab) {
 
   panel.innerHTML = `
     <div class="cx-dp-head">
-      ${cxAvatar(chat, 40)}
+      ${cxAvatar(chat, 56)}
       <div class="cx-dp-title">
-        <div class="cx-dp-name">${esc(displayName(chat))}</div>
+        <div class="cx-dp-name" title="${esc(displayName(chat))}">${esc(displayName(chat))}</div>
         <div class="cx-dp-labels" id="cx-dp-labels"></div>
       </div>
       <div class="cx-dp-actions">
-        <button class="cx-ibtn" id="cx-dp-assign" title="Assign">${cxIcon('userPlus')}</button>
-        <button class="cx-ibtn" id="cx-dp-edit" title="Edit properties">${cxIcon('edit')}</button>
-        <button class="cx-ibtn" id="cx-dp-sync" title="Sync messages from WhatsApp">${cxIcon('sync')}</button>
-        <button class="cx-ibtn" id="close-detail-btn" title="Collapse panel">${cxIcon('panel')}</button>
+        <button class="cx-assign-btn sm" id="cx-dp-assign" title="Assign" aria-label="Assign chat">${cxAssigneeAvatar(chat.assigned_to, 26, { dot: true })}</button>
+        <button class="cx-ibtn" id="cx-dp-edit" title="Edit properties" aria-label="Edit properties">${cxIcon('edit')}</button>
+        <button class="cx-ibtn" id="cx-dp-sync" title="Sync messages from WhatsApp" aria-label="Sync">${cxIcon('sync')}</button>
+        <button class="cx-ibtn" id="close-detail-btn" title="Collapse panel" aria-label="Collapse panel">${cxIcon('panel')}</button>
       </div>
     </div>
     <div class="cx-dp-tabs" role="tablist">
-      ${tabs.map(t => `<button class="cx-dp-tab${t.id === _cxDetailTab ? ' on' : ''}" data-tab="${t.id}" role="tab" aria-selected="${t.id === _cxDetailTab}" title="${esc(t.label)}">${cxIcon(t.icon, 16)}${t.id === _cxDetailTab ? `<span>${esc(t.label)}</span>` : ''}</button>`).join('')}
+      ${tabs.map(t => `<button class="cx-dp-tab${t.id === _cxDetailTab ? ' on' : ''}" data-tab="${t.id}" role="tab" aria-selected="${t.id === _cxDetailTab}" aria-label="${esc(t.label)}" title="${esc(t.label)}">${cxIcon(t.icon, 16)}${t.id === _cxDetailTab ? `<span>${esc(t.label)}</span>` : ''}</button>`).join('')}
     </div>
     <div class="detail-panel-body cx-dp-body" id="detail-panel-body"></div>`;
 
   cxRefreshDetailHead(chat);
   panel.querySelectorAll('.cx-dp-tab').forEach(b => b.addEventListener('click', () => renderContactDetail(chat, b.dataset.tab)));
+  // Keep the active tab visible when the row overflows (narrow panels)
+  const tabRow = panel.querySelector('.cx-dp-tabs'), onTab = panel.querySelector('.cx-dp-tab.on');
+  if (tabRow && onTab && tabRow.scrollWidth > tabRow.clientWidth) {
+    const l = onTab.offsetLeft - tabRow.offsetLeft, r = l + onTab.offsetWidth;
+    if (r > tabRow.clientWidth) tabRow.scrollLeft = r - tabRow.clientWidth + 8;
+  }
+  cxTeam(chat).then(cxRefreshOnlineDots).catch(() => {});
   document.getElementById('close-detail-btn').addEventListener('click', () => cxCloseDetail());
   document.getElementById('cx-dp-assign').addEventListener('click', e => { e.stopPropagation(); cxOpenAssignPop(e.currentTarget, chat, { alignRight: true }); });
   document.getElementById('cx-dp-edit').addEventListener('click', () => renderContactDetail(chat, 'properties'));
-  document.getElementById('cx-dp-sync').addEventListener('click', () => cxSyncThread(chat));
+  document.getElementById('cx-dp-sync').addEventListener('click', async e => {
+    const b = e.currentTarget;
+    b.classList.add('spinning');
+    await cxSyncThread(chat);
+    b.classList.remove('spinning');
+    if (State.inbox.selectedChatId == chat.id && ['members', 'settings'].includes(_cxDetailTab)) renderContactDetail(chat);
+  });
 
   const body = document.getElementById('detail-panel-body');
   const seq = ++_cxDetailSeq;
@@ -1957,6 +2100,7 @@ async function renderContactDetail(chat, tab) {
   const renderers = {
     details: cxTabDetails, properties: cxTabProperties, ai: cxTabAI, tickets: cxTabTickets,
     members: cxTabMembers, media: cxTabMedia, analytics: cxTabAnalytics, history: cxTabHistory, notes: cxTabNotes,
+    settings: cxTabSettings,
   };
   try { await renderers[_cxDetailTab](chat, body, stale); }
   catch (e) { if (!stale()) body.innerHTML = `<div class="cx-dp-empty">Could not load — ${esc(e.message || 'error')}</div>`; }
@@ -2172,10 +2316,72 @@ async function cxTabTickets(chat, body, stale) {
   document.getElementById('cx-new-task').addEventListener('click', () => showTaskModal({ chatId: chat.id, onSaved: again }));
 }
 
-async function cxTabMembers(chat, body, stale) {
+// ── Members tab (groups) ── rendered in pages of 80 as you scroll, so 1,000+
+// member groups stay light; pictures load lazily for rows on screen.
+const CX_MEM_PAGE = 80;
+const _cxMemPics = new Map();     // `${chatId}|${pid}` → url | '' (none)
+let _cxMemPicQueue = [], _cxMemPicBusy = 0, _cxMemObs = null;
+function cxMemberPictureObserve(chat, root) {
+  if (_cxMemObs) _cxMemObs.disconnect();
+  _cxMemPicQueue = [];
+  if (!('IntersectionObserver' in window)) return;
+  _cxMemObs = new IntersectionObserver(entries => entries.forEach(en => {
+    if (!en.isIntersecting) return;
+    _cxMemObs.unobserve(en.target);
+    const pid = en.target.dataset.pid;
+    const key = `${chat.id}|${pid}`;
+    if (_cxMemPics.has(key)) { cxPaintMemberPic(en.target, _cxMemPics.get(key)); return; }
+    _cxMemPicQueue.push({ el: en.target, pid, key, chatId: chat.id });
+    cxPumpMemberPics();
+  }), { root, rootMargin: '120px' });
+}
+function cxPumpMemberPics() {
+  while (_cxMemPicBusy < 3 && _cxMemPicQueue.length) {
+    const job = _cxMemPicQueue.shift();
+    if (!job.el.isConnected) continue;
+    _cxMemPicBusy++;
+    Api.groups.memberPicture(job.chatId, job.pid)
+      .then(r => { const u = cxSafePicture(r?.url); _cxMemPics.set(job.key, u); cxPaintMemberPic(job.el, u); })
+      .catch(() => _cxMemPics.set(job.key, ''))
+      .finally(() => { _cxMemPicBusy--; cxPumpMemberPics(); });
+  }
+}
+function cxPaintMemberPic(av, url) {
+  if (!url || !av.isConnected || av.querySelector('img')) return;
+  const img = document.createElement('img');
+  img.alt = ''; img.referrerPolicy = 'no-referrer'; img.loading = 'lazy';
+  img.onerror = () => img.remove();
+  img.src = url;
+  av.appendChild(img);
+}
+function cxMemberLabel(p) {
+  if (p.is_me) return 'You';
+  if (p.has_number !== false && /^\d{6,}$/.test(p.number)) return cxFmtPhone(p.number);
+  return p.name || 'Hidden number';
+}
+function cxMemberRow(p, canManage) {
+  const label = cxMemberLabel(p);
+  const sub = p.is_me ? (p.name || 'This WhatsApp number') : (p.has_number === false ? (p.name ? '~' : 'Number hidden by WhatsApp') : (p.name || '~'));
+  const menu = canManage && !p.is_me && !(p.is_super_admin);
+  return `<div class="cx-member" data-pid="${esc(p.id)}">
+    <span class="cx-avatar cx-mem-av" data-pid="${esc(p.id)}" style="width:34px;height:34px;background:${avatarColor(p.number || p.id)}">${cxIcon('user', 16)}</span>
+    <span class="cx-member-text"><span class="cx-member-num">${esc(label)}</span><span class="cx-member-sub">${esc(sub)}</span></span>
+    ${p.is_super_admin ? '<span class="cx-admin" title="Group owner">Owner</span>' : p.is_admin ? '<span class="cx-admin">Admin</span>' : ''}
+    ${menu ? `<button class="cx-ibtn sm cx-mem-menu" data-mem-menu="${esc(p.id)}" title="Member actions" aria-label="Member actions">${cxIcon('more', 15)}</button>` : ''}
+  </div>`;
+}
+function cxManageTip(res) {
+  if (!res.phone_working) return 'This WhatsApp number is disconnected';
+  if (!res.crm_admin) return 'Only CRM admins can manage group members';
+  if (res.is_member === false) return 'Your number is no longer in this group';
+  if (!res.me_admin) return 'Your WhatsApp number is not an admin of this group';
+  return '';
+}
+
+async function cxTabMembers(chat, body, stale, refresh) {
   body.innerHTML = cxDpLoading();
   let res;
-  try { res = await cxParticipants(chat); }
+  try { res = await cxParticipants(chat, refresh); }
   catch (e) { if (!stale()) body.innerHTML = `<div class="cx-dp-empty">${esc(e.message || 'Could not load members')}</div>`; return; }
   if (stale()) return;
   const list = res.participants || [];
@@ -2183,21 +2389,143 @@ async function cxTabMembers(chat, body, stale) {
     body.innerHTML = '<div class="cx-dp-empty">Members are only available while this WhatsApp number is connected.</div>';
     return;
   }
-  const admins = list.filter(p => p.is_admin).length;
+  const can = !!res.can_manage;
+  const tip = cxManageTip(res);
   body.innerHTML = `
-    <div class="detail-section">
-      <div class="cx-sec-head"><span class="detail-section-label">${list.length} members · ${admins} admin${admins === 1 ? '' : 's'}</span></div>
-      <input type="search" class="cx-dp-search" id="cx-mem-search" placeholder="Search number…">
-      <div id="cx-mem-list">${list.map(p => `
-        <div class="cx-member" data-num="${esc(p.number)}">
-          <span class="cx-assignee" style="width:26px;height:26px;font-size:10px;background:${avatarColor(p.number)}">${cxIcon('user', 13)}</span>
-          <span class="cx-member-num">${esc(/^\d{6,}$/.test(p.number) ? cxFmtPhone(p.number) : p.number)}</span>
-          ${p.is_admin ? '<span class="cx-admin">Admin</span>' : ''}
-        </div>`).join('')}</div>
-    </div>`;
+    <div class="cx-mem-actions">
+      <button class="cx-mem-action" id="cx-mem-add" ${can ? '' : `disabled aria-disabled="true"`} title="${esc(can ? 'Add members to this group' : tip)}">
+        <span class="cx-mem-action-ic">${cxIcon('userPlus', 16)}</span><span>Add Members</span>
+      </button>
+      <button class="cx-mem-action" id="cx-mem-invite" ${can ? '' : `disabled aria-disabled="true"`} title="${esc(can ? 'Get the group invite link' : tip)}">
+        <span class="cx-mem-action-ic">${cxIcon('link', 16)}</span><span>Invite to group via link</span>
+      </button>
+      <div class="cx-invite" id="cx-invite" hidden></div>
+    </div>
+    <div class="cx-mem-count"><span>${list.length.toLocaleString()} member${list.length === 1 ? '' : 's'}</span><i></i>
+      <button class="cx-ibtn sm" id="cx-mem-refresh" title="Refresh members" aria-label="Refresh members">${cxIcon('sync', 13)}</button></div>
+    <div class="cx-mem-search">${cxIcon('search', 14)}<input type="search" id="cx-mem-search" placeholder="Search name or number…" autocomplete="off" aria-label="Search members"></div>
+    <div id="cx-mem-list" class="cx-mem-list"></div>
+    <div id="cx-mem-more" class="cx-mem-more"></div>`;
+
+  const listEl = document.getElementById('cx-mem-list');
+  const moreEl = document.getElementById('cx-mem-more');
+  let rows = list, shown = 0, moreObs = null;
+  cxMemberPictureObserve(chat, body);
+  const renderMore = () => {
+    const next = rows.slice(shown, shown + CX_MEM_PAGE);
+    listEl.insertAdjacentHTML('beforeend', next.map(p => cxMemberRow(p, can)).join(''));
+    shown += next.length;
+    if (_cxMemObs) listEl.querySelectorAll('.cx-mem-av:not([data-obs])').forEach(av => { av.dataset.obs = '1'; _cxMemObs.observe(av); });
+    moreEl.textContent = shown < rows.length ? `Showing ${shown.toLocaleString()} of ${rows.length.toLocaleString()}` : '';
+    if (!rows.length) listEl.innerHTML = '<div class="cx-dp-muted" style="padding:.75rem 1rem">No members match</div>';
+  };
+  const reset = () => { listEl.innerHTML = ''; shown = 0; renderMore(); };
+  if ('IntersectionObserver' in window) {
+    moreObs = new IntersectionObserver(en => { if (en[0].isIntersecting && shown < rows.length && !stale()) renderMore(); }, { root: body, rootMargin: '400px' });
+    moreObs.observe(moreEl);
+  } else moreEl.addEventListener('click', renderMore);
+  reset();
+
+  let t = null;
   document.getElementById('cx-mem-search').addEventListener('input', e => {
-    const q = e.target.value.replace(/\D/g, '');
-    body.querySelectorAll('.cx-member').forEach(r => { r.hidden = !!q && !r.dataset.num.includes(q); });
+    clearTimeout(t);
+    t = setTimeout(() => {
+      const q = e.target.value.trim().toLowerCase();
+      const qd = q.replace(/\D/g, '');
+      rows = !q ? list : list.filter(p => (qd && p.has_number !== false && p.number.includes(qd)) || (p.name || '').toLowerCase().includes(q) || (p.is_me && 'you'.includes(q)));
+      reset();
+    }, 120);
+  });
+  document.getElementById('cx-mem-refresh').addEventListener('click', () => cxTabMembers(chat, body, stale, true));
+
+  const again = () => { cxForgetGroup(chat.id); if (!stale()) cxTabMembers(chat, body, stale, true); };
+  document.getElementById('cx-mem-add').addEventListener('click', () => { if (can) cxShowAddMembers(chat, again); });
+  document.getElementById('cx-mem-invite').addEventListener('click', async e => {
+    if (!can) return;
+    if (!confirm('Get this group’s invite link?\n\nAnyone who has the link can join the group. WhatsApp creates a link if the group has none yet.')) return;
+    const btn = e.currentTarget, box = document.getElementById('cx-invite');
+    btn.disabled = true;
+    try {
+      const r = await Api.groups.inviteLink(chat.id);
+      if (stale()) return;
+      box.hidden = false;
+      box.innerHTML = `<input type="text" readonly value="${esc(r.link)}" aria-label="Invite link"><button class="btn btn-secondary btn-sm" id="cx-invite-copy">${cxIcon('copy', 13)} Copy</button>`;
+      document.getElementById('cx-invite-copy').addEventListener('click', () => cxCopy(r.link, 'Invite link copied'));
+    } catch (err) { toast(err.message, 'error'); }
+    if (btn.isConnected) btn.disabled = false;
+  });
+
+  listEl.addEventListener('click', e => {
+    const b = e.target.closest('[data-mem-menu]');
+    if (!b) return;
+    e.stopPropagation();
+    const p = list.find(x => x.id === b.dataset.memMenu);
+    if (p) cxOpenMemberMenu(b, chat, p, again);
+  });
+}
+
+function cxCopy(text, msg) {
+  const done = () => toast(msg || 'Copied', 'success');
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done, () => toast('Could not copy', 'error'));
+  else {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch (_) { toast('Could not copy', 'error'); }
+    ta.remove();
+  }
+}
+
+function cxOpenMemberMenu(anchor, chat, p, onDone) {
+  const who = cxMemberLabel(p);
+  const pop = cxPopover(anchor, `
+    <div class="cx-pop-title">${esc(who)}</div>
+    ${p.is_admin
+      ? `<button class="cx-pop-item" data-act="demote">${cxIcon('shield', 14)}<span>Dismiss as admin</span></button>`
+      : `<button class="cx-pop-item" data-act="promote">${cxIcon('shield', 14)}<span>Make group admin</span></button>`}
+    <button class="cx-pop-item danger" data-act="remove">${cxIcon('userMinus', 14)}<span>Remove from group</span></button>`,
+    { alignRight: true });
+  const Q = {
+    promote: [`Make ${who} an admin of “${displayName(chat)}”?`, 'is now an admin'],
+    demote: [`Dismiss ${who} as admin of “${displayName(chat)}”?`, 'is no longer an admin'],
+    remove: [`Remove ${who} from “${displayName(chat)}”?\n\nThey will stop receiving the group’s messages.`, 'was removed'],
+  };
+  pop.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', async ev => {
+    ev.stopPropagation();
+    const act = b.dataset.act;
+    cxClosePop();
+    if (!confirm(Q[act][0])) return;
+    try {
+      await Api.groups.memberAction(chat.id, act, [p.id]);
+      toast(`${who} ${Q[act][1]}`, 'success');
+      onDone();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+function cxShowAddMembers(chat, onDone) {
+  showModal('Add members', `
+    <div class="form-group">
+      <label for="cx-add-nums">Phone numbers (with country code)</label>
+      <textarea id="cx-add-nums" style="min-height:120px" placeholder="+91 98765 43210&#10;+44 7700 900123"></textarea>
+      <div style="font-size:11.5px;color:var(--text-3);margin-top:.35rem">One per line or comma-separated, up to 50. WhatsApp may send an invite instead when someone’s privacy settings don’t allow being added.</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="cx-add-go">Add to group</button>
+    </div>`);
+  document.getElementById('cx-add-go').addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    const numbers = document.getElementById('cx-add-nums').value.split(/[\n,;]+/).map(x => x.trim()).filter(Boolean);
+    if (!numbers.length) return toast('Enter at least one number', 'error');
+    if (numbers.length > 50) return toast('Up to 50 numbers at a time', 'error');
+    if (!confirm(`Add ${numbers.length} number${numbers.length === 1 ? '' : 's'} to “${displayName(chat)}”?`)) return;
+    btn.disabled = true;
+    try {
+      const r = await Api.groups.addMembers(chat.id, numbers);
+      closeModal();
+      const already = (r.already_members || []).length;
+      toast(r.requested ? `Sent ${r.requested} to WhatsApp${already ? ` · ${already} already in the group` : ''}` : 'Everyone is already in the group', 'success');
+      onDone();
+    } catch (err) { toast(err.message, 'error'); btn.disabled = false; }
   });
 }
 
@@ -2220,75 +2548,99 @@ async function cxTabMedia(chat, body, stale) {
 function cxRangeDates(range, from, to) {
   const now = new Date();
   const midnight = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  if (range === 'today') return { from: midnight(now).toISOString(), to: now.toISOString() };
-  if (range === '7d') return { from: new Date(midnight(now).getTime() - 6 * 864e5).toISOString(), to: now.toISOString() };
-  if (range === '30d') return { from: new Date(midnight(now).getTime() - 29 * 864e5).toISOString(), to: now.toISOString() };
+  const today = midnight(now);
+  if (range === 'today') return { from: today.toISOString(), to: now.toISOString() };
+  if (range === 'yesterday') return { from: new Date(today.getTime() - 864e5).toISOString(), to: today.toISOString() };
+  if (range === '7d') return { from: new Date(today.getTime() - 6 * 864e5).toISOString(), to: now.toISOString() };
+  if (range === '30d') return { from: new Date(today.getTime() - 29 * 864e5).toISOString(), to: now.toISOString() };
+  if (range === 'month') return { from: new Date(now.getFullYear(), now.getMonth(), 1).toISOString(), to: now.toISOString() };
   if (range === 'custom' && from && to) {
     const [fy, fm, fd] = from.split('-').map(Number), [ty, tm, td] = to.split('-').map(Number);
     return { from: new Date(fy, fm - 1, fd).toISOString(), to: new Date(ty, tm - 1, td + 1).toISOString() };
   }
   return null;
 }
+const CX_GA_PRESETS = [
+  ['today', 'Today'], ['yesterday', 'Yesterday'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['month', 'This month'],
+];
+// "23-Sep-26 to 24-Sep-26" (the end is inclusive)
+function cxRangeLabel(r) {
+  const d = cxRangeDates(r.range, r.from, r.to);
+  if (!d) return 'Pick dates';
+  const f = new Date(d.from), t = new Date(new Date(d.to).getTime() - 1);
+  const fmt = x => `${String(x.getDate()).padStart(2, '0')}-${x.toLocaleString('en', { month: 'short' })}-${String(x.getFullYear()).slice(-2)}`;
+  return `${fmt(f)} to ${fmt(t < f ? f : t)}`;
+}
+const cxIsoDay = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 let _cxAnalyticsRange = { range: '7d', from: '', to: '' };
 async function cxTabAnalytics(chat, body, stale) {
   const r = _cxAnalyticsRange;
   body.innerHTML = `
-    <div class="detail-section">
-      <div class="cx-sec-head">
+    <div class="detail-section cx-ga">
+      <div class="cx-ga-head">
         <span class="cx-ga-title">Group Analytics</span>
-        <button class="cx-ibtn" id="cx-ga-refresh" title="Refresh">${cxIcon('sync', 14)}</button>
-      </div>
-      <select id="cx-ga-range" class="detail-assign-select">
-        <option value="today" ${r.range === 'today' ? 'selected' : ''}>Today</option>
-        <option value="7d" ${r.range === '7d' ? 'selected' : ''}>Last 7 days</option>
-        <option value="30d" ${r.range === '30d' ? 'selected' : ''}>Last 30 days</option>
-        <option value="custom" ${r.range === 'custom' ? 'selected' : ''}>Custom range…</option>
-      </select>
-      <div class="cx-ga-custom" id="cx-ga-custom" ${r.range === 'custom' ? '' : 'hidden'}>
-        <input type="date" id="cx-ga-from" value="${esc(r.from)}"> <span>–</span> <input type="date" id="cx-ga-to" value="${esc(r.to)}">
+        <button class="cx-ibtn sm" id="cx-ga-refresh" title="Refresh" aria-label="Refresh analytics">${cxIcon('sync', 14)}</button>
+        <span class="cx-grow"></span>
+        <button class="cx-range-btn" id="cx-ga-range" aria-haspopup="menu" title="Date range"><span id="cx-ga-range-label">${esc(cxRangeLabel(r))}</span>${cxIcon('chevDown', 13)}</button>
       </div>
       <div class="cx-ga-grid" id="cx-ga-grid">${cxDpLoading()}</div>
     </div>`;
   const load = async () => {
     const grid = document.getElementById('cx-ga-grid');
     if (!grid) return;
+    document.getElementById('cx-ga-range-label').textContent = cxRangeLabel(r);
     const dates = cxRangeDates(r.range, r.from, r.to);
     if (!dates) { grid.innerHTML = '<div class="cx-dp-muted">Pick both dates</div>'; return; }
     grid.innerHTML = cxDpLoading();
+    const btn = document.getElementById('cx-ga-refresh');
+    btn?.classList.add('spinning');
     let res;
     try { res = await Api.groups.analyticsRange(chat.id, dates); }
     catch (e) { if (!stale()) grid.innerHTML = `<div class="cx-dp-muted">${esc(e.message)}</div>`; return; }
+    finally { btn?.classList.remove('spinning'); }
     if (stale() || !grid.isConnected) return;
     const card = (label, icon, cls, v, tip) => `
-      <div class="cx-ga-card ${cls}" ${v == null ? `title="${esc(tip || 'Not tracked yet')}"` : (tip ? `title="${esc(tip)}"` : '')}>
-        <span class="cx-ga-icon">${cxIcon(icon, 18)}</span>
-        <span class="cx-ga-val">${v == null ? '—' : Number(v).toLocaleString()}</span>
+      <div class="cx-ga-card ${cls}${v == null ? ' untracked' : ''}" ${tip ? `title="${esc(tip)}"` : ''}>
+        <span class="cx-ga-icon">${cxIcon(icon, 26)}</span>
+        <span class="cx-ga-val">${v == null ? '--' : Number(v).toLocaleString()}</span>
         <span class="cx-ga-label">${label}</span>
       </div>`;
     const since = res.tracked_since || {};
+    const nt = 'Not tracked yet — counted from the moment this number starts receiving these events';
     grid.innerHTML =
-      card('Messages', 'msg', 'c-blue', res.messages ?? res.total_messages) +
-      card('Reactions', 'heart', 'c-pink', res.reactions, since.reactions ? `Tracked since ${cxFmtListDate(since.reactions)}` : 'Not tracked yet') +
-      card('Members Joined', 'logIn', 'c-green', res.members_joined, since.members ? `Tracked since ${cxFmtListDate(since.members)}` : 'Not tracked yet') +
-      card('Members Exited', 'logOut', 'c-red', res.members_exited,
-        res.members_exited == null ? 'Not tracked yet' : `${res.members_left ?? 0} left · ${res.members_removed ?? 0} removed`);
+      card('Messages', 'msg', 'c-green', res.messages ?? res.total_messages, `${(res.incoming ?? 0).toLocaleString()} received · ${(res.outgoing ?? 0).toLocaleString()} sent`) +
+      card('Reactions', 'heart', 'c-purple', res.reactions, since.reactions ? `Tracked since ${cxFmtListDate(since.reactions)}` : nt) +
+      card('Members Joined', 'userPlus', 'c-blue', res.members_joined, since.members ? `Tracked since ${cxFmtListDate(since.members)}` : nt) +
+      card('Members Exited', 'userMinus', 'c-red', res.members_exited,
+        res.members_exited == null ? nt : `${res.members_left ?? 0} left · ${res.members_removed ?? 0} removed`);
   };
   document.getElementById('cx-ga-refresh').addEventListener('click', load);
-  document.getElementById('cx-ga-range').addEventListener('change', e => {
-    r.range = e.target.value;
-    document.getElementById('cx-ga-custom').hidden = r.range !== 'custom';
-    if (r.range === 'custom' && !r.from) {
-      const t = new Date(), f = new Date(Date.now() - 6 * 864e5);
-      const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      r.from = iso(f); r.to = iso(t);
-      document.getElementById('cx-ga-from').value = r.from;
-      document.getElementById('cx-ga-to').value = r.to;
-    }
-    load();
+  document.getElementById('cx-ga-range').addEventListener('click', e => {
+    e.stopPropagation();
+    const pop = cxPopover(e.currentTarget, `
+      <div class="cx-pop-title">Date range</div>
+      ${CX_GA_PRESETS.map(([v, l]) => `<button class="cx-pop-item${r.range === v ? ' sel' : ''}" data-range="${v}"><span>${l}</span>${r.range === v ? cxIcon('check', 14) : ''}</button>`).join('')}
+      <div class="cx-pop-sep"></div>
+      <div class="cx-pop-title">Custom</div>
+      <div class="cx-ga-custom">
+        <input type="date" id="cx-ga-from" aria-label="From" value="${esc(r.range === 'custom' ? r.from : '')}">
+        <span>–</span>
+        <input type="date" id="cx-ga-to" aria-label="To" value="${esc(r.range === 'custom' ? r.to : '')}">
+      </div>
+      <div style="display:flex;justify-content:flex-end;padding:.35rem .4rem .2rem"><button class="btn btn-primary btn-sm" id="cx-ga-apply">Apply</button></div>`,
+      { alignRight: true, cls: 'cx-pop-wide' });
+    pop.querySelectorAll('[data-range]').forEach(b => b.addEventListener('click', () => {
+      r.range = b.dataset.range; cxClosePop(); load();
+    }));
+    const f = pop.querySelector('#cx-ga-from'), t = pop.querySelector('#cx-ga-to');
+    if (!f.value) { f.value = cxIsoDay(new Date(Date.now() - 6 * 864e5)); t.value = cxIsoDay(new Date()); }
+    pop.querySelector('#cx-ga-apply').addEventListener('click', () => {
+      if (!f.value || !t.value) return toast('Pick both dates', 'error');
+      if (f.value > t.value) return toast('The start date must be before the end date', 'error');
+      Object.assign(r, { range: 'custom', from: f.value, to: t.value });
+      cxClosePop(); load();
+    });
   });
-  ['cx-ga-from', 'cx-ga-to'].forEach(id => document.getElementById(id).addEventListener('change', e => {
-    r[id === 'cx-ga-from' ? 'from' : 'to'] = e.target.value; load();
-  }));
   await load();
 }
 
@@ -2344,6 +2696,153 @@ async function cxTabNotes(chat, body, stale) {
   }));
 }
 
+// ── Settings tab ── chat facts, assignment, team access, AI switches and
+// (groups) WhatsApp group settings; editing those needs a CRM admin acting
+// through a number that is a group admin.
+function cxFmtDateTime(ts) {
+  const d = parseServerDate(ts);
+  if (!d || isNaN(d.getTime())) return '—';
+  return `${d.getDate()} ${d.toLocaleString('en', { month: 'short' })} ${d.getFullYear()}, ${d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`;
+}
+function cxSettingsAssignHtml(chat) {
+  const a = chat.assigned_to != null ? _cxAgentMap[chat.assigned_to] : null;
+  return `${cxAssigneeAvatar(chat.assigned_to, 22, { dot: chat.assigned_to != null })}<span>${chat.assigned_to == null ? 'Unassigned' : esc(a?.name || `Agent #${chat.assigned_to}`)}</span>${cxIcon('chevDown', 13)}`;
+}
+function cxToggle(id, on, opts = {}) {
+  return `<button type="button" class="cx-switch${on ? ' on' : ''}" id="${id}" role="switch" aria-checked="${!!on}" ${opts.disabled ? 'disabled' : ''} ${opts.title ? `title="${esc(opts.title)}"` : ''} aria-label="${esc(opts.label || '')}"><i></i></button>`;
+}
+
+async function cxTabSettings(chat, body, stale) {
+  const phone = cxPhoneOf(chat);
+  body.innerHTML = `
+    <div class="cx-set">
+      <div class="cx-set-row"><span>Chat ID</span><span class="cx-set-val"><code class="cx-set-id" title="${esc(chat.chat_wid)}">${esc(chat.chat_wid)}</code>
+        <button class="cx-ibtn sm" id="cx-set-copy" title="Copy chat ID" aria-label="Copy chat ID">${cxIcon('copy', 13)}</button></span></div>
+      <div class="cx-set-row"><span>Created at</span><span class="cx-set-val" id="cx-set-created">${esc(cxFmtDateTime(chat.created_at))}</span></div>
+      <div class="cx-set-row"><span>Chat Type</span><span class="cx-set-val">${chat.is_group ? 'Group' : 'Individual'}</span></div>
+      <div class="cx-set-row"><span>Assigned To</span><span class="cx-set-val"><button class="cx-set-assign" id="cx-set-assign" aria-haspopup="menu">${cxSettingsAssignHtml(chat)}</button></span></div>
+      <div class="cx-set-row"><span>Team access</span><span class="cx-set-val cx-team" id="cx-set-team"><span class="spinner" style="width:14px;height:14px"></span></span></div>
+      <div class="cx-set-row"><span>Org Phones</span><span class="cx-set-val">${phone
+        ? `<span class="cx-phone-chip" title="${esc(phone.name || '')} · ${phone.waha_status === 'WORKING' ? 'connected' : 'disconnected'}">${CX_WA_LOGO}<span>${esc(cxPhoneLabel(phone))}</span><span class="cx-dot ${phone.waha_status === 'WORKING' ? 'ok' : 'bad'}"></span></span>`
+        : '—'}</span></div>
+
+      <div class="cx-set-sec">AI</div>
+      <div class="cx-set-row"><span>Allow AI Flagging<small>Auto-flag incoming messages that match your AI flag rules</small></span><span class="cx-set-val">${cxToggle('cx-set-flagging', chat.ai_flagging !== false, { label: 'Allow AI flagging' })}</span></div>
+      <div class="cx-set-row"><span>Allow AI Agent<small>${chat.ai_active ? 'Replying automatically; pauses when a human replies' : 'Not replying automatically'}</small></span><span class="cx-set-val">${cxToggle('cx-set-aiagent', !!chat.ai_active, { label: 'Allow AI agent' })}</span></div>
+
+      ${chat.is_group ? `<div class="cx-set-sec">Group Settings</div><div id="cx-set-group">${cxDpLoading()}</div>` : ''}
+    </div>`;
+
+  document.getElementById('cx-set-copy').addEventListener('click', () => cxCopy(chat.chat_wid, 'Chat ID copied'));
+  document.getElementById('cx-set-assign').addEventListener('click', e => { e.stopPropagation(); cxOpenAssignPop(e.currentTarget, chat, { alignRight: true }); });
+  document.getElementById('cx-set-flagging').addEventListener('click', async e => {
+    const b = e.currentTarget, next = chat.ai_flagging === false;
+    b.disabled = true;
+    try {
+      await Api.inbox.updateChat(chat.id, { ai_flagging: next });
+      chat.ai_flagging = next;
+      b.classList.toggle('on', next); b.setAttribute('aria-checked', String(next));
+      toast(next ? 'AI flagging allowed for this chat' : 'AI flagging turned off for this chat', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+    b.disabled = false;
+  });
+  document.getElementById('cx-set-aiagent').addEventListener('click', async e => {
+    e.currentTarget.disabled = true;
+    await cxToggleAI(chat);
+    if (!stale() && _cxDetailTab === 'settings') renderContactDetail(chat, 'settings');
+  });
+
+  cxTeam(chat).then(team => {
+    if (stale()) return;
+    cxRefreshOnlineDots();
+    const el = document.getElementById('cx-set-team');
+    if (!el) return;
+    const shown = team.slice(0, 6);
+    el.innerHTML = team.length
+      ? shown.map(a => `<span class="cx-team-av">${cxAssigneeAvatar(a.id, 24, { dot: true, title: `${a.name}${a.role === 'admin' ? ' (admin)' : ''} · ${a.online ? 'online' : 'offline'}` })}</span>`).join('') +
+        (team.length > shown.length ? `<span class="cx-team-more" title="${esc(team.slice(6).map(a => a.name).join(', '))}">+${team.length - shown.length}</span>` : '')
+      : '<span class="cx-dp-muted">Nobody</span>';
+  }).catch(() => { const el = document.getElementById('cx-set-team'); if (el && !stale()) el.textContent = '—'; });
+
+  if (!chat.is_group) return;
+  let info;
+  try { info = await cxGroupInfo(chat); }
+  catch (e) { const g = document.getElementById('cx-set-group'); if (g && !stale()) g.innerHTML = `<div class="cx-dp-muted">${esc(e.message || 'Could not load group settings')}</div>`; return; }
+  if (stale()) return;
+  const g = document.getElementById('cx-set-group');
+  if (!g) return;
+  if (info.created_at) document.getElementById('cx-set-created').textContent = cxFmtDateTime(info.created_at);
+  if (!info.available) {
+    g.innerHTML = `<div class="cx-dp-muted">${info.phone_working ? 'WhatsApp didn’t return this group’s details.' : 'Group settings are available while this WhatsApp number is connected.'}</div>`;
+    return;
+  }
+  const can = !!info.can_manage;
+  const tip = can ? '' : cxManageTip(info);
+  g.innerHTML = `
+    <div class="cx-set-block">
+      <div class="cx-set-bhead"><span>Group name</span>${can ? `<button class="cx-link-btn" data-edit="subject">Edit</button>` : ''}</div>
+      <div class="cx-set-text" id="cx-set-subject">${esc(info.subject || displayName(chat))}</div>
+    </div>
+    <div class="cx-set-block">
+      <div class="cx-set-bhead"><span>Description</span>${can ? `<button class="cx-link-btn" data-edit="description">Edit</button>` : ''}</div>
+      <div class="cx-set-text cx-set-desc" id="cx-set-description">${info.description ? esc(info.description) : '<span class="cx-dp-muted">No description</span>'}</div>
+    </div>
+    <div class="cx-set-row"><span>Only admins can send messages</span><span class="cx-set-val">${cxToggle('cx-set-announce', info.messages_admin_only, { disabled: !can, title: tip, label: 'Only admins can send messages' })}</span></div>
+    <div class="cx-set-row"><span>Only admins can edit group info</span><span class="cx-set-val">${cxToggle('cx-set-restrict', info.info_admin_only, { disabled: !can, title: tip, label: 'Only admins can edit group info' })}</span></div>
+    ${can ? '' : `<div class="cx-set-note">${cxIcon('info', 13)}<span>${esc(tip)}</span></div>`}`;
+  if (!can) return;
+
+  const save = async (patch, okMsg) => {
+    try {
+      const res = await Api.groups.updateSettings(chat.id, patch);
+      _cxGroupInfo.set(chat.id, Promise.resolve({ ...info, ...res }));
+      if (patch.subject) {
+        chat.name = patch.subject;
+        cxRerenderRow(chat);
+        document.querySelectorAll('.cx-tname, .cx-dp-name').forEach(el => { el.textContent = patch.subject; });
+      }
+      toast(okMsg, 'success');
+    } catch (err) { toast(err.message, 'error'); }
+    if (!stale()) renderContactDetail(chat, 'settings');
+  };
+  g.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
+    const field = b.dataset.edit;
+    const holder = document.getElementById(`cx-set-${field}`);
+    const cur = field === 'subject' ? (info.subject || '') : (info.description || '');
+    const max = field === 'subject' ? 100 : 2048;
+    holder.innerHTML = `${field === 'subject'
+      ? `<input type="text" id="cx-set-edit" maxlength="${max}">`
+      : `<textarea id="cx-set-edit" maxlength="${max}" rows="6"></textarea>`}
+      <div class="cx-set-edit-bar"><span id="cx-set-left"></span>
+        <button class="btn btn-secondary btn-sm" id="cx-set-cancel">Cancel</button>
+        <button class="btn btn-primary btn-sm" id="cx-set-save">Save</button></div>`;
+    const inp = document.getElementById('cx-set-edit');
+    inp.value = cur;
+    const left = () => { document.getElementById('cx-set-left').textContent = `${max - inp.value.length} left`; };
+    inp.addEventListener('input', left); left(); inp.focus();
+    document.getElementById('cx-set-cancel').addEventListener('click', () => renderContactDetail(chat, 'settings'));
+    document.getElementById('cx-set-save').addEventListener('click', () => {
+      const v = field === 'subject' ? inp.value.trim() : inp.value;
+      if (field === 'subject' && !v) return toast('Group name can’t be empty', 'error');
+      if (v === cur) return renderContactDetail(chat, 'settings');
+      if (!confirm(`Change the ${field === 'subject' ? 'name' : 'description'} of this WhatsApp group for all ${Number(info.count || 0).toLocaleString()} members?`)) return;
+      save({ [field]: v }, field === 'subject' ? 'Group name updated' : 'Description updated');
+    });
+  }));
+  const bindSwitch = (id, key, onMsg, offMsg) => document.getElementById(id).addEventListener('click', e => {
+    const next = !info[key];
+    if (!confirm(next ? onMsg : offMsg)) return;
+    e.currentTarget.disabled = true;
+    save({ [key]: next }, 'Group settings updated');
+  });
+  bindSwitch('cx-set-announce', 'messages_admin_only',
+    'Only admins will be able to send messages in this group. Continue?',
+    'All members will be able to send messages in this group. Continue?');
+  bindSwitch('cx-set-restrict', 'info_admin_only',
+    'Only admins will be able to edit the group name, picture and description. Continue?',
+    'All members will be able to edit the group name, picture and description. Continue?');
+}
+
 // ── Thread ─────────────────────────────────────────────────────── //
 const CX_EMOJI = ('😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😜 🤪 🤗 🤔 🤐 😐 😏 😒 🙄 😬 😌 😔 😴 😷 🤒 🥳 😎 🤓 😕 😟 😮 😲 😳 🥺 😢 😭 😱 😤 😡 👍 👎 👌 ✌️ 🤞 🤝 🙏 👏 🙌 💪 👋 ☝️ 👉 👀 ' +
   '❤️ 🧡 💛 💚 💙 💜 🖤 💔 💯 ✨ 🔥 ⭐ 🎉 🎊 🎁 🎂 ✅ ❌ ⚠️ ❓ ❗ 📌 📎 📞 📱 💬 📅 ⏰ 🚀 💡 💰 🛒 📦 🚚 🏠 ☕ 🌹').split(' ');
@@ -2367,19 +2866,20 @@ async function cxFillGroupSubtitle(chat) {
     const res = await cxParticipants(chat);
     const el = document.getElementById('cx-thread-sub');
     if (!el || State.inbox.selectedChatId != chat.id) return;
-    const nums = (res.participants || []).map(p => /^\d{6,}$/.test(p.number) ? cxFmtPhone(p.number) : '').filter(Boolean);
-    if (nums.length) { el.textContent = nums.join(', '); el.title = `${nums.length} members`; }
+    const list = res.participants || [];
+    const nums = list.slice(0, 40).map(p => p.is_me ? 'You' : (p.has_number !== false && /^\d{6,}$/.test(p.number) ? cxFmtPhone(p.number) : (p.name || ''))).filter(Boolean);
+    if (nums.length) { el.textContent = nums.join(', ') + (list.length > 40 ? ', …' : ''); el.title = `${list.length.toLocaleString()} members`; }
   } catch (_) {}
 }
 
 // Refresh the bits of the thread header that depend on chat state
 function renderThreadHeaderState(chat) {
   const ai = document.getElementById('btn-ai-toggle');
-  if (ai) {
-    ai.classList.toggle('on', !!chat.ai_active);
-    ai.title = chat.ai_active ? 'AI is replying — click to deactivate' : 'Activate AI replies';
-    ai.innerHTML = `${cxIcon('bot', 14)}<span>${chat.ai_active ? 'AI On' : 'AI Off'}</span>`;
-  }
+  if (ai) ai.innerHTML = `${cxIcon('bot', 13)} ${chat.ai_active ? 'Turn AI agent off' : 'Turn AI agent on'}`;
+  const hb = document.getElementById('cx-assign-btn');
+  if (hb) hb.innerHTML = cxAssigneeAvatar(chat.assigned_to, 28, { dot: true });
+  const cf = document.getElementById('cx-chip-flag');
+  if (cf) { cf.classList.toggle('on', !!chat.is_flagged); cf.title = chat.is_flagged ? 'Flagged — click to unflag' : 'Flag this chat'; }
   const flag = document.getElementById('btn-flag');
   if (flag) flag.innerHTML = `${cxIcon('flag', 13)} ${chat.is_flagged ? 'Unflag' : 'Flag'}`;
   const res = document.getElementById('btn-close-chat');
@@ -2387,14 +2887,95 @@ function renderThreadHeaderState(chat) {
   document.getElementById('cx-thead-flag')?.toggleAttribute('hidden', !chat.is_flagged);
 }
 
+// Small spinner next to the thread name while messages sync from WhatsApp
+const _cxSyncing = new Map();   // chat id → syncs in flight
+function cxSetSyncing(chatId, on) {
+  const n = Math.max(0, (_cxSyncing.get(+chatId) || 0) + (on ? 1 : -1));
+  if (n) _cxSyncing.set(+chatId, n); else _cxSyncing.delete(+chatId);
+  const el = document.getElementById('cx-tsync-ind');
+  if (el && State.inbox.selectedChatId == chatId) el.hidden = !n;
+}
 async function cxSyncThread(chat) {
   const btn = document.getElementById('cx-thread-sync');
   btn?.classList.add('spinning');
+  cxSetSyncing(chat.id, true);
   try {
     const r = await Api.inbox.syncMessages(chat.id, 200);
+    if (chat.is_group) {
+      // Pull fresh group data past the server's 5-minute cache
+      cxParticipants(chat, true).catch(() => {});
+      cxGroupInfo(chat, true).catch(() => {});
+      cxFillGroupSubtitle(chat); cxUpdateComposerState(chat);
+    }
     if (State.inbox.selectedChatId == chat.id) await loadMessages(chat.id, true);
     toast(`Synced ${r?.synced ?? 0} messages`, 'success');
   } catch (e) { toast(e.message || 'Sync failed', 'error'); }
+  finally { btn?.classList.remove('spinning'); cxSetSyncing(chat.id, false); }
+}
+
+// Composer guard: the chat's number must be connected and (for groups) still
+// a member. Otherwise show the red banner and block WhatsApp sends.
+const CX_VOICE_TIP = 'Voice notes need audio conversion — not supported by your WhatsApp API tier';
+let _cxComposerSeq = 0;
+async function cxUpdateComposerState(chat) {
+  const seq = ++_cxComposerSeq;
+  const phone = cxPhoneOf(chat);
+  let bad = !phone || phone.waha_status !== 'WORKING';
+  if (!bad && chat.is_group) {
+    try { const info = await cxGroupInfo(chat); if (info && info.is_member === false) bad = true; }
+    catch (_) { /* unknown — don't block */ }
+  }
+  if (seq !== _cxComposerSeq || State.inbox.selectedChatId != chat.id) return;
+  cxShowPhoneBanner(bad);
+}
+function cxShowPhoneBanner(bad) {
+  const banner = document.getElementById('cx-phone-banner');
+  const area = document.getElementById('reply-area');
+  if (!banner || !area) return;
+  banner.hidden = !bad;
+  area.classList.toggle('phone-bad', !!bad);
+  const send = document.getElementById('send-btn');
+  if (send) {
+    const block = !!bad && !area.classList.contains('note-mode');
+    send.disabled = block;
+    send.title = block ? 'Reconnect the phone to send' : 'Send (Enter)';
+  }
+}
+// Sending-phone chip menu: a chat lives on one number, so the others are
+// listed for context but can't be picked here.
+function cxOpenPhoneSwitch(anchor, chat) {
+  const own = cxPhoneOf(chat);
+  const pop = cxPopover(anchor, `
+    <div class="cx-pop-title">Send from</div>
+    ${State.phones.map(p => {
+      const mine = own && p.id === own.id;
+      const st = p.waha_status === 'WORKING' ? 'Connected' : (p.waha_status || 'Disconnected').toLowerCase().replace(/^./, c => c.toUpperCase());
+      return `<button class="cx-pop-item${mine ? ' sel' : ''}" ${mine ? '' : 'disabled title="Not part of this chat"'}>
+        <span class="cx-dot ${p.waha_status === 'WORKING' ? 'ok' : 'bad'}"></span>
+        <span>${esc(cxPhoneLabel(p))}<small>${mine ? esc(st) : 'Not part of this chat'}</small></span>${mine ? cxIcon('check', 14) : ''}
+      </button>`;
+    }).join('') || '<div class="cx-dp-muted" style="padding:.4rem .55rem">No phones connected</div>'}
+    <div class="cx-pop-sep"></div>
+    <button class="cx-pop-item" data-recheck="1">${cxIcon('sync', 14)}<span>Refresh phone status</span></button>`,
+    { above: true, alignRight: true });
+  pop.querySelector('[data-recheck]').addEventListener('click', ev => {
+    ev.stopPropagation(); cxClosePop();
+    cxRecheckPhone(chat, document.getElementById('cx-banner-refresh'));
+  });
+}
+async function cxRecheckPhone(chat, btn) {
+  const phone = cxPhoneOf(chat);
+  btn?.classList.add('spinning');
+  try {
+    if (phone) {
+      const r = await Api.phones.status(phone.id);
+      if (r?.status) { phone.waha_status = r.status; updatePhoneBadge(); }
+    }
+    if (chat.is_group) cxForgetGroup(chat.id);
+    await cxUpdateComposerState(chat);
+    const ok = document.getElementById('cx-phone-banner')?.hidden;
+    toast(ok ? 'Phone is connected' : 'Still disconnected or not part of this chat', ok ? 'success' : 'error');
+  } catch (e) { toast(e.message || 'Could not check the phone', 'error'); }
   finally { btn?.classList.remove('spinning'); }
 }
 
@@ -2407,19 +2988,19 @@ function renderThread(chat) {
   panel.innerHTML = `
     <div class="thread-header cx-thead">
       <button class="cx-ibtn cx-back" id="cx-back" title="Back to chats">${cxIcon('chevLeft', 18)}</button>
-      ${cxAvatar(chat, 38)}
+      ${cxAvatar(chat, 40)}
       <div class="thread-contact-text">
-        <div class="thread-name">${esc(displayName(chat))}<span class="cx-thead-flag" id="cx-thead-flag" title="Flagged" ${chat.is_flagged ? '' : 'hidden'}>${cxIcon('flag', 13)}</span></div>
+        <div class="thread-name"><span class="cx-tname">${esc(displayName(chat))}</span><span class="cx-thead-flag" id="cx-thead-flag" title="Flagged" ${chat.is_flagged ? '' : 'hidden'}>${cxIcon('flag', 13)}</span><span class="cx-tsync spinning" id="cx-tsync-ind" title="Syncing messages…" ${_cxSyncing.get(chat.id) ? '' : 'hidden'}>${cxIcon('sync', 13)}</span></div>
         <div class="thread-meta" id="cx-thread-sub">${esc(cxThreadSubtitle(chat))}</div>
       </div>
       <div class="cx-thead-actions">
-        <button class="cx-assign-btn" id="cx-assign-btn" title="Assign chat">${cxAssigneeAvatar(chat.assigned_to, 26)}</button>
-        <button class="cx-pill-btn" id="btn-ai-toggle"></button>
-        <button class="cx-ibtn" id="cx-thread-sync" title="Sync messages from WhatsApp">${cxIcon('sync')}</button>
-        <button class="cx-ibtn" id="cx-tsearch-btn" title="Search in this chat">${cxIcon('search')}</button>
+        <button class="cx-assign-btn" id="cx-assign-btn" title="Assign chat" aria-label="Assign chat">${cxAssigneeAvatar(chat.assigned_to, 28, { dot: true })}</button>
+        <button class="cx-ibtn" id="cx-thread-sync" title="Refresh — sync messages from WhatsApp" aria-label="Refresh messages">${cxIcon('sync')}</button>
+        <button class="cx-ibtn" id="cx-tsearch-btn" title="Search in this chat" aria-label="Search in this chat">${cxIcon('search')}</button>
         <div class="thread-more-wrap">
-          <button class="cx-ibtn" id="btn-more" title="More actions">${cxIcon('more')}</button>
+          <button class="cx-ibtn" id="btn-more" title="More actions" aria-label="More actions">${cxIcon('more')}</button>
           <div class="thread-more-menu" id="thread-more-menu">
+            <button id="btn-ai-toggle"></button>
             <button id="btn-summarize">${cxIcon('note', 13)} Summary</button>
             <button id="btn-ticket">${cxIcon('ticket', 13)} Create Ticket</button>
             <button id="btn-task">${cxIcon('task', 13)} Create Task</button>
@@ -2443,25 +3024,33 @@ function renderThread(chat) {
       <div class="loading-center"><div class="spinner"></div></div>
     </div>
     <div class="reply-area cx-composer" id="reply-area">
-      <div class="composer-tabs">
-        <span class="composer-tab active" id="tab-whatsapp">WhatsApp</span>
-        <span class="composer-tab" id="tab-note">Private Note</span>
+      <div class="composer-tabs cx-ctabs" role="tablist">
+        <button type="button" class="composer-tab active" id="tab-whatsapp" role="tab">WhatsApp</button>
+        <button type="button" class="composer-tab" id="tab-note" role="tab">Private Note</button>
       </div>
       <div class="cx-cbox">
         <div class="reply-bar cx-rbar">
           <textarea id="reply-text" rows="1" placeholder="Message…"></textarea>
-          <button class="cx-send" id="send-btn" title="Send (Enter)">${cxIcon('send', 17)}</button>
+          <button class="cx-send" id="send-btn" title="Send (Enter)" aria-label="Send">${cxIcon('send', 17)}</button>
+        </div>
+        <div class="cx-cbanner" id="cx-phone-banner" role="alert" title="Selected phone is disconnected or not part of this chat! Please reconnect or switch the active phone" hidden>
+          <span>Selected phone is disconnected or not part of this chat! Please reconnect or switch the active phone</span>
+          <button type="button" class="cx-cbanner-btn" id="cx-banner-refresh">Refresh ${cxIcon('sync', 12)}</button>
         </div>
         <div class="cx-tools" id="reply-toolbar">
-          <button class="cx-ibtn wa-only" id="btn-attach" title="Send image or file by URL">${cxIcon('clip')}</button>
-          <button class="cx-ibtn" id="cx-emoji-btn" title="Emoji">${cxIcon('smile')}</button>
-          <button class="cx-ibtn" id="cx-translate-btn" title="Translate draft">${cxIcon('translate')}</button>
-          <button class="cx-ibtn wa-only" id="btn-suggest" title="AI: suggest a reply">${cxIcon('sparkle')}</button>
-          <button class="cx-ibtn" id="btn-polish" title="AI: polish grammar and tone">${cxIcon('wand')}</button>
-          <button class="cx-ibtn wa-only" id="btn-qr" title="Quick replies (or type /)">${cxIcon('zap')}</button>
-          <button class="cx-ibtn wa-only" id="btn-schedule" title="Schedule this message">${cxIcon('clock')}</button>
+          <button class="cx-ibtn wa-only" id="btn-attach" title="Send an image or file (by URL)" aria-label="Attach">${cxIcon('clip')}</button>
+          <button class="cx-ibtn" id="cx-emoji-btn" title="Emoji" aria-label="Emoji">${cxIcon('smile')}</button>
+          <button class="cx-ibtn" id="cx-translate-btn" title="Translate draft" aria-label="Translate draft">${cxIcon('translate')}</button>
+          <button class="cx-ibtn" id="cx-ai-btn" title="AI: suggest a reply or polish your draft" aria-label="AI assist">${cxIcon('sparkle')}</button>
+          <span class="cx-tip-wrap wa-only" title="${esc(CX_VOICE_TIP)}"><button class="cx-ibtn" id="btn-voice" disabled aria-label="Voice note (not supported)">${cxIcon('mic')}</button></span>
+          <button class="cx-ibtn wa-only" id="btn-qr" title="Quick replies & signatures (or type /)" aria-label="Quick replies">${cxIcon('zap')}</button>
+          <button class="cx-ibtn wa-only" id="btn-schedule" title="Schedule this message" aria-label="Schedule">${cxIcon('clock')}</button>
           <span class="cx-grow"></span>
-          <span class="cx-from-chip wa-only" title="Replies go out from the number this chat belongs to">${CX_WA_LOGO}<span>${esc(cxPhoneLabel(phone) || 'No number')}</span></span>
+          <span class="cx-from-chip wa-only" id="cx-from-chip">
+            <button type="button" class="cx-chip-main" id="cx-chip-phone" title="Replies go out from the number this chat belongs to">${CX_WA_LOGO}<span>${esc(cxPhoneLabel(phone) || 'No number')}</span></button>
+            <button type="button" class="cx-chip-flag${chat.is_flagged ? ' on' : ''}" id="cx-chip-flag" title="${chat.is_flagged ? 'Flagged — click to unflag' : 'Flag this chat'}" aria-label="Flag chat">${cxIcon('flag', 13)}</button>
+            <button type="button" class="cx-chip-sw" id="cx-chip-switch" title="Sending phone" aria-label="Choose sending phone">${cxIcon('chevUpDown', 13)}</button>
+          </span>
           <select id="phone-select" hidden>${sendPhones.map(p => `<option value="${p.id}">${esc(p.name || p.phone_number)}</option>`).join('')}</select>
         </div>
       </div>
@@ -2469,6 +3058,12 @@ function renderThread(chat) {
 
   renderThreadHeaderState(chat);
   cxFillGroupSubtitle(chat);
+  cxUpdateComposerState(chat);
+  cxTeam(chat).then(cxRefreshOnlineDots).catch(() => {});
+  document.getElementById('cx-banner-refresh').addEventListener('click', e => cxRecheckPhone(chat, e.currentTarget));
+  document.getElementById('cx-chip-flag').addEventListener('click', () => cxToggleFlag(chat));
+  document.getElementById('cx-chip-switch').addEventListener('click', e => { e.stopPropagation(); cxOpenPhoneSwitch(e.currentTarget, chat); });
+  document.getElementById('cx-chip-phone').addEventListener('click', e => { e.stopPropagation(); cxOpenPhoneSwitch(e.currentTarget, chat); });
 
   document.getElementById('cx-back').addEventListener('click', () => {
     document.getElementById('inbox-layout')?.classList.remove('cx-thread-open');
@@ -2517,21 +3112,27 @@ function renderThread(chat) {
   const autosize = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; };
   ta.addEventListener('input', autosize);
 
-  // Suggest reply
-  document.getElementById('btn-suggest').addEventListener('click', () => cxSuggestReply(chat));
-
-  // Polish draft reply
-  document.getElementById('btn-polish').addEventListener('click', async () => {
-    const draft = ta.value.trim();
-    if (!draft) return toast('Type a draft first', 'error');
-    const btn = document.getElementById('btn-polish');
-    btn.disabled = true; btn.classList.add('spinning');
-    try {
-      const res = await Api.ai.polish(draft);
-      ta.value = res.polished || draft; autosize();
-      toast('Reply polished', 'success');
-    } catch(e) { toast(e.message, 'error'); }
-    btn.disabled = false; btn.classList.remove('spinning');
+  // AI assist: suggest a reply (WhatsApp mode) or polish the draft
+  document.getElementById('cx-ai-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    const note = replyArea.classList.contains('note-mode');
+    const pop = cxPopover(btn, `<div class="cx-pop-title">AI assist</div>
+      ${note ? '' : `<button class="cx-pop-item" data-ai="suggest">${cxIcon('sparkle', 14)}<span>Suggest a reply</span></button>`}
+      <button class="cx-pop-item" data-ai="polish">${cxIcon('wand', 14)}<span>Polish grammar &amp; tone</span></button>`, { above: true });
+    pop.querySelector('[data-ai="suggest"]')?.addEventListener('click', () => { cxClosePop(); cxSuggestReply(chat); });
+    pop.querySelector('[data-ai="polish"]').addEventListener('click', async () => {
+      cxClosePop();
+      const draft = ta.value.trim();
+      if (!draft) return toast('Type a draft first', 'error');
+      btn.disabled = true; btn.classList.add('spinning');
+      try {
+        const res = await Api.ai.polish(draft);
+        ta.value = res.polished || draft; autosize();
+        toast('Reply polished', 'success');
+      } catch(err) { toast(err.message, 'error'); }
+      btn.disabled = false; btn.classList.remove('spinning');
+    });
   });
 
   // Translate draft into a chosen language (existing AI translate endpoint)
@@ -2700,8 +3301,12 @@ function renderThread(chat) {
     tabWA.classList.toggle('active', !note);
     tabNote.classList.toggle('active', false);
     tabNote.classList.toggle('note-active', note);
+    tabWA.setAttribute('aria-selected', String(!note));
+    tabNote.setAttribute('aria-selected', String(note));
     replyArea.classList.toggle('note-mode', note);
     ta.placeholder = note ? 'Write a private note — only your team can see this…' : 'Message…';
+    // Notes never leave the CRM, so a disconnected phone only blocks WhatsApp sends
+    cxShowPhoneBanner(replyArea.classList.contains('phone-bad'));
     ta.focus();
   };
   tabWA.addEventListener('click', () => setComposerMode('whatsapp'));
@@ -2720,6 +3325,7 @@ function renderThread(chat) {
         toast('Private note added — team only', 'success');
         await loadMessages(chat.id, true);   // show the note in the thread
       } else {
+        if (replyArea.classList.contains('phone-bad')) { cxShowPhoneBanner(true); return toast('This chat’s phone is disconnected — reconnect it to send', 'error'); }
         const phoneId = document.getElementById('phone-select')?.value;
         if (!phoneId) { btn.disabled = false; return toast('Select a phone', 'error'); }
         await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
@@ -2730,6 +3336,7 @@ function renderThread(chat) {
       }
     } catch(e) { toast(e.message, 'error'); }
     btn.disabled = false;
+    cxShowPhoneBanner(replyArea.classList.contains('phone-bad'));
   };
 
   document.getElementById('send-btn').addEventListener('click', sendMsg);
@@ -2817,7 +3424,9 @@ async function loadMessages(chatId, _alreadySynced) {
   try {
     // Always do a live WAHA sync first (200 msgs) unless WS just reconnected
     if (!_alreadySynced) {
+      cxSetSyncing(chatId, true);
       try { await Api.inbox.syncMessages(chatId, 200); _msgLastSyncedChatId = chatId; } catch(_) {}
+      finally { cxSetSyncing(chatId, false); }
       if (stale()) return;
     }
 
