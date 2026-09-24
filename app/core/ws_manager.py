@@ -4,6 +4,8 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from app.services import presence_service
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,7 +19,11 @@ class ConnectionManager:
         # via the first message before registering it).
         if accept:
             await websocket.accept()
-        self._connections.setdefault(agent_id, []).append(websocket)
+        conns = self._connections.setdefault(agent_id, [])
+        if not conns:
+            # First live socket for this agent: a presence span starts (User uptime)
+            presence_service.span_opened(agent_id)
+        conns.append(websocket)
         logger.info("WS connected: agent_id=%s  total_agents=%s", agent_id, len(self._connections))
         # Confirm connection to the client
         await self._send(websocket, {"type": "connected", "agent_id": agent_id})
@@ -28,10 +34,13 @@ class ConnectionManager:
 
     def disconnect(self, websocket: WebSocket, agent_id: int) -> None:
         conns = self._connections.get(agent_id, [])
-        if websocket in conns:
-            conns.remove(websocket)
+        if websocket not in conns:
+            return
+        conns.remove(websocket)
         if not conns:
             self._connections.pop(agent_id, None)
+            # Last socket gone (all tabs closed): the presence span ends
+            presence_service.span_closed(agent_id)
         logger.info("WS disconnected: agent_id=%s  total_agents=%s", agent_id, len(self._connections))
 
     async def send(self, websocket: WebSocket, payload: dict) -> bool:
