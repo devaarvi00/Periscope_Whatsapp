@@ -49,3 +49,15 @@ class TicketLabel(Base):
 
     ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), primary_key=True)
     label_id: Mapped[int] = mapped_column(ForeignKey("labels.id"), primary_key=True)
+
+
+class TicketMessage(Base):
+    """Extra messages attached to a ticket (e.g. replies quoting a ticketed
+    message). The ticket's originating message stays in Ticket.message_wid."""
+    __tablename__ = "ticket_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_wid: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
