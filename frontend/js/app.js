@@ -768,12 +768,13 @@ const VIEW_LABELS = {
   media: 'Media',
 };
 
-// Routes are "view" or "view/sub" (analytics and settings have sub-pages, e.g. #analytics/team, #settings/team)
+// Routes are "view" or "view/sub" (analytics, settings and logs have sub-pages, e.g. #analytics/team, #logs/group)
 function _parseRoute(route) {
   const [view, sub] = String(route || '').split('/');
   if (!VIEW_LABELS[view]) return null;
   if (view === 'analytics') return { view, sub: AN_PAGES[sub] ? sub : null };
   if (view === 'settings') return { view, sub: stIsPage(sub) ? sub : null };
+  if (view === 'logs') return { view, sub: LG_PAGES[sub] ? sub : null };
   return { view, sub: null };
 }
 
@@ -787,7 +788,9 @@ function navigateTo(route) {
   _stopAllPhoneQrFlows();
   // Switching analytics / settings sub-pages keeps the shell (sub-nav) in place
   const keepShell = (view === 'analytics' && State.currentView === 'analytics' && document.getElementById('an-shell'))
-    || (view === 'settings' && State.currentView === 'settings' && document.getElementById('st-shell'));
+    || (view === 'settings' && State.currentView === 'settings' && document.getElementById('st-shell'))
+    || (view === 'logs' && State.currentView === 'logs' && document.getElementById('lg-shell'));
+  if (view !== 'logs') { _lgCloseDrawer(); _lgClosePop(); }
   if (view !== 'analytics' && State.currentView === 'analytics') _anDestroyCharts();
   State.currentView = view;
   State.currentRoute = full;
@@ -804,6 +807,7 @@ function navigateTo(route) {
   }
   if (view === 'analytics') return renderAnalytics(r.sub);
   if (view === 'settings') return renderSettings(r.sub);
+  if (view === 'logs') return renderLogs(r.sub);
   return ({
     dashboard:        renderDashboard,
     inbox:            renderInbox,
@@ -9065,67 +9069,385 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
 }
 
 // ── LOGS VIEW ───────────────────────────────────────────────────── //
-async function renderLogs() {
+// #logs/<page>: Group / API / Webhooks / Rules / Scheduled operation logs
+// (GET /logs/operations, last 7 days) + the older Activity log at the bottom.
+// Sub-nav reuses the analytics .an-nav look; the rest is styled in css/logs.css (lg-*).
+// Icons: Font Awesome Free 6.7.2 (CC BY 4.0), regular (outline) where available.
+const LG_ICONS = {
+  'comments': [640, 'M88.2 309.1c9.8-18.3 6.8-40.8-7.5-55.8C59.4 230.9 48 204 48 176c0-63.5 63.8-128 160-128s160 64.5 160 128s-63.8 128-160 128c-13.1 0-25.8-1.3-37.8-3.6c-10.4-2-21.2-.6-30.7 4.2c-4.1 2.1-8.3 4.1-12.6 6c-16 7.2-32.9 13.5-49.9 18c2.8-4.6 5.4-9.1 7.9-13.6c1.1-1.9 2.2-3.9 3.2-5.9zM208 352c114.9 0 208-78.8 208-176S322.9 0 208 0S0 78.8 0 176c0 41.8 17.2 80.1 45.9 110.3c-.9 1.7-1.9 3.5-2.8 5.1c-10.3 18.4-22.3 36.5-36.6 52.1c-6.6 7-8.3 17.2-4.6 25.9C5.8 378.3 14.4 384 24 384c43 0 86.5-13.3 122.7-29.7c4.8-2.2 9.6-4.5 14.2-6.8c15.1 3 30.9 4.5 47.1 4.5zM432 480c16.2 0 31.9-1.6 47.1-4.5c4.6 2.3 9.4 4.6 14.2 6.8C529.5 498.7 573 512 616 512c9.6 0 18.2-5.7 22-14.5c3.8-8.8 2-19-4.6-25.9c-14.2-15.6-26.2-33.7-36.6-52.1c-.9-1.7-1.9-3.4-2.8-5.1C622.8 384.1 640 345.8 640 304c0-94.4-87.9-171.5-198.2-175.8c4.1 15.2 6.2 31.2 6.2 47.8l0 .6c87.2 6.7 144 67.5 144 127.4c0 28-11.4 54.9-32.7 77.2c-14.3 15-17.3 37.6-7.5 55.8c1.1 2 2.2 4 3.2 5.9c2.5 4.5 5.2 9 7.9 13.6c-17-4.5-33.9-10.7-49.9-18c-4.3-1.9-8.5-3.9-12.6-6c-9.5-4.8-20.3-6.2-30.7-4.2c-12.1 2.4-24.8 3.6-37.8 3.6c-61.7 0-110-26.5-136.8-62.3c-16 5.4-32.8 9.4-50 11.8C279 439.8 350 480 432 480z'],
+  'file-code': [384, 'M64 464c-8.8 0-16-7.2-16-16L48 64c0-8.8 7.2-16 16-16l160 0 0 80c0 17.7 14.3 32 32 32l80 0 0 288c0 8.8-7.2 16-16 16L64 464zM64 0C28.7 0 0 28.7 0 64L0 448c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-293.5c0-17-6.7-33.3-18.7-45.3L274.7 18.7C262.7 6.7 246.5 0 229.5 0L64 0zm97 289c9.4-9.4 9.4-24.6 0-33.9s-24.6-9.4-33.9 0L79 303c-9.4 9.4-9.4 24.6 0 33.9l48 48c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-31-31 31-31zM257 255c-9.4-9.4-24.6-9.4-33.9 0s-9.4 24.6 0 33.9l31 31-31 31c-9.4 9.4-9.4 24.6 0 33.9s24.6 9.4 33.9 0l48-48c9.4-9.4 9.4-24.6 0-33.9l-48-48z'],
+  'paper-plane': [512, 'M16.1 260.2c-22.6 12.9-20.5 47.3 3.6 57.3L160 376l0 103.3c0 18.1 14.6 32.7 32.7 32.7c9.7 0 18.9-4.3 25.1-11.8l62-74.3 123.9 51.6c18.9 7.9 40.8-4.5 43.9-24.7l64-416c1.9-12.1-3.4-24.3-13.5-31.2s-23.3-7.5-34-1.4l-448 256zm52.1 25.5L409.7 90.6 190.1 336l1.2 1L68.2 285.7zM403.3 425.4L236.7 355.9 450.8 116.6 403.3 425.4z'],
+  'lightbulb': [384, 'M297.2 248.9C311.6 228.3 320 203.2 320 176c0-70.7-57.3-128-128-128S64 105.3 64 176c0 27.2 8.4 52.3 22.8 72.9c3.7 5.3 8.1 11.3 12.8 17.7c0 0 0 0 0 0c12.9 17.7 28.3 38.9 39.8 59.8c10.4 19 15.7 38.8 18.3 57.5L109 384c-2.2-12-5.9-23.7-11.8-34.5c-9.9-18-22.2-34.9-34.5-51.8c0 0 0 0 0 0s0 0 0 0c-5.2-7.1-10.4-14.2-15.4-21.4C27.6 247.9 16 213.3 16 176C16 78.8 94.8 0 192 0s176 78.8 176 176c0 37.3-11.6 71.9-31.4 100.3c-5 7.2-10.2 14.3-15.4 21.4c0 0 0 0 0 0s0 0 0 0c-12.3 16.8-24.6 33.7-34.5 51.8c-5.9 10.8-9.6 22.5-11.8 34.5l-48.6 0c2.6-18.7 7.9-38.6 18.3-57.5c11.5-20.9 26.9-42.1 39.8-59.8c0 0 0 0 0 0s0 0 0 0s0 0 0 0c4.7-6.4 9-12.4 12.7-17.7zM192 128c-26.5 0-48 21.5-48 48c0 8.8-7.2 16-16 16s-16-7.2-16-16c0-44.2 35.8-80 80-80c8.8 0 16 7.2 16 16s-7.2 16-16 16zm0 384c-44.2 0-80-35.8-80-80l0-16 160 0 0 16c0 44.2-35.8 80-80 80z'],
+  'calendar-days': [448, 'M152 24c0-13.3-10.7-24-24-24s-24 10.7-24 24l0 40L64 64C28.7 64 0 92.7 0 128l0 16 0 48L0 448c0 35.3 28.7 64 64 64l320 0c35.3 0 64-28.7 64-64l0-256 0-48 0-16c0-35.3-28.7-64-64-64l-40 0 0-40c0-13.3-10.7-24-24-24s-24 10.7-24 24l0 40L152 64l0-40zM48 192l80 0 0 56-80 0 0-56zm0 104l80 0 0 64-80 0 0-64zm128 0l96 0 0 64-96 0 0-64zm144 0l80 0 0 64-80 0 0-64zm80-48l-80 0 0-56 80 0 0 56zm0 160l0 40c0 8.8-7.2 16-16 16l-64 0 0-56 80 0zm-128 0l0 56-96 0 0-56 96 0zm-144 0l0 56-64 0c-8.8 0-16-7.2-16-16l0-40 80 0zM272 248l-96 0 0-56 96 0 0 56z'],
+  'file-lines': [384, 'M64 464c-8.8 0-16-7.2-16-16L48 64c0-8.8 7.2-16 16-16l160 0 0 80c0 17.7 14.3 32 32 32l80 0 0 288c0 8.8-7.2 16-16 16L64 464zM64 0C28.7 0 0 28.7 0 64L0 448c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-293.5c0-17-6.7-33.3-18.7-45.3L274.7 18.7C262.7 6.7 246.5 0 229.5 0L64 0zm56 256c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0zm0 96c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0z'],
+  'bars': [448, 'M0 96C0 78.3 14.3 64 32 64l384 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 128C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32l384 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 288c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32L32 448c-17.7 0-32-14.3-32-32s14.3-32 32-32l384 0c17.7 0 32 14.3 32 32z'],
+  'arrow-left': [448, 'M9.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.2 288 416 288c17.7 0 32-14.3 32-32s-14.3-32-32-32l-306.7 0L214.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z'],
+  'arrow-right': [448, 'M438.6 278.6c12.5-12.5 12.5-32.8 0-45.3l-160-160c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L338.8 224 32 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l306.7 0L233.4 393.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0l160-160z'],
+  'magnifying-glass': [512, 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
+  'xmark': [384, 'M342.6 150.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L192 210.7 86.6 105.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L146.7 256 41.4 361.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 301.3 297.4 406.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L237.3 256 342.6 150.6z'],
+  'copy': [448, 'M384 336l-192 0c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l140.1 0L400 115.9 400 320c0 8.8-7.2 16-16 16zM192 384l192 0c35.3 0 64-28.7 64-64l0-204.1c0-12.7-5.1-24.9-14.1-33.9L366.1 14.1c-9-9-21.2-14.1-33.9-14.1L192 0c-35.3 0-64 28.7-64 64l0 256c0 35.3 28.7 64 64 64zM64 128c-35.3 0-64 28.7-64 64L0 448c0 35.3 28.7 64 64 64l192 0c35.3 0 64-28.7 64-64l0-32-48 0 0 32c0 8.8-7.2 16-16 16L64 464c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l32 0 0-48-32 0z'],
+};
+function lgIcon(name, cls = '') {
+  const ic = LG_ICONS[name];
+  if (!ic) return '';
+  return `<svg class="an-ic lg-ic ${cls}" viewBox="0 0 ${ic[0]} 512" fill="currentColor" aria-hidden="true"><path d="${ic[1]}"/></svg>`;
+}
+
+// cols: which count columns a page shows; code: show HTTP status code / duration
+const LG_PAGES = {
+  group:     { nav: 'Group logs',     icon: 'comments',      kind: 'group',     cols: ['success', 'failed', 'pending'] },
+  api:       { nav: 'API logs',       icon: 'file-code',     kind: 'api',       cols: [], code: true },
+  webhooks:  { nav: 'Webhooks logs',  icon: 'paper-plane',   kind: 'webhook',   cols: ['success', 'failed'], code: true },
+  rules:     { nav: 'Rules logs',     icon: 'lightbulb',     kind: 'rule',      cols: ['success', 'failed'] },
+  scheduled: { nav: 'Scheduled logs', icon: 'calendar-days', kind: 'scheduled', cols: ['success', 'failed', 'pending'] },
+  activity:  { nav: 'Activity logs',  icon: 'file-lines' },
+};
+const LG_PERFORMERS = [['automation', 'Automation'], ['scheduler', 'Scheduler'], ['api', 'API key'], ['system', 'System']];
+const LG = { sub: 'group', q: '', status: '', from: '', to: '', by: '', page: 1, pageSize: 50, seq: 0, agents: null, data: null };
+
+function _lgShellHTML() {
+  const item = key => `<a href="#logs/${key}" class="an-nav-item lg-nav-item" data-lg="${key}">${lgIcon(LG_PAGES[key].icon)}<span>${esc(LG_PAGES[key].nav)}</span></a>`;
+  return `<div class="an-shell lg-shell" id="lg-shell">
+      <nav class="an-nav lg-nav" aria-label="Logs">
+        ${['group', 'api', 'webhooks', 'rules', 'scheduled'].map(item).join('')}
+        <div class="lg-nav-sep" role="separator"></div>
+        ${item('activity')}
+      </nav>
+      <div class="lg-main" id="lg-main"></div>
+    </div>`;
+}
+
+function _lgSyncRoute(sub) {
+  const route = 'logs/' + sub;
+  State.currentRoute = route;
+  if (location.hash !== '#' + route) history.replaceState(null, '', '#' + route);
+  const bc = document.getElementById('app-breadcrumb');
+  if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS.logs)}</strong><span class="bc-sep" aria-hidden="true">&gt;</span><strong>${esc(sub)}</strong>`;
+}
+
+async function renderLogs(sub) {
+  if (!LG_PAGES[sub]) sub = LG_PAGES[LG.sub] ? LG.sub : 'group';
+  if (sub !== LG.sub) Object.assign(LG, { q: '', status: '', from: '', to: '', by: '', page: 1 });
+  LG.sub = sub;
+  _lgSyncRoute(sub);
+  _lgCloseDrawer();
   const main = document.getElementById('main-content');
-  main.innerHTML = `
-    <div class="flex-col h-full" style="overflow-y:auto">
-      <div class="section-header">
-        <h2>Audit Logs</h2>
-        <div class="header-actions" style="margin-left:auto;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
-          <div style="display:flex;align-items:center;gap:.4rem">
-            <span style="font-size:12px;color:var(--text-3);font-weight:500">From:</span>
-            <input type="date" id="log-start-date" class="search-input" style="padding:4px 8px;font-size:12.5px;max-width:130px;height:30px">
-          </div>
-          <div style="display:flex;align-items:center;gap:.4rem">
-            <span style="font-size:12px;color:var(--text-3);font-weight:500">To:</span>
-            <input type="date" id="log-end-date" class="search-input" style="padding:4px 8px;font-size:12.5px;max-width:130px;height:30px">
-          </div>
-          <select id="log-action-filter" style="max-width:160px;height:30px;padding:4px 8px;font-size:12.5px;border-radius:6px;border:1px solid var(--border)"><option value="">All events</option></select>
-          ${isAdmin() ? '<button class="btn btn-secondary btn-sm" id="log-export" style="height:30px;padding:4px 12px;font-size:12.5px">Export CSV</button>' : ''}
+  if (!document.getElementById('lg-shell')) {
+    main.innerHTML = _lgShellHTML();
+    main.querySelectorAll('.lg-nav-item').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      navigateTo('logs/' + a.dataset.lg);
+    }));
+  }
+  main.querySelectorAll('.lg-nav-item').forEach(a => {
+    const on = a.dataset.lg === sub;
+    a.classList.toggle('active', on);
+    on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current');
+  });
+  const host = document.getElementById('lg-main');
+  host.scrollTop = 0;
+  if (sub === 'activity') return _lgRenderActivity(host);
+  host.innerHTML = _lgPageHTML(sub);
+  _lgBindToolbar(host);
+  _lgLoad();
+}
+
+function _lgPageHTML(sub) {
+  const p = LG_PAGES[sub];
+  const nf = [LG.status, LG.from || LG.to, LG.by].filter(Boolean).length;
+  return `<div class="lg-page" data-page="${esc(sub)}">
+      <div class="lg-toolbar">
+        <label class="lg-search">${lgIcon('magnifying-glass')}
+          <input type="search" id="lg-q" placeholder="Search by operation ID or performed by" aria-label="Search by operation ID or performed by" value="${esc(LG.q)}" autocomplete="off">
+        </label>
+        <div class="an-pop-wrap">
+          <button class="lg-btn" id="lg-filter-btn" aria-haspopup="true" aria-expanded="false">${lgIcon('bars')}<span>Filter</span>${nf ? `<span class="an-count">${nf}</span>` : ''}</button>
         </div>
+        <span class="lg-spacer"></span>
+        <span class="lg-history">Viewing 7 day log history</span>
       </div>
-      <div class="scroll-area">
-        <div class="content-card">
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th style="width: 170px;">Time</th>
-                  <th style="width: 150px;">Event</th>
-                  <th style="width: 150px;">Agent</th>
-                  <th>Details</th>
-                </tr>
-              </thead>
-              <tbody id="logs-tbody">
-                <tr><td colspan="4" style="text-align:center;padding:3rem"><div class="spinner"></div></td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
+      <div class="lg-table-wrap">
+        <table class="lg-table" aria-label="${esc(p.nav)}">
+          <thead><tr>${_lgHeadCells(p)}</tr></thead>
+          <tbody id="lg-tbody"><tr class="lg-state"><td colspan="${_lgColCount(p)}"><div class="spinner"></div></td></tr></tbody>
+        </table>
+      </div>
+      <div class="lg-pager" id="lg-pager"></div>
+    </div>`;
+}
+
+function _lgHeadCells(p) {
+  const th = (t, cls = '') => `<th scope="col"${cls ? ` class="${cls}"` : ''}>${t}</th>`;
+  const counts = { success: 'Success', failed: 'Failed', pending: 'Pending' };
+  return th('Operation', 'lg-col-op')
+    + p.cols.map(c => th(counts[c], 'lg-col-num')).join('')
+    + (p.code ? th('Status code', 'lg-col-num') + (p.kind === 'api' ? th('Duration', 'lg-col-num') : '') : '')
+    + th('Timestamp') + th('Performed by') + th('Log ID');
+}
+function _lgColCount(p) { return 4 + p.cols.length + (p.code ? (p.kind === 'api' ? 2 : 1) : 0); }
+
+function _lgWhen(ts) {
+  const d = parseServerDate(ts);
+  if (!d || isNaN(d)) return '—';
+  return d.toLocaleString(undefined, { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function _lgNum(n, tone) {
+  n = Number(n) || 0;
+  return `<span class="lg-num${n ? ' lg-' + tone : ''}">${n.toLocaleString()}</span>`;
+}
+function _lgCode(code) {
+  if (code == null) return '<span class="lg-muted">—</span>';
+  const tone = code < 300 ? 'ok' : code < 500 ? 'warn' : 'bad';
+  return `<span class="lg-code lg-code-${tone}">${esc(code)}</span>`;
+}
+function _lgOperation(it) {
+  if (it.kind === 'api') {
+    const [m, ...rest] = String(it.operation).split(' ');
+    return `<span class="lg-method lg-method-${esc(m.toLowerCase())}">${esc(m)}</span><span class="lg-path">${esc(rest.join(' '))}</span>`;
+  }
+  return esc(it.operation);
+}
+
+function _lgRowHTML(p, it) {
+  const cells = p.cols.map(c => `<td class="lg-col-num">${_lgNum(it[c + '_count'], c)}</td>`).join('');
+  const code = p.code ? `<td class="lg-col-num">${_lgCode(it.status_code)}</td>`
+    + (p.kind === 'api' ? `<td class="lg-col-num lg-muted">${it.duration_ms != null ? esc(it.duration_ms) + ' ms' : '—'}</td>` : '') : '';
+  return `<tr class="lg-row" tabindex="0" data-uid="${esc(it.uid)}" aria-label="View log ${esc(it.uid)}">
+      <td class="lg-col-op"><span class="lg-dot lg-dot-${esc(it.status)}" title="${esc(it.status)}"></span>${_lgOperation(it)}</td>
+      ${cells}${code}
+      <td class="lg-nowrap">${esc(_lgWhen(it.created_at))}</td>
+      <td>${esc(it.performed_by || 'System')}</td>
+      <td><code class="lg-uid">${esc(it.uid)}</code></td>
+    </tr>`;
+}
+
+async function _lgLoad() {
+  const p = LG_PAGES[LG.sub];
+  const tbody = document.getElementById('lg-tbody');
+  if (!p || !tbody) return;
+  const seq = ++LG.seq;
+  const q = { kind: p.kind, page: LG.page, page_size: LG.pageSize };
+  if (LG.q.trim()) q.q = LG.q.trim();
+  if (LG.status) q.status = LG.status;
+  if (LG.from) q.from = new Date(LG.from + 'T00:00:00').toISOString();
+  if (LG.to) { const e = new Date(LG.to + 'T00:00:00'); e.setDate(e.getDate() + 1); q.to = e.toISOString(); }
+  if (LG.by) q.performed_by = LG.by;
+  let data;
+  try { data = await Api.logs.operations(q); }
+  catch (e) {
+    if (seq !== LG.seq) return;
+    tbody.innerHTML = `<tr class="lg-state"><td colspan="${_lgColCount(p)}">${esc(e.message || 'Could not load logs')}</td></tr>`;
+    document.getElementById('lg-pager').innerHTML = '';
+    return;
+  }
+  if (seq !== LG.seq || !document.getElementById('lg-tbody')) return;
+  LG.data = data;
+  const filtered = LG.q.trim() || LG.status || LG.from || LG.to || LG.by;
+  tbody.innerHTML = data.items.length
+    ? data.items.map(it => _lgRowHTML(p, it)).join('')
+    : `<tr class="lg-state lg-empty"><td colspan="${_lgColCount(p)}">${filtered ? 'No logs match these filters' : 'No logs in the last 7 days'}</td></tr>`;
+  tbody.querySelectorAll('.lg-row').forEach(tr => {
+    tr.addEventListener('click', () => _lgOpenDrawer(tr.dataset.uid));
+    tr.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _lgOpenDrawer(tr.dataset.uid); } });
+  });
+  _lgRenderPager(data);
+}
+
+function _lgRenderPager(data) {
+  const el = document.getElementById('lg-pager');
+  if (!el) return;
+  const pages = Math.max(1, Math.ceil((data.total || 0) / (data.page_size || LG.pageSize)));
+  el.innerHTML = `
+    <button class="lg-page-btn" id="lg-prev" aria-label="Previous page"${LG.page <= 1 ? ' disabled' : ''}>${lgIcon('arrow-left')}</button>
+    <span class="lg-page-num" aria-live="polite" title="${pages} page${pages === 1 ? '' : 's'}, ${Number(data.total || 0).toLocaleString()} log${data.total === 1 ? '' : 's'}">${LG.page}</span>
+    <button class="lg-page-btn" id="lg-next" aria-label="Next page"${LG.page >= pages ? ' disabled' : ''}>${lgIcon('arrow-right')}</button>`;
+  el.querySelector('#lg-prev').addEventListener('click', () => { if (LG.page > 1) { LG.page--; _lgLoad(); } });
+  el.querySelector('#lg-next').addEventListener('click', () => { if (LG.page < pages) { LG.page++; _lgLoad(); } });
+}
+
+function _lgBindToolbar(host) {
+  const input = host.querySelector('#lg-q');
+  let t = null;
+  input.addEventListener('input', () => {
+    clearTimeout(t);
+    t = setTimeout(() => { LG.q = input.value; LG.page = 1; _lgLoad(); }, 300);
+  });
+  host.querySelector('#lg-filter-btn').addEventListener('click', e => { e.stopPropagation(); _lgOpenFilter(e.currentTarget); });
+}
+
+function _lgClosePop() {
+  document.querySelectorAll('.lg-pop').forEach(p => p.remove());
+  document.querySelectorAll('#lg-filter-btn[aria-expanded="true"]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+document.addEventListener('click', e => { if (!e.target.closest('.lg-pop, #lg-filter-btn')) _lgClosePop(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.querySelector('.lg-pop')) _lgClosePop(); });
+
+async function _lgOpenFilter(btn) {
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  _lgClosePop();
+  if (open) return;
+  btn.setAttribute('aria-expanded', 'true');
+  if (!LG.agents) {
+    try { LG.agents = await Api.auth.agents(); } catch (_) { LG.agents = []; }
+  }
+  if (btn.getAttribute('aria-expanded') !== 'true') return;
+  const today = new Date(), min = new Date(); min.setDate(min.getDate() - 7);
+  const statuses = [['', 'Any status'], ['success', 'Success'], ['failed', 'Failed'], ['pending', 'Pending']];
+  const pop = document.createElement('div');
+  pop.className = 'an-pop lg-pop';
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', 'Filter logs');
+  pop.innerHTML = `
+    <div class="an-pop-label">Status</div>
+    <div class="lg-seg" role="radiogroup" aria-label="Status">
+      ${statuses.map(([v, l]) => `<label class="lg-seg-opt"><input type="radio" name="lg-st" value="${v}"${LG.status === v ? ' checked' : ''}><span>${l}</span></label>`).join('')}
+    </div>
+    <div class="an-pop-sep"></div>
+    <div class="an-pop-label">Date range</div>
+    <div class="an-custom">
+      <label>From<input type="date" id="lg-from" value="${esc(LG.from)}" min="${_anYmd(min)}" max="${_anYmd(today)}"></label>
+      <label>To<input type="date" id="lg-to" value="${esc(LG.to)}" min="${_anYmd(min)}" max="${_anYmd(today)}"></label>
+    </div>
+    <div class="an-pop-sep"></div>
+    <div class="an-pop-label"><label for="lg-by">Performed by</label></div>
+    <div class="lg-pop-field">
+      <select id="lg-by">
+        <option value="">Anyone</option>
+        ${(LG.agents || []).length ? `<optgroup label="Team">${LG.agents.map(a => `<option value="${a.id}"${String(a.id) === LG.by ? ' selected' : ''}>${esc(a.name || a.email || ('#' + a.id))}</option>`).join('')}</optgroup>` : ''}
+        <optgroup label="Other">${LG_PERFORMERS.map(([v, l]) => `<option value="${v}"${v === LG.by ? ' selected' : ''}>${l}</option>`).join('')}</optgroup>
+      </select>
+    </div>
+    <div class="an-pop-foot">
+      <button class="lg-btn lg-btn-sm" id="lg-f-clear">Clear</button>
+      <button class="btn btn-primary btn-sm" id="lg-f-apply">Apply</button>
+    </div>`;
+  btn.parentElement.appendChild(pop);
+  pop.querySelector('input[name="lg-st"]:checked')?.focus();
+  pop.querySelector('#lg-f-clear').addEventListener('click', () => {
+    Object.assign(LG, { status: '', from: '', to: '', by: '', page: 1 });
+    _lgClosePop(); _lgRefreshToolbar(); _lgLoad();
+  });
+  pop.querySelector('#lg-f-apply').addEventListener('click', () => {
+    let from = pop.querySelector('#lg-from').value, to = pop.querySelector('#lg-to').value;
+    if (from && to && from > to) [from, to] = [to, from];
+    Object.assign(LG, {
+      status: pop.querySelector('input[name="lg-st"]:checked')?.value || '',
+      from, to, by: pop.querySelector('#lg-by').value, page: 1,
+    });
+    _lgClosePop(); _lgRefreshToolbar(); _lgLoad();
+  });
+}
+
+function _lgRefreshToolbar() {
+  const btn = document.getElementById('lg-filter-btn');
+  if (!btn) return;
+  const nf = [LG.status, LG.from || LG.to, LG.by].filter(Boolean).length;
+  btn.innerHTML = `${lgIcon('bars')}<span>Filter</span>${nf ? `<span class="an-count">${nf}</span>` : ''}`;
+}
+
+// ── Details drawer ── //
+function _lgCloseDrawer() {
+  const w = document.getElementById('lg-drawer-wrap');
+  if (!w) return;
+  w.remove();
+  document.removeEventListener('keydown', _lgDrawerKey);
+  document.querySelector(`.lg-row[data-uid="${CSS.escape(LG.openUid || '')}"]`)?.focus();
+  LG.openUid = null;
+}
+function _lgDrawerKey(e) { if (e.key === 'Escape') _lgCloseDrawer(); }
+
+async function _lgOpenDrawer(uid) {
+  _lgCloseDrawer();
+  LG.openUid = uid;
+  const wrap = document.createElement('div');
+  wrap.id = 'lg-drawer-wrap';
+  wrap.className = 'lg-drawer-wrap';
+  wrap.innerHTML = `<div class="lg-scrim" data-close></div>
+    <aside class="lg-drawer" role="dialog" aria-modal="true" aria-labelledby="lg-dr-title" tabindex="-1"><div class="loading-center"><div class="spinner"></div></div></aside>`;
+  document.body.appendChild(wrap);
+  document.addEventListener('keydown', _lgDrawerKey);
+  wrap.querySelector('[data-close]').addEventListener('click', _lgCloseDrawer);
+  let it;
+  try { it = await Api.logs.operation(uid); }
+  catch (e) { _lgCloseDrawer(); toast(e.message || 'Could not load log', 'error'); return; }
+  if (!wrap.isConnected) return;
+  const dr = wrap.querySelector('.lg-drawer');
+  dr.innerHTML = _lgDrawerHTML(it);
+  dr.querySelector('[data-close]').addEventListener('click', _lgCloseDrawer);
+  dr.querySelector('[data-copy]')?.addEventListener('click', () => stCopy(it.uid, 'Log ID copied'));
+  dr.focus();
+}
+
+const LG_STATUS_LABEL = { success: 'Success', failed: 'Failed', partial: 'Partly failed', pending: 'Pending' };
+
+function _lgDrawerHTML(it) {
+  const p = Object.values(LG_PAGES).find(x => x.kind === it.kind) || {};
+  const fact = (k, v) => `<div class="lg-fact"><dt>${k}</dt><dd>${v}</dd></div>`;
+  const d = it.details || {};
+  const parts = Array.isArray(d.participants) && d.participants.some(x => x && typeof x === 'object' && 'ok' in x) ? d.participants : null;
+  const deliveries = Array.isArray(d.deliveries) ? d.deliveries : null;
+  const sub = (title, rows) => `<h4 class="lg-sub">${title}</h4><table class="lg-mini">${rows}</table>`;
+  return `
+    <div class="lg-dr-head">
+      <div class="lg-dr-title">
+        <div class="lg-dr-kind">${esc(p.nav || it.kind)}</div>
+        <h3 id="lg-dr-title">${_lgOperation(it)}</h3>
+      </div>
+      <button type="button" class="lg-icon-btn" data-close aria-label="Close">${lgIcon('xmark')}</button>
+    </div>
+    <div class="lg-dr-body">
+      <dl class="lg-facts">
+        ${fact('Status', `<span class="lg-status lg-status-${esc(it.status)}">${esc(LG_STATUS_LABEL[it.status] || it.status)}</span>`)}
+        ${fact('Log ID', `<code class="lg-uid">${esc(it.uid)}</code><button type="button" class="lg-icon-btn lg-copy" data-copy aria-label="Copy log ID" title="Copy">${lgIcon('copy')}</button>`)}
+        ${it.kind !== 'api' ? fact('Success', _lgNum(it.success_count, 'success')) + fact('Failed', _lgNum(it.failed_count, 'failed'))
+          + (it.pending_count || it.kind === 'group' || it.kind === 'scheduled' ? fact('Pending', _lgNum(it.pending_count, 'pending')) : '') : ''}
+        ${it.status_code != null ? fact('Status code', _lgCode(it.status_code)) : ''}
+        ${it.duration_ms != null ? fact('Duration', `${esc(it.duration_ms)} ms`) : ''}
+        ${fact('Performed by', esc(it.performed_by || 'System'))}
+        ${fact('Timestamp', esc(_lgWhen(it.created_at)))}
+        ${it.updated_at && parseServerDate(it.updated_at) - parseServerDate(it.created_at) > 1500 ? fact('Last updated', esc(_lgWhen(it.updated_at))) : ''}
+      </dl>
+      ${d.error ? `<div class="lg-error" role="note"><strong>Error</strong><span>${esc(d.error)}</span></div>` : ''}
+      ${parts ? sub(`Participants (${parts.length})`, parts.map(x => `<tr><td><code>${esc(x.id)}</code></td><td>${x.ok ? '<span class="lg-success">Success</span>' : `<span class="lg-failed">Failed</span>${x.error ? ` <span class="lg-muted">· ${esc(x.error)}</span>` : ''}`}</td></tr>`).join('')) : ''}
+      ${deliveries ? sub(`Endpoints (${deliveries.length})`, deliveries.map(x => `<tr><td>${esc(x.host || '?')}</td><td>${_lgCode(x.status_code)}</td><td>${x.ok ? '<span class="lg-success">Delivered</span>' : `<span class="lg-failed">Failed</span>${x.error ? ` <span class="lg-muted">· ${esc(x.error)}</span>` : ''}`}</td></tr>`).join('')) : ''}
+      <h4 class="lg-sub">Payload</h4>
+      <pre class="lg-json">${esc(JSON.stringify(d, null, 2))}</pre>
+    </div>`;
+}
+
+// ── Activity logs (the original audit log) ── //
+async function _lgRenderActivity(host) {
+  host.innerHTML = `
+    <div class="lg-page lg-activity">
+      <div class="lg-toolbar">
+        <label class="lg-inline">From<input type="date" id="log-start-date" class="lg-date"></label>
+        <label class="lg-inline">To<input type="date" id="log-end-date" class="lg-date"></label>
+        <select id="log-action-filter" class="lg-select" aria-label="Event"><option value="">All events</option></select>
+        <span class="lg-spacer"></span>
+        ${isAdmin() ? '<button class="lg-btn" id="log-export">Export CSV</button>' : ''}
+      </div>
+      <div class="lg-table-wrap">
+        <table class="lg-table lg-table-activity" aria-label="Activity logs">
+          <thead><tr><th scope="col" style="width:190px">Time</th><th scope="col" style="width:170px">Event</th><th scope="col" style="width:160px">Agent</th><th scope="col">Details</th></tr></thead>
+          <tbody id="logs-tbody"><tr class="lg-state"><td colspan="4"><div class="spinner"></div></td></tr></tbody>
+        </table>
       </div>
     </div>`;
 
   const startInput = document.getElementById('log-start-date');
   const endInput = document.getElementById('log-end-date');
   const actionSel = document.getElementById('log-action-filter');
-
   function reloadWithFilters() {
-    let startVal = startInput.value;
-    let endVal = endInput.value;
-    let start_date = startVal ? `${startVal}T00:00:00.000Z` : undefined;
-    let end_date = endVal ? `${endVal}T23:59:59.999Z` : undefined;
-    loadLogsTable(actionSel.value, start_date, end_date);
+    const s = startInput.value, e = endInput.value;
+    loadLogsTable(actionSel.value, s ? `${s}T00:00:00.000Z` : undefined, e ? `${e}T23:59:59.999Z` : undefined);
   }
-
   startInput.addEventListener('change', reloadWithFilters);
   endInput.addEventListener('change', reloadWithFilters);
   actionSel.addEventListener('change', reloadWithFilters);
-
   document.getElementById('log-export')?.addEventListener('click', async () => {
     try { await Api.exports.logs(30); toast('Export downloaded', 'success'); }
-    catch(e) { toast(e.message, 'error'); }
+    catch (e) { toast(e.message, 'error'); }
   });
-
   try {
     const actions = await Api.logs.actions();
     actions.forEach(a => {
@@ -9134,7 +9456,7 @@ async function renderLogs() {
       o.textContent = a.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
       actionSel.appendChild(o);
     });
-  } catch(_) {}
+  } catch (_) {}
   await loadLogsTable('');
 }
 

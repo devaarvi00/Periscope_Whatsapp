@@ -228,10 +228,12 @@ const Api = (() => {
     assistant:     (b)  => post('/ai/assistant', b),
   };
 
-  // Activity logs
+  // Activity logs + operation logs (Logs → Group / API / Webhooks / Rules / Scheduled)
   const logs = {
-    list:    (q) => get('/logs', q),
-    actions: ()  => get('/logs/actions'),
+    list:       (q)   => get('/logs', q),
+    actions:    ()    => get('/logs/actions'),
+    operations: (q)   => get('/logs/operations', q),
+    operation:  (uid) => get(`/logs/operations/${encodeURIComponent(uid)}`),
   };
 
   // Groups
