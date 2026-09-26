@@ -9,9 +9,15 @@ LABEL_COLOR_PATTERN = r"^#[0-9a-fA-F]{3,8}$"
 
 class KnowledgeItemCreate(BaseModel):
     item_type: str = "faq"
-    title: str
-    content: str
+    title: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1, max_length=200_000)
     status: str = "active"
+
+
+class KnowledgeItemUpdate(BaseModel):
+    title: str | None = Field(None, min_length=1, max_length=500)
+    content: str | None = Field(None, min_length=1, max_length=200_000)
+    status: str | None = None
 
 
 class KnowledgeItemOut(BaseModel):
@@ -21,8 +27,84 @@ class KnowledgeItemOut(BaseModel):
     content: str
     status: str
     is_self_learned: bool
+    source: str | None = None
+    origin_chat_id: int | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class ExternalSourceCreate(BaseModel):
+    url: str = Field(min_length=8, max_length=1000)
+    title: str | None = Field(None, max_length=500)
+
+
+# ── AI agent settings ──
+class DayHours(BaseModel):
+    on: bool = False
+    start: str = Field("09:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    end: str = Field("18:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+class AISettingsUpdate(BaseModel):
+    """Partial update: fields left out keep their value."""
+    enabled: bool | None = None
+    auto_activate_new_chats: bool | None = None
+    activation_rules: str | None = Field(None, max_length=20_000)
+    allowed_phone_ids: list[int] | None = None
+    response_delay_seconds: int | None = None
+    snooze_after_human_seconds: int | None = None
+    hours_enabled: bool | None = None
+    hours_schedule: dict[str, DayHours] | None = None
+    hours_start: str | None = None
+    hours_end: str | None = None
+    agent_name: str | None = Field(None, max_length=100)
+    personality: str | None = None
+    role_description: str | None = Field(None, max_length=20_000)
+    custom_instructions: str | None = Field(None, max_length=20_000)
+    restrictions: str | None = Field(None, max_length=20_000)
+    allow_send_messages: bool | None = None
+    allow_create_tickets: bool | None = None
+    ticket_instructions: str | None = Field(None, max_length=5_000)
+    allow_private_notes: bool | None = None
+    note_instructions: str | None = Field(None, max_length=5_000)
+    flag_enabled: bool | None = None
+    flag_criteria: str | None = Field(None, max_length=5_000)
+
+
+class PlaygroundMessage(BaseModel):
+    role: Literal["customer", "agent"] = "customer"
+    text: str = Field(min_length=1, max_length=4000)
+
+
+class PlaygroundRequest(BaseModel):
+    settings: AISettingsUpdate | None = None
+    messages: list[PlaygroundMessage] = Field(min_length=1, max_length=40)
+    check_rules: bool = True
+
+
+class InternalContactCreate(BaseModel):
+    number: str = Field(min_length=5, max_length=40)
+    label: str = Field("", max_length=255)
+
+
+class CustomToolParam(BaseModel):
+    name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,39}$")
+    type: Literal["string", "number", "integer", "boolean"] = "string"
+    description: str = Field("", max_length=300)
+    required: bool = False
+
+
+class CustomToolIn(BaseModel):
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,40}$")
+    description: str = Field("", max_length=1000)
+    method: Literal["GET", "POST"] = "GET"
+    url: str = Field(min_length=8, max_length=1000)
+    headers: dict[str, str] | None = None  # omitted on update = keep existing
+    params: list[CustomToolParam] = Field(default_factory=list, max_length=12)
+    enabled: bool = True
+    timeout_seconds: int = Field(8, ge=1, le=15)
 
 
 class AutomationRuleCreate(BaseModel):

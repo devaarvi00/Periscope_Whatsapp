@@ -18,6 +18,7 @@ from app.models.bulk_message_job import (
 from app.models.activity_log import ActivityLog
 from app.models.operation_log import OperationLog
 from app.models.ai_settings import AIAgentSettings
+from app.models.ai_records import AICustomTool, AIInternalContact, AIRunLog, AIUsage
 from app.models.api_key import ApiKey, WebhookEndpoint
 from app.models.scheduled_message import ScheduledMessage
 from app.models.task import Task
@@ -33,4 +34,5 @@ __all__ = [
     "ScheduledMessage", "Task", "PropertyDefinition",
     "BulkMessageLog", "MessageTemplate", "SavedChatList", "AIAgentSettings", "OrgSettings",
     "OrgConfig", "MediaLibraryItem", "GroupTemplate",
+    "AIUsage", "AIRunLog", "AIInternalContact", "AICustomTool",
 ]

@@ -775,6 +775,7 @@ function _parseRoute(route) {
   if (view === 'analytics') return { view, sub: AN_PAGES[sub] ? sub : null };
   if (view === 'settings') return { view, sub: stIsPage(sub) ? sub : null };
   if (view === 'logs') return { view, sub: LG_PAGES[sub] ? sub : null };
+  if (view === 'ai-agent') return { view, sub: AIA_PAGES[sub] ? sub : null };
   return { view, sub: null };
 }
 
@@ -782,6 +783,11 @@ function navigateTo(route) {
   const r = _parseRoute(route) || { view: 'dashboard', sub: null };
   const view = r.view;
   const full = r.sub ? `${view}/${r.sub}` : view;
+  // AI Agent pages with unsaved edits ask before leaving
+  if (State.currentView === 'ai-agent' && full !== State.currentRoute && !aiaConfirmLeave()) {
+    if (location.hash !== '#' + State.currentRoute) history.pushState(null, '', '#' + State.currentRoute);
+    return;
+  }
   if (location.hash !== '#' + full) history.pushState(null, '', '#' + full);
   _stopDashWahaPoller();
   _stopDashQrPoll();
@@ -789,8 +795,10 @@ function navigateTo(route) {
   // Switching analytics / settings sub-pages keeps the shell (sub-nav) in place
   const keepShell = (view === 'analytics' && State.currentView === 'analytics' && document.getElementById('an-shell'))
     || (view === 'settings' && State.currentView === 'settings' && document.getElementById('st-shell'))
-    || (view === 'logs' && State.currentView === 'logs' && document.getElementById('lg-shell'));
+    || (view === 'logs' && State.currentView === 'logs' && document.getElementById('lg-shell'))
+    || (view === 'ai-agent' && State.currentView === 'ai-agent' && document.getElementById('aia-shell'));
   if (view !== 'logs') { _lgCloseDrawer(); _lgClosePop(); }
+  if (view !== 'ai-agent' && State.currentView === 'ai-agent') _aiaDestroyCharts();
   if (view !== 'analytics' && State.currentView === 'analytics') _anDestroyCharts();
   State.currentView = view;
   State.currentRoute = full;
@@ -808,6 +816,7 @@ function navigateTo(route) {
   if (view === 'analytics') return renderAnalytics(r.sub);
   if (view === 'settings') return renderSettings(r.sub);
   if (view === 'logs') return renderLogs(r.sub);
+  if (view === 'ai-agent') return renderAIAgent(r.sub);
   return ({
     dashboard:        renderDashboard,
     inbox:            renderInbox,
@@ -5883,113 +5892,1453 @@ function _anExportModal(x) {
 }
 
 // ── AI AGENT VIEW ───────────────────────────────────────────────── //
-async function renderAIAgent() {
-  const main = document.getElementById('main-content');
-  main.innerHTML = `
-    <div class="flex-col h-full" style="overflow-y:auto">
-      <div class="section-header"><h2>AI Agent</h2></div>
-      <div class="scroll-area">
-        <div class="content-card" style="margin-bottom:1rem">
-          <div class="card-header">Agent Settings
-            <div class="header-actions"><button class="btn btn-primary btn-sm" id="ai-cfg-save">Save Settings</button></div>
-          </div>
-          <div class="card-body" id="ai-cfg-body"><div class="spinner"></div></div>
-        </div>
-        <div class="content-card">
-          <div class="card-header">Translate Message</div>
-          <div class="card-body">
-            <div style="display:flex;gap:.75rem;align-items:flex-end">
-              <div class="form-group" style="flex:1;margin:0"><label>Text</label><textarea id="tl-text" style="min-height:60px" placeholder="Enter text to translate..."></textarea></div>
-              <div class="form-group" style="margin:0"><label>Language</label>
-                <select id="tl-lang"><option value="hindi">Hindi</option><option value="spanish">Spanish</option><option value="french">French</option><option value="arabic">Arabic</option><option value="english">English</option></select>
-              </div>
-              <button class="btn btn-primary btn-sm" id="tl-btn" style="margin-bottom:1rem">Translate</button>
-            </div>
-            <div id="tl-result" style="display:none;background:var(--bg);padding:.75rem;border-radius:4px;font-size:13px;margin-top:.5rem"></div>
-          </div>
-        </div>
-      </div>
+// Sub-routes #ai-agent/<page>; pages render into a centred column with a
+// shared save bar and a Playground slide-over. Styles: css/ai.css.
+// AI Agent icons: Font Awesome Free 6.7.2 (CC BY 4.0) — [viewBox width, path]
+const AI_ICONS = {
+  robot: [640, 'M320 0c17.7 0 32 14.3 32 32l0 64 120 0c39.8 0 72 32.2 72 72l0 272c0 39.8-32.2 72-72 72l-304 0c-39.8 0-72-32.2-72-72l0-272c0-39.8 32.2-72 72-72l120 0 0-64c0-17.7 14.3-32 32-32zM208 384c-8.8 0-16 7.2-16 16s7.2 16 16 16l32 0c8.8 0 16-7.2 16-16s-7.2-16-16-16l-32 0zm96 0c-8.8 0-16 7.2-16 16s7.2 16 16 16l32 0c8.8 0 16-7.2 16-16s-7.2-16-16-16l-32 0zm96 0c-8.8 0-16 7.2-16 16s7.2 16 16 16l32 0c8.8 0 16-7.2 16-16s-7.2-16-16-16l-32 0zM264 256a40 40 0 1 0 -80 0 40 40 0 1 0 80 0zm152 40a40 40 0 1 0 0-80 40 40 0 1 0 0 80zM48 224l16 0 0 192-16 0c-26.5 0-48-21.5-48-48l0-96c0-26.5 21.5-48 48-48zm544 0c26.5 0 48 21.5 48 48l0 96c0 26.5-21.5 48-48 48l-16 0 0-192 16 0z'],
+  book: [448, 'M96 0C43 0 0 43 0 96L0 416c0 53 43 96 96 96l288 0 32 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l0-64c17.7 0 32-14.3 32-32l0-320c0-17.7-14.3-32-32-32L384 0 96 0zm0 384l256 0 0 64L96 448c-17.7 0-32-14.3-32-32s14.3-32 32-32zm32-240c0-8.8 7.2-16 16-16l192 0c8.8 0 16 7.2 16 16s-7.2 16-16 16l-192 0c-8.8 0-16-7.2-16-16zm16 48l192 0c8.8 0 16 7.2 16 16s-7.2 16-16 16l-192 0c-8.8 0-16-7.2-16-16s7.2-16 16-16z'],
+  wrench: [512, 'M78.6 5C69.1-2.4 55.6-1.5 47 7L7 47c-8.5 8.5-9.4 22-2.1 31.6l80 104c4.5 5.9 11.6 9.4 19 9.4l54.1 0 109 109c-14.7 29-10 65.4 14.3 89.6l112 112c12.5 12.5 32.8 12.5 45.3 0l64-64c12.5-12.5 12.5-32.8 0-45.3l-112-112c-24.2-24.2-60.6-29-89.6-14.3l-109-109 0-54.1c0-7.5-3.5-14.5-9.4-19L78.6 5zM19.9 396.1C7.2 408.8 0 426.1 0 444.1C0 481.6 30.4 512 67.9 512c18 0 35.3-7.2 48-19.9L233.7 374.3c-7.8-20.9-9-43.6-3.6-65.1l-61.7-61.7L19.9 396.1zM512 144c0-10.5-1.1-20.7-3.2-30.5c-2.4-11.2-16.1-14.1-24.2-6l-63.9 63.9c-3 3-7.1 4.7-11.3 4.7L352 176c-8.8 0-16-7.2-16-16l0-57.4c0-4.2 1.7-8.3 4.7-11.3l63.9-63.9c8.1-8.1 5.2-21.8-6-24.2C388.7 1.1 378.5 0 368 0C288.5 0 224 64.5 224 144l0 .8 85.3 85.3c36-9.1 75.8 .5 104 28.7L429 274.5c49-23 83-72.8 83-130.5zM56 432a24 24 0 1 1 48 0 24 24 0 1 1 -48 0z'],
+  coins: [512, 'M512 80c0 18-14.3 34.6-38.4 48c-29.1 16.1-72.5 27.5-122.3 30.9c-3.7-1.8-7.4-3.5-11.3-5C300.6 137.4 248.2 128 192 128c-8.3 0-16.4 .2-24.5 .6l-1.1-.6C142.3 114.6 128 98 128 80c0-44.2 86-80 192-80S512 35.8 512 80zM160.7 161.1c10.2-.7 20.7-1.1 31.3-1.1c62.2 0 117.4 12.3 152.5 31.4C369.3 204.9 384 221.7 384 240c0 4-.7 7.9-2.1 11.7c-4.6 13.2-17 25.3-35 35.5c0 0 0 0 0 0c-.1 .1-.3 .1-.4 .2c0 0 0 0 0 0s0 0 0 0c-.3 .2-.6 .3-.9 .5c-35 19.4-90.8 32-153.6 32c-59.6 0-112.9-11.3-148.2-29.1c-1.9-.9-3.7-1.9-5.5-2.9C14.3 274.6 0 258 0 240c0-34.8 53.4-64.5 128-75.4c10.5-1.5 21.4-2.7 32.7-3.5zM416 240c0-21.9-10.6-39.9-24.1-53.4c28.3-4.4 54.2-11.4 76.2-20.5c16.3-6.8 31.5-15.2 43.9-25.5l0 35.4c0 19.3-16.5 37.1-43.8 50.9c-14.6 7.4-32.4 13.7-52.4 18.5c.1-1.8 .2-3.5 .2-5.3zm-32 96c0 18-14.3 34.6-38.4 48c-1.8 1-3.6 1.9-5.5 2.9C304.9 404.7 251.6 416 192 416c-62.8 0-118.6-12.6-153.6-32C14.3 370.6 0 354 0 336l0-35.4c12.5 10.3 27.6 18.7 43.9 25.5C83.4 342.6 135.8 352 192 352s108.6-9.4 148.1-25.9c7.8-3.2 15.3-6.9 22.4-10.9c6.1-3.4 11.8-7.2 17.2-11.2c1.5-1.1 2.9-2.3 4.3-3.4l0 3.4 0 5.7 0 26.3zm32 0l0-32 0-25.9c19-4.2 36.5-9.5 52.1-16c16.3-6.8 31.5-15.2 43.9-25.5l0 35.4c0 10.5-5 21-14.9 30.9c-16.3 16.3-45 29.7-81.3 38.4c.1-1.7 .2-3.5 .2-5.3zM192 448c56.2 0 108.6-9.4 148.1-25.9c16.3-6.8 31.5-15.2 43.9-25.5l0 35.4c0 44.2-86 80-192 80S0 476.2 0 432l0-35.4c12.5 10.3 27.6 18.7 43.9 25.5C83.4 438.6 135.8 448 192 448z'],
+  grad: [640, 'M320 32c-8.1 0-16.1 1.4-23.7 4.1L15.8 137.4C6.3 140.9 0 149.9 0 160s6.3 19.1 15.8 22.6l57.9 20.9C57.3 229.3 48 259.8 48 291.9l0 28.1c0 28.4-10.8 57.7-22.3 80.8c-6.5 13-13.9 25.8-22.5 37.6C0 442.7-.9 448.3 .9 453.4s6 8.9 11.2 10.2l64 16c4.2 1.1 8.7 .3 12.4-2s6.3-6.1 7.1-10.4c8.6-42.8 4.3-81.2-2.1-108.7C90.3 344.3 86 329.8 80 316.5l0-24.6c0-30.2 10.2-58.7 27.9-81.5c12.9-15.5 29.6-28 49.2-35.7l157-61.7c8.2-3.2 17.5 .8 20.7 9s-.8 17.5-9 20.7l-157 61.7c-12.4 4.9-23.3 12.4-32.2 21.6l159.6 57.6c7.6 2.7 15.6 4.1 23.7 4.1s16.1-1.4 23.7-4.1L624.2 182.6c9.5-3.4 15.8-12.5 15.8-22.6s-6.3-19.1-15.8-22.6L343.7 36.1C336.1 33.4 328.1 32 320 32zM128 408c0 35.3 86 72 192 72s192-36.7 192-72L496.7 262.6 354.5 314c-11.1 4-22.8 6-34.5 6s-23.5-2-34.5-6L143.3 262.6 128 408z'],
+  anglesLeft: [512, 'M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160zm352-160l-160 160c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L301.3 256 438.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0z'],
+  expand: [448, 'M32 32C14.3 32 0 46.3 0 64l0 96c0 17.7 14.3 32 32 32s32-14.3 32-32l0-64 64 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L32 32zM64 352c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 96c0 17.7 14.3 32 32 32l96 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-64 0 0-64zM320 32c-17.7 0-32 14.3-32 32s14.3 32 32 32l64 0 0 64c0 17.7 14.3 32 32 32s32-14.3 32-32l0-96c0-17.7-14.3-32-32-32l-96 0zM448 352c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64-64 0c-17.7 0-32 14.3-32 32s14.3 32 32 32l96 0c17.7 0 32-14.3 32-32l0-96z'],
+  fileLines: [384, 'M64 0C28.7 0 0 28.7 0 64L0 448c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-288-128 0c-17.7 0-32-14.3-32-32L224 0 64 0zM256 0l0 128 128 0L256 0zM112 256l160 0c8.8 0 16 7.2 16 16s-7.2 16-16 16l-160 0c-8.8 0-16-7.2-16-16s7.2-16 16-16zm0 64l160 0c8.8 0 16 7.2 16 16s-7.2 16-16 16l-160 0c-8.8 0-16-7.2-16-16s7.2-16 16-16zm0 64l160 0c8.8 0 16 7.2 16 16s-7.2 16-16 16l-160 0c-8.8 0-16-7.2-16-16s7.2-16 16-16z'],
+  globe: [512, 'M352 256c0 22.2-1.2 43.6-3.3 64l-185.3 0c-2.2-20.4-3.3-41.8-3.3-64s1.2-43.6 3.3-64l185.3 0c2.2 20.4 3.3 41.8 3.3 64zm28.8-64l123.1 0c5.3 20.5 8.1 41.9 8.1 64s-2.8 43.5-8.1 64l-123.1 0c2.1-20.6 3.2-42 3.2-64s-1.1-43.4-3.2-64zm112.6-32l-116.7 0c-10-63.9-29.8-117.4-55.3-151.6c78.3 20.7 142 77.5 171.9 151.6zm-149.1 0l-176.6 0c6.1-36.4 15.5-68.6 27-94.7c10.5-23.6 22.2-40.7 33.5-51.5C239.4 3.2 248.7 0 256 0s16.6 3.2 27.8 13.8c11.3 10.8 23 27.9 33.5 51.5c11.6 26 20.9 58.2 27 94.7zm-209 0L18.6 160C48.6 85.9 112.2 29.1 190.6 8.4C165.1 42.6 145.3 96.1 135.3 160zM8.1 192l123.1 0c-2.1 20.6-3.2 42-3.2 64s1.1 43.4 3.2 64L8.1 320C2.8 299.5 0 278.1 0 256s2.8-43.5 8.1-64zM194.7 446.6c-11.6-26-20.9-58.2-27-94.6l176.6 0c-6.1 36.4-15.5 68.6-27 94.6c-10.5 23.6-22.2 40.7-33.5 51.5C272.6 508.8 263.3 512 256 512s-16.6-3.2-27.8-13.8c-11.3-10.8-23-27.9-33.5-51.5zM135.3 352c10 63.9 29.8 117.4 55.3 151.6C112.2 482.9 48.6 426.1 18.6 352l116.7 0zm358.1 0c-30 74.1-93.6 130.9-171.9 151.6c25.5-34.2 45.2-87.7 55.3-151.6l116.7 0z'],
+  question: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM169.8 165.3c7.9-22.3 29.1-37.3 52.8-37.3l58.3 0c34.9 0 63.1 28.3 63.1 63.1c0 22.6-12.1 43.5-31.7 54.8L280 264.4c-.2 13-10.9 23.6-24 23.6c-13.3 0-24-10.7-24-24l0-13.5c0-8.6 4.6-16.5 12.1-20.8l44.3-25.4c4.7-2.7 7.6-7.7 7.6-13.1c0-8.4-6.8-15.1-15.1-15.1l-58.3 0c-3.4 0-6.4 2.1-7.5 5.3l-.4 1.2c-4.4 12.5-18.2 19-30.6 14.6s-19-18.2-14.6-30.6l.4-1.2zM224 352a32 32 0 1 1 64 0 32 32 0 1 1 -64 0z'],
+  bulb: [384, 'M272 384c9.6-31.9 29.5-59.1 49.2-86.2c0 0 0 0 0 0c5.2-7.1 10.4-14.2 15.4-21.4c19.8-28.5 31.4-63 31.4-100.3C368 78.8 289.2 0 192 0S16 78.8 16 176c0 37.3 11.6 71.9 31.4 100.3c5 7.2 10.2 14.3 15.4 21.4c0 0 0 0 0 0c19.8 27.1 39.7 54.4 49.2 86.2l160 0zM192 512c44.2 0 80-35.8 80-80l0-16-160 0 0 16c0 44.2 35.8 80 80 80zM112 176c0 8.8-7.2 16-16 16s-16-7.2-16-16c0-61.9 50.1-112 112-112c8.8 0 16 7.2 16 16s-7.2 16-16 16c-44.2 0-80 35.8-80 80z'],
+  house: [576, 'M575.8 255.5c0 18-15 32.1-32 32.1l-32 0 .7 160.2c0 2.7-.2 5.4-.5 8.1l0 16.2c0 22.1-17.9 40-40 40l-16 0c-1.1 0-2.2 0-3.3-.1c-1.4 .1-2.8 .1-4.2 .1L416 512l-24 0c-22.1 0-40-17.9-40-40l0-24 0-64c0-17.7-14.3-32-32-32l-64 0c-17.7 0-32 14.3-32 32l0 64 0 24c0 22.1-17.9 40-40 40l-24 0-31.9 0c-1.5 0-3-.1-4.5-.2c-1.2 .1-2.4 .2-3.6 .2l-16 0c-22.1 0-40-17.9-40-40l0-112c0-.9 0-1.9 .1-2.8l0-69.7-32 0c-18 0-32-14-32-32.1c0-9 3-17 10-24L266.4 8c7-7 15-8 22-8s15 2 21 7L564.8 231.5c8 7 12 15 11 24z'],
+  wand: [576, 'M234.7 42.7L197 56.8c-3 1.1-5 4-5 7.2s2 6.1 5 7.2l37.7 14.1L248.8 123c1.1 3 4 5 7.2 5s6.1-2 7.2-5l14.1-37.7L315 71.2c3-1.1 5-4 5-7.2s-2-6.1-5-7.2L277.3 42.7 263.2 5c-1.1-3-4-5-7.2-5s-6.1 2-7.2 5L234.7 42.7zM46.1 395.4c-18.7 18.7-18.7 49.1 0 67.9l34.6 34.6c18.7 18.7 49.1 18.7 67.9 0L529.9 116.5c18.7-18.7 18.7-49.1 0-67.9L495.3 14.1c-18.7-18.7-49.1-18.7-67.9 0L46.1 395.4zM484.6 82.6l-105 105-23.3-23.3 105-105 23.3 23.3zM7.5 117.2C3 118.9 0 123.2 0 128s3 9.1 7.5 10.8L64 160l21.2 56.5c1.7 4.5 6 7.5 10.8 7.5s9.1-3 10.8-7.5L128 160l56.5-21.2c4.5-1.7 7.5-6 7.5-10.8s-3-9.1-7.5-10.8L128 96 106.8 39.5C105.1 35 100.8 32 96 32s-9.1 3-10.8 7.5L64 96 7.5 117.2zm352 256c-4.5 1.7-7.5 6-7.5 10.8s3 9.1 7.5 10.8L416 416l21.2 56.5c1.7 4.5 6 7.5 10.8 7.5s9.1-3 10.8-7.5L480 416l56.5-21.2c4.5-1.7 7.5-6 7.5-10.8s-3-9.1-7.5-10.8L480 352l-21.2-56.5c-1.7-4.5-6-7.5-10.8-7.5s-9.1 3-10.8 7.5L416 352l-56.5 21.2z'],
+  circleCheck: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM369 209L241 337c-9.4 9.4-24.6 9.4-33.9 0l-64-64c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l47 47L335 175c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9z'],
+  circleO: [512, 'M464 256A208 208 0 1 0 48 256a208 208 0 1 0 416 0zM0 256a256 256 0 1 1 512 0A256 256 0 1 1 0 256z'],
+  paper: [512, 'M498.1 5.6c10.1 7 15.4 19.1 13.5 31.2l-64 416c-1.5 9.7-7.4 18.2-16 23s-18.9 5.4-28 1.6L284 427.7l-68.5 74.1c-8.9 9.7-22.9 12.9-35.2 8.1S160 493.2 160 480l0-83.6c0-4 1.5-7.8 4.2-10.8L331.8 202.8c5.8-6.3 5.6-16-.4-22s-15.7-6.4-22-.7L106 360.8 17.7 316.6C7.1 311.3 .3 300.7 0 288.9s5.9-22.8 16.1-28.7l448-256c10.7-6.1 23.9-5.5 34 1.4z'],
+  sticky: [448, 'M64 32C28.7 32 0 60.7 0 96L0 416c0 35.3 28.7 64 64 64l224 0 0-112c0-26.5 21.5-48 48-48l112 0 0-224c0-35.3-28.7-64-64-64L64 32zM448 352l-45.3 0L336 352c-8.8 0-16 7.2-16 16l0 66.7 0 45.3 32-32 64-64 32-32z'],
+  chartLine: [512, 'M64 64c0-17.7-14.3-32-32-32S0 46.3 0 64L0 400c0 44.2 35.8 80 80 80l400 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L80 416c-8.8 0-16-7.2-16-16L64 64zm406.6 86.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L320 210.7l-57.4-57.4c-12.5-12.5-32.8-12.5-45.3 0l-112 112c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L240 221.3l57.4 57.4c12.5 12.5 32.8 12.5 45.3 0l128-128z'],
+  listUl: [512, 'M64 144a48 48 0 1 0 0-96 48 48 0 1 0 0 96zM192 64c-17.7 0-32 14.3-32 32s14.3 32 32 32l288 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L192 64zm0 160c-17.7 0-32 14.3-32 32s14.3 32 32 32l288 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-288 0zm0 160c-17.7 0-32 14.3-32 32s14.3 32 32 32l288 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-288 0zM64 464a48 48 0 1 0 0-96 48 48 0 1 0 0 96zm48-208a48 48 0 1 0 -96 0 48 48 0 1 0 96 0z'],
+  flag: [448, 'M64 32C64 14.3 49.7 0 32 0S0 14.3 0 32L0 64 0 368 0 480c0 17.7 14.3 32 32 32s32-14.3 32-32l0-128 64.3-16.1c41.1-10.3 84.6-5.5 122.5 13.4c44.2 22.1 95.5 24.8 141.7 7.4l34.7-13c12.5-4.7 20.8-16.6 20.8-30l0-247.7c0-23-24.2-38-44.8-27.7l-9.6 4.8c-46.3 23.2-100.8 23.2-147.1 0c-35.1-17.6-75.4-22-113.5-12.5L64 48l0-16z'],
+  addressBook: [512, 'M96 0C60.7 0 32 28.7 32 64l0 384c0 35.3 28.7 64 64 64l288 0c35.3 0 64-28.7 64-64l0-384c0-35.3-28.7-64-64-64L96 0zM208 288l64 0c44.2 0 80 35.8 80 80c0 8.8-7.2 16-16 16l-192 0c-8.8 0-16-7.2-16-16c0-44.2 35.8-80 80-80zm-32-96a64 64 0 1 1 128 0 64 64 0 1 1 -128 0zM512 80c0-8.8-7.2-16-16-16s-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64zM496 192c-8.8 0-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64c0-8.8-7.2-16-16-16zm16 144c0-8.8-7.2-16-16-16s-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64z'],
+  chevronRight: [320, 'M310.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-192 192c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L242.7 256 73.4 86.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l192 192z'],
+  toggle: [576, 'M192 64C86 64 0 150 0 256S86 448 192 448l192 0c106 0 192-86 192-192s-86-192-192-192L192 64zm192 96a96 96 0 1 1 0 192 96 96 0 1 1 0-192z'],
+  idBadge: [384, 'M64 0C28.7 0 0 28.7 0 64L0 448c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-384c0-35.3-28.7-64-64-64L64 0zm96 320l64 0c44.2 0 80 35.8 80 80c0 8.8-7.2 16-16 16L96 416c-8.8 0-16-7.2-16-16c0-44.2 35.8-80 80-80zm-32-96a64 64 0 1 1 128 0 64 64 0 1 1 -128 0zM144 64l96 0c8.8 0 16 7.2 16 16s-7.2 16-16 16l-96 0c-8.8 0-16-7.2-16-16s7.2-16 16-16z'],
+  rotate: [512, 'M142.9 142.9c-17.5 17.5-30.1 38-37.8 59.8c-5.9 16.7-24.2 25.4-40.8 19.5s-25.4-24.2-19.5-40.8C55.6 150.7 73.2 122 97.6 97.6c87.2-87.2 228.3-87.5 315.8-1L455 55c6.9-6.9 17.2-8.9 26.2-5.2s14.8 12.5 14.8 22.2l0 128c0 13.3-10.7 24-24 24l-8.4 0c0 0 0 0 0 0L344 224c-9.7 0-18.5-5.8-22.2-14.8s-1.7-19.3 5.2-26.2l41.1-41.1c-62.6-61.5-163.1-61.2-225.3 1zM16 312c0-13.3 10.7-24 24-24l7.6 0 .7 0L168 288c9.7 0 18.5 5.8 22.2 14.8s1.7 19.3-5.2 26.2l-41.1 41.1c62.6 61.5 163.1 61.2 225.3-1c17.5-17.5 30.1-38 37.8-59.8c5.9-16.7 24.2-25.4 40.8-19.5s25.4 24.2 19.5 40.8c-10.8 30.6-28.4 59.3-52.9 83.8c-87.2 87.2-228.3 87.5-315.8 1L57 457c-6.9 6.9-17.2 8.9-26.2 5.2S16 449.7 16 440l0-119.6 0-.7 0-7.6z'],
+  bolt: [448, 'M349.4 44.6c5.9-13.7 1.5-29.7-10.6-38.5s-28.6-8-39.9 1.8l-256 224c-10 8.8-13.6 22.9-8.9 35.3S50.7 288 64 288l111.5 0L98.6 467.4c-5.9 13.7-1.5 29.7 10.6 38.5s28.6 8 39.9-1.8l256-224c10-8.8 13.6-22.9 8.9-35.3s-16.6-20.7-30-20.7l-111.5 0L349.4 44.6z'],
+  ban: [512, 'M367.2 412.5L99.5 144.8C77.1 176.1 64 214.5 64 256c0 106 86 192 192 192c41.5 0 79.9-13.1 111.2-35.5zm45.3-45.3C434.9 335.9 448 297.5 448 256c0-106-86-192-192-192c-41.5 0-79.9 13.1-111.2 35.5L412.5 367.2zM0 256a256 256 0 1 1 512 0A256 256 0 1 1 0 256z'],
+  xmark: [384, 'M342.6 150.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L192 210.7 86.6 105.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L146.7 256 41.4 361.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 301.3 297.4 406.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L237.3 256 342.6 150.6z'],
+  clock: [512, 'M256 0a256 256 0 1 1 0 512A256 256 0 1 1 256 0zM232 120l0 136c0 8 4 15.5 10.7 20l96 64c11 7.4 25.9 4.4 33.3-6.7s4.4-25.9-6.7-33.3L280 243.2 280 120c0-13.3-10.7-24-24-24s-24 10.7-24 24z'],
+  ticket: [576, 'M64 64C28.7 64 0 92.7 0 128l0 64c0 8.8 7.4 15.7 15.7 18.6C34.5 217.1 48 235 48 256s-13.5 38.9-32.3 45.4C7.4 304.3 0 311.2 0 320l0 64c0 35.3 28.7 64 64 64l448 0c35.3 0 64-28.7 64-64l0-64c0-8.8-7.4-15.7-15.7-18.6C541.5 294.9 528 277 528 256s13.5-38.9 32.3-45.4c8.3-2.9 15.7-9.8 15.7-18.6l0-64c0-35.3-28.7-64-64-64L64 64zm64 112l0 160c0 8.8 7.2 16 16 16l288 0c8.8 0 16-7.2 16-16l0-160c0-8.8-7.2-16-16-16l-288 0c-8.8 0-16 7.2-16 16zM96 160c0-17.7 14.3-32 32-32l320 0c17.7 0 32 14.3 32 32l0 192c0 17.7-14.3 32-32 32l-320 0c-17.7 0-32-14.3-32-32l0-192z'],
+  userShield: [640, 'M224 256A128 128 0 1 0 224 0a128 128 0 1 0 0 256zm-45.7 48C79.8 304 0 383.8 0 482.3C0 498.7 13.3 512 29.7 512l388.6 0c1.8 0 3.5-.2 5.3-.5c-76.3-55.1-99.8-141-103.1-200.2c-16.1-4.8-33.1-7.3-50.7-7.3l-91.4 0zm308.8-78.3l-120 48C358 277.4 352 286.2 352 296c0 63.3 25.9 168.8 134.8 214.2c5.9 2.5 12.6 2.5 18.5 0C614.1 464.8 640 359.3 640 296c0-9.8-6-18.6-15.1-22.3l-120-48c-5.7-2.3-12.1-2.3-17.8 0zM591.4 312c-3.9 50.7-27.2 116.7-95.4 149.7l0-187.8L591.4 312z'],
+  compress: [448, 'M160 64c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64-64 0c-17.7 0-32 14.3-32 32s14.3 32 32 32l96 0c17.7 0 32-14.3 32-32l0-96zM32 320c-17.7 0-32 14.3-32 32s14.3 32 32 32l64 0 0 64c0 17.7 14.3 32 32 32s32-14.3 32-32l0-96c0-17.7-14.3-32-32-32l-96 0zM352 64c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 96c0 17.7 14.3 32 32 32l96 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-64 0 0-64zM320 320c-17.7 0-32 14.3-32 32l0 96c0 17.7 14.3 32 32 32s32-14.3 32-32l0-64 64 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-96 0z'],
+  sliders: [512, 'M0 416c0 17.7 14.3 32 32 32l54.7 0c12.3 28.3 40.5 48 73.3 48s61-19.7 73.3-48L480 448c17.7 0 32-14.3 32-32s-14.3-32-32-32l-246.7 0c-12.3-28.3-40.5-48-73.3-48s-61 19.7-73.3 48L32 384c-17.7 0-32 14.3-32 32zm128 0a32 32 0 1 1 64 0 32 32 0 1 1 -64 0zM320 256a32 32 0 1 1 64 0 32 32 0 1 1 -64 0zm32-80c-32.8 0-61 19.7-73.3 48L32 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l246.7 0c12.3 28.3 40.5 48 73.3 48s61-19.7 73.3-48l54.7 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-54.7 0c-12.3-28.3-40.5-48-73.3-48zM192 128a32 32 0 1 1 0-64 32 32 0 1 1 0 64zm73.3-64C253 35.7 224.8 16 192 16s-61 19.7-73.3 48L32 64C14.3 64 0 78.3 0 96s14.3 32 32 32l86.7 0c12.3 28.3 40.5 48 73.3 48s61-19.7 73.3-48L480 128c17.7 0 32-14.3 32-32s-14.3-32-32-32L265.3 64z'],
+  trash: [448, 'M135.2 17.7C140.6 6.8 151.7 0 163.8 0L284.2 0c12.1 0 23.2 6.8 28.6 17.7L320 32l96 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 96C14.3 96 0 81.7 0 64S14.3 32 32 32l96 0 7.2-14.3zM32 128l384 0 0 320c0 35.3-28.7 64-64 64L96 512c-35.3 0-64-28.7-64-64l0-320zm96 64c-8.8 0-16 7.2-16 16l0 224c0 8.8 7.2 16 16 16s16-7.2 16-16l0-224c0-8.8-7.2-16-16-16zm96 0c-8.8 0-16 7.2-16 16l0 224c0 8.8 7.2 16 16 16s16-7.2 16-16l0-224c0-8.8-7.2-16-16-16zm96 0c-8.8 0-16 7.2-16 16l0 224c0 8.8 7.2 16 16 16s16-7.2 16-16l0-224c0-8.8-7.2-16-16-16z'],
+  pen: [512, 'M362.7 19.3L314.3 67.7 444.3 197.7l48.4-48.4c25-25 25-65.5 0-90.5L453.3 19.3c-25-25-65.5-25-90.5 0zm-71 71L58.6 323.5c-10.4 10.4-18 23.3-22.2 37.4L1 481.2C-1.5 489.7 .8 498.8 7 505s15.3 8.5 23.7 6.1l120.3-35.4c14.1-4.2 27-11.8 37.4-22.2L421.7 220.3 291.7 90.3z'],
+  plus: [448, 'M256 80c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 144L48 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l144 0 0 144c0 17.7 14.3 32 32 32s32-14.3 32-32l0-144 144 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-144 0 0-144z'],
+  down: [512, 'M233.4 406.6c12.5 12.5 32.8 12.5 45.3 0l192-192c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L256 338.7 86.6 169.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l192 192z'],
+  search: [512, 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
+  calendar: [448, 'M96 32l0 32L48 64C21.5 64 0 85.5 0 112l0 48 448 0 0-48c0-26.5-21.5-48-48-48l-48 0 0-32c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 32L160 64l0-32c0-17.7-14.3-32-32-32S96 14.3 96 32zM448 192L0 192 0 464c0 26.5 21.5 48 48 48l352 0c26.5 0 48-21.5 48-48l0-272z'],
+  info: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM216 336l24 0 0-64-24 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l48 0c13.3 0 24 10.7 24 24l0 88 8 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-80 0c-13.3 0-24-10.7-24-24s10.7-24 24-24zm40-208a32 32 0 1 1 0 64 32 32 0 1 1 0-64z'],
+  upload: [448, 'M246.6 9.4c-12.5-12.5-32.8-12.5-45.3 0l-128 128c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 109.3 192 320c0 17.7 14.3 32 32 32s32-14.3 32-32l0-210.7 73.4 73.4c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3l-128-128zM64 352c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64c0 53 43 96 96 96l256 0c53 0 96-43 96-96l0-64c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64c0 17.7-14.3 32-32 32L96 448c-17.7 0-32-14.3-32-32l0-64z'],
+  check: [448, 'M438.6 105.4c12.5 12.5 12.5 32.8 0 45.3l-256 256c-12.5 12.5-32.8 12.5-45.3 0l-128-128c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0L160 338.7 393.4 105.4c12.5-12.5 32.8-12.5 45.3 0z'],
+  link: [640, 'M579.8 267.7c56.5-56.5 56.5-148 0-204.5c-50-50-128.8-56.5-186.3-15.4l-1.6 1.1c-14.4 10.3-17.7 30.3-7.4 44.6s30.3 17.7 44.6 7.4l1.6-1.1c32.1-22.9 76-19.3 103.8 8.6c31.5 31.5 31.5 82.5 0 114L422.3 334.8c-31.5 31.5-82.5 31.5-114 0c-27.9-27.9-31.5-71.8-8.6-103.8l1.1-1.6c10.3-14.4 6.9-34.4-7.4-44.6s-34.4-6.9-44.6 7.4l-1.1 1.6C206.5 251.2 213 330 263 380c56.5 56.5 148 56.5 204.5 0L579.8 267.7zM60.2 244.3c-56.5 56.5-56.5 148 0 204.5c50 50 128.8 56.5 186.3 15.4l1.6-1.1c14.4-10.3 17.7-30.3 7.4-44.6s-30.3-17.7-44.6-7.4l-1.6 1.1c-32.1 22.9-76 19.3-103.8-8.6C74 372 74 321 105.5 289.5L217.7 177.2c31.5-31.5 82.5-31.5 114 0c27.9 27.9 31.5 71.8 8.6 103.9l-1.1 1.6c-10.3 14.4-6.9 34.4 7.4 44.6s34.4 6.9 44.6-7.4l1.1-1.6C433.5 260.8 427 182 377 132c-56.5-56.5-148-56.5-204.5 0L60.2 244.3z'],
+  eraser: [576, 'M290.7 57.4L57.4 290.7c-25 25-25 65.5 0 90.5l80 80c12 12 28.3 18.7 45.3 18.7L288 480l9.4 0L512 480c17.7 0 32-14.3 32-32s-14.3-32-32-32l-124.1 0L518.6 285.3c25-25 25-65.5 0-90.5L381.3 57.4c-25-25-65.5-25-90.5 0zM297.4 416l-9.4 0-105.4 0-80-80L227.3 211.3 364.7 348.7 297.4 416z'],
+  copy: [448, 'M384 336l-192 0c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l140.1 0L400 115.9 400 320c0 8.8-7.2 16-16 16zM192 384l192 0c35.3 0 64-28.7 64-64l0-204.1c0-12.7-5.1-24.9-14.1-33.9L366.1 14.1c-9-9-21.2-14.1-33.9-14.1L192 0c-35.3 0-64 28.7-64 64l0 256c0 35.3 28.7 64 64 64zM64 128c-35.3 0-64 28.7-64 64L0 448c0 35.3 28.7 64 64 64l192 0c35.3 0 64-28.7 64-64l0-32-48 0 0 32c0 8.8-7.2 16-16 16L64 464c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l32 0 0-48-32 0z'],
+  phone: [384, 'M16 64C16 28.7 44.7 0 80 0L304 0c35.3 0 64 28.7 64 64l0 384c0 35.3-28.7 64-64 64L80 512c-35.3 0-64-28.7-64-64L16 64zM224 448a32 32 0 1 0 -64 0 32 32 0 1 0 64 0zM304 64L80 64l0 320 224 0 0-320z'],
+  hourglass: [384, 'M32 0C14.3 0 0 14.3 0 32S14.3 64 32 64l0 11c0 42.4 16.9 83.1 46.9 113.1L146.7 256 78.9 323.9C48.9 353.9 32 394.6 32 437l0 11c-17.7 0-32 14.3-32 32s14.3 32 32 32l32 0 256 0 32 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l0-11c0-42.4-16.9-83.1-46.9-113.1L237.3 256l67.9-67.9c30-30 46.9-70.7 46.9-113.1l0-11c17.7 0 32-14.3 32-32s-14.3-32-32-32L320 0 64 0 32 0zM96 75l0-11 192 0 0 11c0 19-5.6 37.4-16 53L112 128c-10.3-15.6-16-34-16-53zm16 309c3.5-5.3 7.6-10.3 12.1-14.9L192 301.3l67.9 67.9c4.6 4.6 8.6 9.6 12.1 14.9L112 384z'],
+  triangle: [512, 'M256 32c14.2 0 27.3 7.5 34.5 19.8l216 368c7.3 12.4 7.3 27.7 .2 40.1S486.3 480 472 480L40 480c-14.3 0-27.6-7.7-34.7-20.1s-7-27.8 .2-40.1l216-368C228.7 39.5 241.8 32 256 32zm0 128c-13.3 0-24 10.7-24 24l0 112c0 13.3 10.7 24 24 24s24-10.7 24-24l0-112c0-13.3-10.7-24-24-24zm32 224a32 32 0 1 0 -64 0 32 32 0 1 0 64 0z'],
+  message: [512, 'M64 0C28.7 0 0 28.7 0 64L0 352c0 35.3 28.7 64 64 64l96 0 0 80c0 6.1 3.4 11.6 8.8 14.3s11.9 2.1 16.8-1.5L309.3 416 448 416c35.3 0 64-28.7 64-64l0-288c0-35.3-28.7-64-64-64L64 0z'],
+  fire: [448, 'M159.3 5.4c7.8-7.3 19.9-7.2 27.7 .1c27.6 25.9 53.5 53.8 77.7 84c11-14.4 23.5-30.1 37-42.9c7.9-7.4 20.1-7.4 28 .1c34.6 33 63.9 76.6 84.5 118c20.3 40.8 33.8 82.5 33.8 111.9C448 404.2 348.2 512 224 512C98.4 512 0 404.1 0 276.5c0-38.4 17.8-85.3 45.4-131.7C73.3 97.7 112.7 48.6 159.3 5.4zM225.7 416c25.3 0 47.7-7 68.8-21c42.1-29.4 53.4-88.2 28.1-134.4c-4.5-9-16-9.6-22.5-2l-25.2 29.3c-6.6 7.6-18.5 7.4-24.7-.5c-16.5-21-46-58.5-62.8-79.8c-6.3-8-18.3-8.1-24.7-.1c-33.8 42.5-50.8 69.3-50.8 99.4C112 375.4 162.6 416 225.7 416z'],
+};
+
+function aiIcon(name, cls = '') {
+  const ic = AI_ICONS[name] || ST_ICONS[name] || AN_ICONS[name];
+  if (!ic) return '';
+  return `<svg class="an-ic aia-ic ${cls}" viewBox="0 0 ${ic[0]} 512" fill="currentColor" aria-hidden="true"><path d="${ic[1]}"/></svg>`;
+}
+
+// #ai-agent/<page> sub-routes (same shell as #analytics / #settings)
+const AIA_PAGES = {
+  overview:        { nav: 'Overview', icon: 'house', title: 'AI Agent',
+                     sub: 'An AI teammate that answers your customers on WhatsApp using your knowledge and rules.' },
+  activation:      { nav: 'Activation', icon: 'toggle', title: 'Activation', editable: true,
+                     sub: 'Decide which messages the agent answers, on which numbers and when.' },
+  personalization: { nav: 'Personalization', icon: 'idBadge', title: 'Personalization', editable: true,
+                     sub: 'Give the agent a name, a personality and clear instructions.' },
+  knowledge:       { nav: 'Knowledge Base', icon: 'book', title: 'Knowledge Base', wide: true,
+                     sub: 'Answers, documents and web pages the agent can use. It only answers from what is here.' },
+  tools:           { nav: 'Tools', icon: 'wrench', title: 'Tools', editable: true,
+                     sub: 'Actions the agent may take besides replying.' },
+  usage:           { nav: 'Credit Usage', icon: 'coins', title: 'Credit Usage', wide: true,
+                     sub: 'Gemini tokens used by the agent and the other AI features.' },
+  training:        { nav: 'Self-Training', icon: 'grad', title: 'Self-Training',
+                     sub: 'Answers learned from your team’s conversations. Approve them to add them to the knowledge base.' },
+  analytics:       { nav: 'Analytics', icon: 'chartLine', title: 'Analytics', wide: true,
+                     sub: 'What the agent did over time.' },
+  logs:            { nav: 'Logs', icon: 'listUl', title: 'Logs', wide: true,
+                     sub: 'Every incoming message the agent evaluated, and what it decided. Kept for 30 days.' },
+  flagging:        { nav: 'Flagging', icon: 'flag', title: 'Flagging', editable: true,
+                     sub: 'Let AI flag important incoming messages so your team sees them first.' },
+  internal:        { nav: 'Internal Contacts', icon: 'addressBook', title: 'Internal Contacts',
+                     sub: 'Team and internal numbers. The agent never replies to or flags messages from them.' },
+};
+const AIA_GROUPS = [
+  { label: 'AI Agent', icon: 'robot', pages: ['overview', 'activation', 'personalization', 'knowledge', 'tools'] },
+  { label: 'Monitor', icon: 'chartLine', pages: ['usage', 'training', 'analytics', 'logs'] },
+  { label: 'General', icon: 'sliders', pages: ['flagging', 'internal'] },
+];
+// Settings fields each editable page owns (the save bar compares these)
+const AIA_FIELDS = {
+  activation: ['activation_rules', 'auto_activate_new_chats', 'allowed_phone_ids', 'response_delay_seconds',
+               'snooze_after_human_seconds', 'hours_enabled', 'hours_schedule'],
+  personalization: ['agent_name', 'personality', 'role_description', 'restrictions'],
+  tools: ['allow_send_messages', 'allow_create_tickets', 'ticket_instructions', 'allow_private_notes', 'note_instructions'],
+  flagging: ['flag_enabled', 'flag_criteria'],
+};
+const AIA_PERSONALITIES = {
+  friendly:     ['Friendly', 'Warm and conversational, with a helpful, positive tone.'],
+  professional: ['Professional', 'Polite, clear and businesslike. No slang.'],
+  spartan:      ['Concise / Spartan', 'Ultra-brief answers — one or two short sentences.'],
+  sales:        ['Sales', 'Enthusiastic and benefit-led; guides toward the next step.'],
+  grounded:     ['Grounded', 'Strictly factual; says it will check when unsure.'],
+  empathetic:   ['Empathetic', 'Patient and caring; acknowledges feelings first.'],
+};
+const AIA_DAYS = [['mon', 'Monday'], ['tue', 'Tuesday'], ['wed', 'Wednesday'], ['thu', 'Thursday'],
+                  ['fri', 'Friday'], ['sat', 'Saturday'], ['sun', 'Sunday']];
+const AIA_ROLE_TEMPLATES = [
+  { name: 'Online store', text: 'You are the customer support assistant for our online store.\n\nHelp customers with:\n- Product questions (features, sizes, availability)\n- Order status, delivery times and shipping charges\n- Returns, exchanges and refunds, following our policy\n- Payment options\n\nAsk for the order number when a question is about a specific order. If a customer reports a damaged or wrong item, apologise, collect the order number and a photo, and tell them the team will resolve it.' },
+  { name: 'Clinic / healthcare', text: 'You are the front-desk assistant for our clinic.\n\nHelp patients with:\n- Clinic timings, address and doctors available\n- Booking, rescheduling or cancelling appointments (collect name, preferred date and time)\n- Consultation fees and accepted payment methods\n- What to bring for a visit\n\nNever give medical advice or a diagnosis. For symptoms or emergencies, ask them to call the clinic or visit the nearest emergency room.' },
+  { name: 'Real estate', text: 'You are the enquiry assistant for our real-estate agency.\n\nHelp prospects with:\n- Available properties, locations, sizes and price ranges\n- Amenities and possession timelines\n- Scheduling a site visit (collect name, preferred date and budget)\n\nQualify each lead politely: ask about budget, preferred location and timeline. Hand over to an agent for negotiation or legal questions.' },
+  { name: 'Software / SaaS support', text: 'You are the support assistant for our software product.\n\nHelp users with:\n- How-to questions about features\n- Account, login and billing questions\n- Known issues and their workarounds\n\nFor bugs, collect: what they did, what they expected, what happened, and a screenshot. Tell them the support team will follow up.' },
+  { name: 'Restaurant / cafe', text: 'You are the assistant for our restaurant.\n\nHelp guests with:\n- Opening hours, location and parking\n- Menu items, prices, vegetarian / vegan options\n- Table reservations (collect name, date, time and number of guests)\n- Home delivery and takeaway\n\nKeep replies short and friendly.' },
+  { name: 'Education / coaching', text: 'You are the admissions assistant for our institute.\n\nHelp students and parents with:\n- Courses offered, duration, schedule and fees\n- Admission process and required documents\n- Demo classes (collect name, course and preferred time)\n\nBe encouraging and clear.' },
+];
+const AIA_RESTRICTION_TEMPLATES = [
+  { name: 'Safe defaults', text: '- Never promise discounts, refunds or delivery dates that are not in the knowledge base\n- Never share internal phone numbers, emails or staff details\n- Never ask for passwords, OTPs or full card numbers\n- Do not discuss competitors\n- Do not talk about politics, religion or other unrelated topics' },
+  { name: 'Healthcare', text: '- Never give medical advice, diagnoses or medication doses\n- Never discuss another patient\n- In an emergency, tell the person to call emergency services immediately\n- Do not quote treatment outcomes' },
+  { name: 'Finance', text: '- Never give investment, tax or legal advice\n- Never ask for or repeat account numbers, PINs or OTPs\n- Do not promise approval, rates or returns\n- Refer complaints to a human agent' },
+  { name: 'Sales guardrails', text: '- Do not offer discounts or custom pricing\n- Do not commit to delivery or installation dates\n- Hand over to a salesperson when the customer asks for a quote or negotiation' },
+];
+const AIA_REASONS = {
+  outside_hours: 'Outside operating hours', snoozed: 'Snoozed — a teammate replied', not_activated: 'Not activated for this chat',
+  phone_not_allowed: 'Number not allowed', internal_contact: 'Internal contact', rules: 'Activation rules',
+  superseded: 'A newer message arrived', group: 'Group chat', no_reply: 'Chose not to reply',
+  blocked: 'Blocked by safety filters', error: 'Error', send_off: 'Sending is off — saved as draft',
+};
+const AIA_PURPOSES = {
+  reply: 'Agent replies', classify: 'Activation checks', playground: 'Playground', translate: 'Translation',
+  suggest: 'Suggested replies', summary: 'Summaries', flag: 'Flagging', polish: 'Polish', assistant: 'Assistant',
+  self_training: 'Self-training', other: 'Other',
+};
+const AIA_TOOL_LABELS = { create_ticket: 'Ticket', private_note: 'Private note' };
+const _aiaToolLabel = n => AIA_TOOL_LABELS[n] || n;
+const AIA_KB_TYPES = { faq: 'FAQ', self_learned: 'Self-Learned', document: 'Document', external: 'External Source' };
+
+const AIA = {
+  sub: 'overview', saved: null, draft: null, phones: [], charts: [], seq: 0,
+  kb: { status: 'all', type: 'all', q: '' }, toolsTab: 'builtin', trainTab: 'review',
+  logs: { decision: '', reason: '', q: '', page: 1 }, usageRange: '30d', anRange: '30d',
+  pg: { open: false, messages: [], busy: false, rules: true },
+};
+
+const _aiaClone = o => JSON.parse(JSON.stringify(o));
+const _aiaCount = t => {
+  const s = String(t || '');
+  const w = s.trim() ? s.trim().split(/\s+/).length : 0;
+  return `${w.toLocaleString('en-IN')} word${w === 1 ? '' : 's'} · ${s.length.toLocaleString('en-IN')} chars`;
+};
+const _aiaFmtNum = n => Number(n || 0).toLocaleString('en-IN');
+function _aiaFmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+function _aiaDirty(sub = AIA.sub) {
+  const f = AIA_FIELDS[sub];
+  if (!f || !AIA.saved || !AIA.draft) return false;
+  return f.some(k => JSON.stringify(AIA.draft[k]) !== JSON.stringify(AIA.saved[k]));
+}
+// Navigation guard (called by navigateTo): true = the route may change
+function aiaConfirmLeave() {
+  if (State.currentView !== 'ai-agent' || !_aiaDirty()) return true;
+  if (!confirm('You have unsaved changes on this page. Leave without saving?')) return false;
+  AIA.draft = _aiaClone(AIA.saved);
+  return true;
+}
+window.addEventListener('beforeunload', e => {
+  if (State.currentView === 'ai-agent' && _aiaDirty()) { e.preventDefault(); e.returnValue = ''; }
+});
+
+function _aiaDestroyCharts() {
+  AIA.charts.forEach(c => { try { c.destroy(); } catch (_) {} });
+  AIA.charts = [];
+}
+async function _aiaLoadSettings() {
+  const s = await Api.ai.settings();
+  AIA.saved = s;
+  AIA.draft = _aiaClone(s);
+  return s;
+}
+
+// ── Shell ── //
+function _aiaShellHTML() {
+  const groups = AIA_GROUPS.map((g, gi) =>
+    `<div class="an-nav-group${gi ? ' an-nav-group-2' : ''}">${aiIcon(g.icon)}<span>${esc(g.label)}</span></div>` +
+    g.pages.map(k => `<a href="#ai-agent/${k}" class="an-nav-item" data-aia="${k}">${aiIcon(AIA_PAGES[k].icon)}<span>${esc(AIA_PAGES[k].nav)}</span></a>`).join('')
+  ).join('');
+  return `<div class="an-shell st-shell aia-shell" id="aia-shell">
+      <nav class="an-nav st-nav" aria-label="AI Agent">${groups}</nav>
+      <div class="st-main aia-main" id="aia-main"></div>
+      <button class="aia-pg-tab" id="aia-pg-tab" aria-controls="aia-pg" aria-expanded="false">${aiIcon('anglesLeft')}<span>Playground</span></button>
+      <aside class="aia-pg" id="aia-pg" aria-label="Playground" hidden></aside>
     </div>`;
+}
 
-  // Agent Settings form (org-wide personalization + behavior)
-  try {
-    const cfg = await Api.ai.settings();
-    const el = document.getElementById('ai-cfg-body');
-    el.innerHTML = `
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.8rem 1.2rem">
-        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
-          <input type="checkbox" id="cfg-enabled" ${cfg.enabled ? 'checked' : ''} style="width:15px;height:15px">
-          <strong>AI agent enabled</strong> (master switch)</label></div>
-        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
-          <input type="checkbox" id="cfg-autoact" ${cfg.auto_activate_new_chats ? 'checked' : ''} style="width:15px;height:15px">
-          Auto-activate on new chats</label></div>
-        <div class="form-group"><label>Agent name (shown to customers)</label>
-          <input type="text" id="cfg-name" value="${esc(cfg.agent_name)}"></div>
-        <div class="form-group"><label>Personality</label><select id="cfg-personality">
-          <option value="friendly" ${cfg.personality === 'friendly' ? 'selected' : ''}>Friendly — warm, moderate detail</option>
-          <option value="grounded" ${cfg.personality === 'grounded' ? 'selected' : ''}>Grounded — strictly factual</option>
-          <option value="spartan" ${cfg.personality === 'spartan' ? 'selected' : ''}>Spartan — ultra-brief</option>
-          <option value="sales" ${cfg.personality === 'sales' ? 'selected' : ''}>Sales — benefit-oriented</option>
-        </select></div>
-        <div class="form-group" style="grid-column:1/-1"><label>Role & business context</label>
-          <textarea id="cfg-role" style="min-height:50px" placeholder="e.g. Support agent for Acme Store — we sell electronics, ship India-wide in 3-5 days...">${esc(cfg.role_description)}</textarea></div>
-        <div class="form-group" style="grid-column:1/-1"><label>Operational instructions</label>
-          <textarea id="cfg-instructions" style="min-height:50px" placeholder="e.g. Technical bugs → say the engineering team will call back. Pricing → share the plans page...">${esc(cfg.custom_instructions)}</textarea></div>
-        <div class="form-group" style="grid-column:1/-1"><label>Hard restrictions (the agent must never do these)</label>
-          <textarea id="cfg-restrictions" style="min-height:40px" placeholder="e.g. Never promise refunds, never share internal phone numbers, never schedule calls...">${esc(cfg.restrictions)}</textarea></div>
-        <div class="form-group" style="grid-column:1/-1"><label>Activation rules (when to reply / ignore)</label>
-          <textarea id="cfg-rules" style="min-height:40px" placeholder="e.g. Do not reply to plain greetings or thank-you messages. Only reply to actual questions.">${esc(cfg.activation_rules)}</textarea></div>
-        <div class="form-group"><label>Response delay (seconds, lets humans answer first)</label>
-          <input type="number" id="cfg-delay" min="0" max="6000" value="${cfg.response_delay_seconds}"></div>
-        <div class="form-group"><label>Snooze after human reply (seconds)</label>
-          <input type="number" id="cfg-snooze" min="0" max="6000" value="${cfg.snooze_after_human_seconds}"></div>
-        <div class="form-group"><label>Operating hours start (HH:MM, empty = always)</label>
-          <input type="text" id="cfg-hstart" value="${esc(cfg.hours_start)}" placeholder="09:00"></div>
-        <div class="form-group"><label>Operating hours end</label>
-          <input type="text" id="cfg-hend" value="${esc(cfg.hours_end)}" placeholder="18:00"></div>
-        <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
-          <input type="checkbox" id="cfg-flag" ${cfg.flag_enabled ? 'checked' : ''} style="width:15px;height:15px">
-          AI auto-flag important messages</label></div>
-        <div class="form-group"><label>Flag criteria</label>
-          <input type="text" id="cfg-flagcrit" value="${esc(cfg.flag_criteria)}" placeholder="urgent requests, complaints, refunds..."></div>
-      </div>`;
-    document.getElementById('ai-cfg-save').addEventListener('click', async () => {
-      try {
-        await Api.ai.saveSettings({
-          enabled: document.getElementById('cfg-enabled').checked,
-          auto_activate_new_chats: document.getElementById('cfg-autoact').checked,
-          agent_name: document.getElementById('cfg-name').value.trim() || 'AI Assistant',
-          personality: document.getElementById('cfg-personality').value,
-          role_description: document.getElementById('cfg-role').value.trim(),
-          custom_instructions: document.getElementById('cfg-instructions').value.trim(),
-          restrictions: document.getElementById('cfg-restrictions').value.trim(),
-          activation_rules: document.getElementById('cfg-rules').value.trim(),
-          response_delay_seconds: parseInt(document.getElementById('cfg-delay').value) || 0,
-          snooze_after_human_seconds: parseInt(document.getElementById('cfg-snooze').value) || 0,
-          hours_start: document.getElementById('cfg-hstart').value.trim(),
-          hours_end: document.getElementById('cfg-hend').value.trim(),
-          flag_enabled: document.getElementById('cfg-flag').checked,
-          flag_criteria: document.getElementById('cfg-flagcrit').value.trim(),
-        });
-        toast('AI agent settings saved', 'success');
-      } catch(e) { toast(e.message, 'error'); }
-    });
-  } catch(e) {
-    const el = document.getElementById('ai-cfg-body');
-    if (el) el.innerHTML = `<p class="text-muted" style="font-size:12.5px">${esc(e.message)}</p>`;
+function _aiaSyncRoute(sub) {
+  const route = 'ai-agent/' + sub;
+  State.currentRoute = route;
+  if (location.hash !== '#' + route) history.replaceState(null, '', '#' + route);
+  const bc = document.getElementById('app-breadcrumb');
+  if (bc) bc.innerHTML = `<strong>AI Agent</strong><span class="bc-sep" aria-hidden="true">&gt;</span><strong>${esc(AIA_PAGES[sub].nav)}</strong>`;
+}
+
+async function renderAIAgent(sub) {
+  sub = AIA_PAGES[sub] ? sub : 'overview';
+  AIA.sub = sub;
+  _aiaSyncRoute(sub);
+  cxClosePop();
+  const main = document.getElementById('main-content');
+  if (!document.getElementById('aia-shell')) {
+    main.innerHTML = _aiaShellHTML();
+    main.querySelectorAll('.aia-shell .an-nav-item').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      navigateTo('ai-agent/' + a.dataset.aia);
+    }));
+    document.getElementById('aia-pg-tab').addEventListener('click', () => _aiaTogglePlayground(true));
+    if (AIA.pg.open) _aiaTogglePlayground(true);
   }
+  main.querySelectorAll('.aia-shell .an-nav-item').forEach(a => {
+    const on = a.dataset.aia === sub;
+    a.classList.toggle('active', on);
+    on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current');
+  });
+  _aiaDestroyCharts();
+  const p = AIA_PAGES[sub];
+  const host = document.getElementById('aia-main');
+  host.scrollTop = 0;
+  host.innerHTML = `<div class="aia-page${p.wide ? ' aia-page-wide' : ''}" data-page="${sub}">${stLoading()}</div>`;
+  const page = host.firstElementChild;
+  const seq = ++AIA.seq;
+  const stale = () => seq !== AIA.seq || !page.isConnected;
+  try {
+    await _aiaLoadSettings();
+    if (stale()) return;
+    await AIA_RENDER[sub](page, stale);
+  } catch (e) {
+    if (!stale()) page.innerHTML = stHead(p.title) + stEmpty(`Could not load this page: ${e.message || e}`);
+  }
+}
+function _aiaRerender() { if (State.currentView === 'ai-agent') AIA_RENDER[AIA.sub](document.querySelector('.aia-page'), () => false); }
 
-  document.getElementById('tl-btn').addEventListener('click', async () => {
-    const text = document.getElementById('tl-text').value.trim();
-    if (!text) return;
-    try {
-      const res = await Api.ai.translate(text, document.getElementById('tl-lang').value);
-      const div = document.getElementById('tl-result');
-      div.textContent = res.translated || res.translation || JSON.stringify(res);
-      div.style.display = 'block';
-    } catch(e) { toast(e.message, 'error'); }
+// ── Shared widgets ── //
+function _aiaHead(sub, actions = '') {
+  const p = AIA_PAGES[sub];
+  return stHead(p.title, p.sub, actions);
+}
+function _aiaCard(title, body, opts = {}) {
+  return `<section class="aia-card${opts.cls ? ' ' + opts.cls : ''}"${opts.id ? ` id="${opts.id}"` : ''}>
+    ${title ? `<div class="aia-card-head"><div class="aia-card-title">${title}</div>${opts.actions || ''}</div>` : ''}
+    <div class="aia-card-body">${body}</div></section>`;
+}
+function _aiaTip(text) {
+  return `<span class="aia-tip" tabindex="0" role="img" aria-label="${esc(text)}" data-tip="${esc(text)}">${aiIcon('info')}</span>`;
+}
+function _aiaPill(text, kind = '') { return `<span class="aia-pill ${kind}">${esc(text)}</span>`; }
+function _aiaReadonly() { return !isAdmin(); }
+function _aiaTextarea(id, value, opts = {}) {
+  return `<div class="aia-ta-wrap">
+      <textarea class="aia-ta" id="${id}" rows="${opts.rows || 8}" placeholder="${esc(opts.placeholder || '')}"
+        ${_aiaReadonly() ? 'readonly' : ''} aria-label="${esc(opts.label || '')}">${esc(value || '')}</textarea>
+      <div class="aia-ta-foot"><span class="aia-count" data-count-for="${id}">${_aiaCount(value)}</span>
+        <button type="button" class="aia-link aia-fullbtn" data-full-for="${id}">${aiIcon('expand')}Open full editor</button></div>
+    </div>`;
+}
+// Two-way bind a textarea to draft[field] (+ word count + full editor)
+function _aiaBindTextarea(page, id, field, title) {
+  const ta = page.querySelector('#' + id);
+  if (!ta) return;
+  const counter = page.querySelector(`[data-count-for="${id}"]`);
+  const sync = () => { AIA.draft[field] = ta.value; counter.textContent = _aiaCount(ta.value); _aiaUpdateBar(); };
+  ta.addEventListener('input', sync);
+  page.querySelector(`[data-full-for="${id}"]`).addEventListener('click', () =>
+    _aiaFullEditor(title, ta.value, v => { ta.value = v; sync(); }));
+}
+function _aiaToggle(id, on, label, disabled = false) {
+  return `<label class="st-switch${disabled ? ' aia-switch-disabled' : ''}"><input type="checkbox" role="switch" id="${id}" ${on ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="${esc(label)}"><span class="st-track" aria-hidden="true"></span></label>`;
+}
+
+function _aiaModal(title, bodyHTML, opts = {}) {
+  const ov = document.createElement('div');
+  ov.className = 'aia-modal-ov';
+  ov.innerHTML = `<div class="aia-modal${opts.wide ? ' aia-modal-wide' : ''}${opts.full ? ' aia-modal-full' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <div class="aia-modal-head"><h2>${esc(title)}</h2>${opts.headExtra || ''}<button class="aia-icon-btn" data-close aria-label="Close">${aiIcon('xmark')}</button></div>
+      <div class="aia-modal-body">${bodyHTML}</div>
+      ${opts.footer ? `<div class="aia-modal-foot">${opts.footer}</div>` : ''}
+    </div>`;
+  document.body.appendChild(ov);
+  const prevFocus = document.activeElement;
+  const close = () => { ov.remove(); document.removeEventListener('keydown', onKey, true); opts.onClose?.(); prevFocus?.focus?.(); };
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  document.addEventListener('keydown', onKey, true);
+  ov.addEventListener('mousedown', e => { if (e.target === ov) close(); });
+  ov.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
+  setTimeout(() => (ov.querySelector('[autofocus]') || ov.querySelector('input, textarea, select, button:not([data-close])'))?.focus(), 30);
+  return { el: ov, close };
+}
+
+function _aiaFullEditor(title, value, onChange) {
+  const ro = _aiaReadonly();
+  const m = _aiaModal(title, `<textarea class="aia-ta aia-ta-full" id="aia-full-ta" ${ro ? 'readonly' : ''} aria-label="${esc(title)}">${esc(value || '')}</textarea>`, {
+    full: true,
+    headExtra: `<span class="aia-count" id="aia-full-count">${_aiaCount(value)}</span>`,
+    footer: `<button class="btn btn-primary btn-sm" data-close>Done</button>`,
+  });
+  const ta = m.el.querySelector('#aia-full-ta');
+  ta.addEventListener('input', () => { m.el.querySelector('#aia-full-count').textContent = _aiaCount(ta.value); onChange(ta.value); });
+  setTimeout(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }, 40);
+}
+
+function _aiaConfirm(title, text, okLabel = 'Delete', danger = true) {
+  return new Promise(resolve => {
+    let done = false;
+    const m = _aiaModal(title, `<p class="aia-confirm-text">${esc(text)}</p>`, {
+      footer: `<button class="btn btn-secondary btn-sm" data-close>Cancel</button><button class="btn ${danger ? 'btn-danger' : 'btn-primary'} btn-sm" id="aia-confirm-ok">${esc(okLabel)}</button>`,
+      onClose: () => { if (!done) resolve(false); },
+    });
+    m.el.querySelector('#aia-confirm-ok').addEventListener('click', () => { done = true; m.close(); resolve(true); });
   });
 }
+
+// ── Save bar (editable pages) ── //
+function _aiaSaveBar() {
+  if (_aiaReadonly()) return `<div class="aia-savebar aia-savebar-ro">${aiIcon('info')}<span>Only admins can change these settings.</span></div>`;
+  return `<div class="aia-savebar" id="aia-savebar" role="region" aria-label="Save changes">
+      <span class="aia-save-state" id="aia-save-state" aria-live="polite"></span>
+      <div class="aia-save-actions">
+        <button class="btn btn-secondary btn-sm" id="aia-discard">Discard</button>
+        <button class="btn btn-primary btn-sm" id="aia-save">Save changes</button>
+      </div>
+    </div>`;
+}
+function _aiaUpdateBar() {
+  const state = document.getElementById('aia-save-state');
+  if (!state) return;
+  const dirty = _aiaDirty();
+  state.className = 'aia-save-state' + (dirty ? ' dirty' : '');
+  state.innerHTML = dirty ? '<i class="aia-dot"></i>Unsaved changes' : `${aiIcon('circleCheck')}All changes saved`;
+  document.getElementById('aia-discard').disabled = !dirty;
+  document.getElementById('aia-save').disabled = !dirty;
+}
+function _aiaBindBar(page, rerender) {
+  if (!page.querySelector('#aia-savebar')) return;
+  _aiaUpdateBar();
+  page.querySelector('#aia-discard').addEventListener('click', () => {
+    AIA.draft = _aiaClone(AIA.saved);
+    rerender();
+  });
+  page.querySelector('#aia-save').addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    const body = {};
+    (AIA_FIELDS[AIA.sub] || []).forEach(k => {
+      if (JSON.stringify(AIA.draft[k]) !== JSON.stringify(AIA.saved[k])) body[k] = AIA.draft[k];
+    });
+    btn.disabled = true;
+    try {
+      const res = await Api.ai.saveSettings(body);
+      AIA.saved = res;
+      AIA.draft = _aiaClone(res);
+      toast('Changes saved', 'success');
+      rerender();
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false;
+    }
+  });
+}
+
+// ── Overview ── //
+function _aiaSteps(s) {
+  const st = s.setup || {};
+  return [
+    { key: 'role', label: 'Set the agent’s role and instructions', req: true, done: !!st.role, go: 'personalization', focus: 'aia-role' },
+    { key: 'identity', label: 'Set its identity and personality', req: true, done: !!st.identity, go: 'personalization', focus: 'aia-name' },
+    { key: 'knowledge', label: 'Add answers it can use', req: false, done: !!st.knowledge, go: 'knowledge' },
+  ];
+}
+function _aiaGo(sub, focusId) {
+  navigateTo('ai-agent/' + sub);
+  if (!focusId) return;
+  const started = Date.now();
+  (function wait() {
+    const el = document.getElementById(focusId);
+    if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); return; }
+    if (Date.now() - started < 4000) setTimeout(wait, 80);
+  })();
+}
+
+async function _aiaRenderOverview(page) {
+  const s = AIA.saved;
+  const steps = _aiaSteps(s);
+  const doneN = steps.filter(x => x.done).length;
+  const reqDone = steps.filter(x => x.req).every(x => x.done);
+  const firstOpen = steps.findIndex(x => !x.done);
+  const ro = _aiaReadonly();
+  const status = !reqDone ? 'Finish the required steps to turn it on.'
+    : s.enabled ? 'On — replying to customers based on your settings.' : 'Off — turn it on to start replying to customers.';
+  const needs = { personalization: !(s.setup.role && s.setup.identity), knowledge: !s.setup.knowledge };
+  const cfgCards = [
+    ['activation', 'toggle', 'Activation', 'Choose which messages it answers, on which numbers, its hours and response delay.'],
+    ['personalization', 'idBadge', 'Personalization', 'Name, personality, role, instructions and restrictions.'],
+    ['knowledge', 'book', 'Knowledge Base', 'FAQs, documents and web pages the agent answers from.'],
+    ['tools', 'wrench', 'Tools', 'Let it send messages, create tickets and private notes, or call your APIs.'],
+    ['flagging', 'flag', 'Flagging', 'Automatically flag important incoming messages for your team.', true],
+  ];
+  page.innerHTML = `
+    ${_aiaHead('overview')}
+    <section class="aia-card aia-master">
+      <div class="aia-icbox aia-icbox-lg">${aiIcon('robot')}</div>
+      <div class="aia-master-text">
+        <div class="aia-master-title">AI Agent ${s.effective_enabled ? _aiaPill('On', 'ok') : _aiaPill('Off')}</div>
+        <div class="aia-muted">${esc(status)}</div>
+      </div>
+      <span ${!reqDone ? 'title="Finish the required setup steps first"' : ''}>${_aiaToggle('aia-master', s.enabled && reqDone, 'AI Agent', !reqDone || ro)}</span>
+    </section>
+    <section class="aia-card">
+      <div class="aia-card-head"><div class="aia-card-title">Setup <span class="aia-muted aia-setup-n">${doneN} of 3 done</span></div></div>
+      <div class="aia-seg" aria-hidden="true">${steps.map(x => `<i class="${x.done ? 'on' : ''}"></i>`).join('')}</div>
+      <div class="aia-steps">
+        ${steps.map((x, i) => `
+          <div class="aia-step${x.done ? ' done' : ''}${i === firstOpen ? ' next' : ''}">
+            <span class="aia-step-radio" aria-hidden="true">${x.done ? aiIcon('circleCheck') : aiIcon('circleO')}</span>
+            <span class="aia-step-label">${esc(x.label)}</span>
+            ${x.req ? '<span class="aia-step-req">Required</span>' : ''}
+            ${x.done ? '<span class="aia-step-done">Done</span>'
+              : `<button class="btn btn-sm ${i === firstOpen ? 'aia-btn-amber' : 'btn-secondary'}" data-step="${i}">Set up</button>`}
+          </div>`).join('')}
+      </div>
+    </section>
+    <div class="aia-section-head"><h2>Configuration</h2><p>Fine-tune how the agent behaves.</p></div>
+    <div class="aia-grid">
+      ${cfgCards.map(([k, ic, t, d, full]) => `
+        <a href="#ai-agent/${k}" class="aia-cfg${full ? ' full' : ''}${needs[k] ? ' needs' : ''}" data-go="${k}">
+          <div class="aia-cfg-top"><span class="aia-icbox">${aiIcon(ic)}</span><span class="aia-cfg-title">${esc(t)}</span>${aiIcon('chevronRight', 'aia-cfg-chev')}</div>
+          <p class="aia-cfg-desc">${esc(d)}</p>
+          ${needs[k] ? `<span class="btn btn-sm aia-btn-amber aia-cfg-finish">Finish setup</span>` : ''}
+        </a>`).join('')}
+    </div>`;
+  page.querySelectorAll('[data-step]').forEach(b => b.addEventListener('click', () => {
+    const x = steps[+b.dataset.step];
+    _aiaGo(x.go, x.focus);
+  }));
+  page.querySelectorAll('[data-go]').forEach(a => a.addEventListener('click', e => { e.preventDefault(); navigateTo('ai-agent/' + a.dataset.go); }));
+  page.querySelector('#aia-master').addEventListener('change', async e => {
+    const on = e.target.checked;
+    e.target.disabled = true;
+    try {
+      AIA.saved = await Api.ai.saveSettings({ enabled: on });
+      AIA.draft = _aiaClone(AIA.saved);
+      toast(on ? 'AI agent turned on' : 'AI agent turned off', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+    _aiaRenderOverview(page);
+  });
+}
+
+// ── Activation ── //
+function _aiaRenderActivation(page) {
+  const d = AIA.draft, ro = _aiaReadonly();
+  const phones = AIA.phones;
+  const allowed = new Set(d.allowed_phone_ids || []);
+  const sched = d.hours_schedule || {};
+  page.innerHTML = `
+    ${_aiaHead('activation')}
+    ${_aiaCard('Customize Activation Rules', `
+      <p class="aia-help">Before replying, the agent checks each new message against these rules and stays silent when they say it shouldn’t answer.</p>
+      ${_aiaTextarea('aia-rules', d.activation_rules, { rows: 10, label: 'Activation rules' })}
+      <div class="aia-field-label">Chat Activation Mode ${_aiaTip('Auto: the agent works in every chat unless someone turns it off for that chat. Manual: it only works in chats where a teammate turned it on (chat → AI tab).')}</div>
+      <div class="aia-radios" role="radiogroup" aria-label="Chat activation mode">
+        ${[[true, 'Auto-activate for all chats', 'The agent handles every 1:1 chat. Turn it off per chat when needed.'],
+           [false, 'Manual activation per chat', 'The agent only works in chats where it has been turned on.']].map(([v, t, s]) => `
+          <label class="aia-radio${!!d.auto_activate_new_chats === v ? ' on' : ''}">
+            <input type="radio" name="aia-mode" value="${v}" ${!!d.auto_activate_new_chats === v ? 'checked' : ''} ${ro ? 'disabled' : ''}>
+            <span class="aia-radio-dot" aria-hidden="true"></span>
+            <span><span class="aia-radio-title">${t}</span><span class="aia-radio-sub">${s}</span></span>
+          </label>`).join('')}
+      </div>`)}
+    ${_aiaCard('Operational Settings', `
+      <div class="aia-field">
+        <div class="aia-field-label">Allowed Phone Numbers ${_aiaTip('The agent only replies on the numbers selected here. Select none to allow all numbers.')}</div>
+        <div class="aia-chips" id="aia-phones">
+          ${phones.length ? phones.map(p => `
+            <button type="button" class="aia-chip${allowed.has(p.id) ? ' on' : ''}" data-phone="${p.id}" aria-pressed="${allowed.has(p.id)}" ${ro ? 'disabled' : ''}>
+              ${allowed.has(p.id) ? aiIcon('check') : aiIcon('phone')}<span>${esc(p.name || 'Phone')}</span><small>${esc(/^\+?\d/.test(p.phone_number || '') ? p.phone_number : 'not linked')}</small>
+            </button>`).join('') : '<span class="aia-muted">No WhatsApp numbers connected yet.</span>'}
+        </div>
+        <div class="aia-hint">${allowed.size ? `Replies only on ${allowed.size} selected number${allowed.size > 1 ? 's' : ''}.` : 'All numbers — select numbers to limit where the agent replies.'}</div>
+      </div>
+      <div class="aia-two">
+        <div class="aia-field">
+          <label class="aia-field-label" for="aia-delay">Response Delay</label>
+          <div class="aia-num"><input type="number" id="aia-delay" min="3" max="6000" value="${d.response_delay_seconds}" ${ro ? 'readonly' : ''}><span>seconds</span></div>
+          <div class="aia-hint">Wait this long before answering (3–6000 s) so the customer can finish typing and a teammate can answer first.</div>
+        </div>
+        <div class="aia-field">
+          <label class="aia-field-label" for="aia-snooze">Snooze Duration</label>
+          <div class="aia-num"><input type="number" id="aia-snooze" min="0" max="6000" value="${d.snooze_after_human_seconds}" ${ro ? 'readonly' : ''}><span>seconds</span></div>
+          <div class="aia-hint">After a teammate replies in a chat, the agent pauses there for this long (0–6000 s, 0 = never pause).</div>
+        </div>
+      </div>
+      <div class="aia-row aia-row-top">
+        <div><div class="aia-field-label">Operating Hours</div>
+          <div class="aia-hint">Only reply during these hours (${esc(d.timezone || AIA.saved.timezone || 'business timezone')}). Off = any time.</div></div>
+        ${_aiaToggle('aia-hours', d.hours_enabled, 'Operating hours', ro)}
+      </div>
+      <div class="aia-hours" id="aia-hours-list" ${d.hours_enabled ? '' : 'hidden'}>
+        ${AIA_DAYS.map(([k, label]) => {
+          const day = sched[k] || { on: false, start: '09:00', end: '18:00' };
+          return `<div class="aia-day${day.on ? '' : ' off'}" data-day="${k}">
+            ${_aiaToggle('aia-day-' + k, day.on, label, ro)}
+            <span class="aia-day-name">${label}</span>
+            <input type="time" class="aia-time" data-part="start" value="${esc(day.start)}" aria-label="${label} start" ${ro || !day.on ? 'disabled' : ''}>
+            <span class="aia-muted">to</span>
+            <input type="time" class="aia-time" data-part="end" value="${esc(day.end)}" aria-label="${label} end" ${ro || !day.on ? 'disabled' : ''}>
+            ${day.on ? '' : '<span class="aia-muted aia-closed">Closed</span>'}
+          </div>`;
+        }).join('')}
+      </div>`)}
+    ${_aiaSaveBar()}`;
+  const rerender = () => _aiaRenderActivation(page);
+  _aiaBindTextarea(page, 'aia-rules', 'activation_rules', 'Activation Rules');
+  page.querySelectorAll('input[name="aia-mode"]').forEach(r => r.addEventListener('change', () => {
+    d.auto_activate_new_chats = r.value === 'true';
+    page.querySelectorAll('.aia-radio').forEach(l => l.classList.toggle('on', l.querySelector('input').checked));
+    _aiaUpdateBar();
+  }));
+  page.querySelectorAll('[data-phone]').forEach(b => b.addEventListener('click', () => {
+    const id = +b.dataset.phone;
+    const set = new Set(d.allowed_phone_ids || []);
+    set.has(id) ? set.delete(id) : set.add(id);
+    d.allowed_phone_ids = [...set].sort((a, b2) => a - b2);
+    rerender();
+  }));
+  const num = (id, field, min, max) => page.querySelector('#' + id).addEventListener('input', e => {
+    const v = parseInt(e.target.value, 10);
+    d[field] = Number.isFinite(v) ? Math.max(min, Math.min(max, v)) : min;
+    _aiaUpdateBar();
+  });
+  num('aia-delay', 'response_delay_seconds', 3, 6000);
+  num('aia-snooze', 'snooze_after_human_seconds', 0, 6000);
+  page.querySelectorAll('#aia-delay, #aia-snooze').forEach(i => i.addEventListener('blur', () => {
+    i.value = d[i.id === 'aia-delay' ? 'response_delay_seconds' : 'snooze_after_human_seconds'];
+  }));
+  page.querySelector('#aia-hours').addEventListener('change', e => { d.hours_enabled = e.target.checked; rerender(); });
+  page.querySelectorAll('.aia-day').forEach(row => {
+    const k = row.dataset.day;
+    const cur = () => (d.hours_schedule = d.hours_schedule || {}, d.hours_schedule[k] = d.hours_schedule[k] || { on: false, start: '09:00', end: '18:00' });
+    row.querySelector('input[type="checkbox"]').addEventListener('change', e => { cur().on = e.target.checked; rerender(); });
+    row.querySelectorAll('.aia-time').forEach(t => t.addEventListener('change', () => { if (t.value) { cur()[t.dataset.part] = t.value; _aiaUpdateBar(); } }));
+  });
+  _aiaBindBar(page, rerender);
+}
+
+// ── Personalization ── //
+function _aiaTemplateMenu(anchor, templates, apply) {
+  const pop = cxPopover(anchor, `<div class="aia-menu-head">Templates</div>` + templates.map((t, i) =>
+    `<button class="cx-pop-item aia-menu-item" data-i="${i}"><span>${esc(t.name)}</span></button>`).join(''), { cls: 'aia-pop' });
+  pop.querySelectorAll('[data-i]').forEach(b => b.addEventListener('click', async e => {
+    e.stopPropagation();
+    cxClosePop();
+    apply(templates[+b.dataset.i]);
+  }));
+}
+function _aiaRenderPersonalization(page) {
+  const d = AIA.draft, ro = _aiaReadonly();
+  const pers = AIA_PERSONALITIES[d.personality] || AIA_PERSONALITIES.friendly;
+  page.innerHTML = `
+    ${_aiaHead('personalization')}
+    ${_aiaCard('Identity', `
+      <div class="aia-two">
+        <div class="aia-field">
+          <label class="aia-field-label" for="aia-name">AI Nickname</label>
+          <input type="text" class="aia-input" id="aia-name" maxlength="100" placeholder="e.g. Hyperscope AI" value="${esc(d.agent_name === 'AI Assistant' && !AIA.saved.setup?.identity ? '' : d.agent_name)}" ${ro ? 'readonly' : ''}>
+          <div class="aia-hint">How the agent introduces itself to customers.</div>
+        </div>
+        <div class="aia-field">
+          <span class="aia-field-label" id="aia-pers-label">Personality Type</span>
+          <button type="button" class="aia-select" id="aia-pers" aria-haspopup="listbox" aria-labelledby="aia-pers-label" ${ro ? 'disabled' : ''}>
+            <span><span class="aia-select-title">${esc(pers[0])}</span><span class="aia-select-sub">${esc(pers[1])}</span></span>${aiIcon('down', 'aia-caret')}
+          </button>
+        </div>
+      </div>`)}
+    ${_aiaCard(`Agent Role and Instructions ${_aiaPill('Required', 'req')}`, `
+      <p class="aia-help">Describe the business, what the agent should help with and how to handle common situations.</p>
+      ${_aiaTextarea('aia-role', d.role_description, { rows: 10, label: 'Agent role and instructions', placeholder: 'e.g. You are the support assistant for Acme Electronics, a gadget store in Ahmedabad. Help customers with product questions, orders and returns…' })}`,
+      { actions: ro ? '' : `<button type="button" class="aia-link" id="aia-role-tpl">${aiIcon('wand')}Use template</button>` })}
+    ${_aiaCard(`Restrictions ${_aiaPill('Optional')}`, `
+      <p class="aia-help">Things the agent must never do or say, even if a customer asks.</p>
+      ${_aiaTextarea('aia-restr', d.restrictions, { rows: 6, label: 'Restrictions', placeholder: 'e.g. Never promise refunds or discounts. Never share staff phone numbers.' })}`,
+      { actions: ro ? '' : `<button type="button" class="aia-link" id="aia-restr-tpl">${aiIcon('wand')}Use template</button>` })}
+    ${_aiaSaveBar()}`;
+  const rerender = () => _aiaRenderPersonalization(page);
+  page.querySelector('#aia-name').addEventListener('input', e => { d.agent_name = e.target.value; _aiaUpdateBar(); });
+  _aiaBindTextarea(page, 'aia-role', 'role_description', 'Agent Role and Instructions');
+  _aiaBindTextarea(page, 'aia-restr', 'restrictions', 'Restrictions');
+  page.querySelector('#aia-pers').addEventListener('click', e => {
+    e.stopPropagation();
+    const pop = cxPopover(e.currentTarget, `<div role="listbox" aria-label="Personality">` + Object.entries(AIA_PERSONALITIES).map(([k, [t, s]]) =>
+      `<button class="cx-pop-item aia-menu-item aia-menu-2${k === d.personality ? ' active' : ''}" role="option" aria-selected="${k === d.personality}" data-k="${k}">
+        <span class="aia-menu-title">${esc(t)}${k === d.personality ? aiIcon('check') : ''}</span><span class="aia-menu-sub">${esc(s)}</span></button>`).join('') + '</div>',
+      { cls: 'aia-pop aia-pop-wide' });
+    pop.style.minWidth = e.currentTarget.offsetWidth + 'px';
+    pop.querySelectorAll('[data-k]').forEach(b => b.addEventListener('click', ev => {
+      ev.stopPropagation(); cxClosePop();
+      d.personality = b.dataset.k;
+      rerender();
+    }));
+    pop.querySelector('.active, button')?.focus();
+  });
+  const tpl = (btnId, list, taId, field) => page.querySelector('#' + btnId)?.addEventListener('click', e => {
+    e.stopPropagation();
+    _aiaTemplateMenu(e.currentTarget, list, async t => {
+      const cur = (d[field] || '').trim();
+      if (cur && cur !== t.text && !(await _aiaConfirm('Replace text?', `Replace the current text with the “${t.name}” template?`, 'Replace', false))) return;
+      d[field] = t.text;
+      rerender();
+      page.querySelector('#' + taId)?.focus();
+    });
+  });
+  tpl('aia-role-tpl', AIA_ROLE_TEMPLATES, 'aia-role', 'role_description');
+  tpl('aia-restr-tpl', AIA_RESTRICTION_TEMPLATES, 'aia-restr', 'restrictions');
+  _aiaBindBar(page, rerender);
+}
+
+// ── Knowledge base ── //
+function _aiaKbBadge(t) { return `<span class="aia-badge t-${esc(t)}">${esc(AIA_KB_TYPES[t] || t)}</span>`; }
+async function _aiaRenderKnowledge(page, stale) {
+  const f = AIA.kb, ro = _aiaReadonly();
+  page.innerHTML = `
+    ${_aiaHead('knowledge', ro ? '' : `
+      <button class="btn btn-secondary btn-sm" id="aia-kb-train">${aiIcon('grad')}AI Training${aiIcon('down', 'aia-caret')}</button>
+      <button class="btn btn-primary btn-sm" id="aia-kb-add">${aiIcon('plus')}Add New${aiIcon('down', 'aia-caret')}</button>`)}
+    <div class="aia-toolbar">
+      <label class="st-search aia-search">${aiIcon('search')}<input type="search" id="aia-kb-q" placeholder="Search knowledge" value="${esc(f.q)}" aria-label="Search knowledge"></label>
+      <div class="aia-segctl" id="aia-kb-status" role="tablist" aria-label="Status"></div>
+    </div>
+    <div class="aia-typepills" id="aia-kb-types" role="tablist" aria-label="Type">
+      ${[['all', 'All'], ['faq', 'FAQ'], ['self_learned', 'Self-Learned'], ['document', 'Documents'], ['external', 'External Sources']].map(([k, l]) =>
+        `<button class="aia-typepill${f.type === k ? ' on' : ''}" data-type="${k}" role="tab" aria-selected="${f.type === k}">${l}</button>`).join('')}
+    </div>
+    <div class="aia-card aia-list" id="aia-kb-list">${stLoading()}</div>`;
+  const load = async () => {
+    const q = { summary: true };
+    if (f.status !== 'all') q.status = f.status;
+    if (f.type !== 'all') q.item_type = f.type;
+    if (f.q.trim()) q.q = f.q.trim();
+    let data;
+    try { data = await Api.kb.list(q); } catch (e) { page.querySelector('#aia-kb-list').innerHTML = stEmpty(e.message); return; }
+    if (stale()) return;
+    const c = data.counts;
+    page.querySelector('#aia-kb-status').innerHTML = [['all', 'All', c.all], ['active', 'Active', c.active], ['inactive', 'Inactive', c.inactive], ['review', 'Needs Review', c.review]]
+      .map(([k, l, n]) => `<button class="aia-seg-btn${f.status === k ? ' on' : ''}" data-status="${k}" role="tab" aria-selected="${f.status === k}">${l}${k === 'all' ? '' : ` <span class="aia-seg-n">${n}</span>`}</button>`).join('');
+    page.querySelectorAll('[data-status]').forEach(b => b.addEventListener('click', () => { f.status = b.dataset.status; load(); }));
+    const list = page.querySelector('#aia-kb-list');
+    if (!data.items.length) {
+      list.innerHTML = `<div class="aia-empty">${aiIcon('book')}<div class="aia-empty-title">${c.all || f.q ? 'Nothing matches these filters' : 'No knowledge yet'}</div>
+        <div class="aia-muted">${c.all || f.q ? 'Try another filter or search.' : 'Add FAQs, documents or web pages. The agent answers only from what is here.'}</div></div>`;
+      return;
+    }
+    list.innerHTML = data.items.map(i => `
+      <div class="aia-kb-row" data-id="${i.id}">
+        ${_aiaKbBadge(i.item_type)}
+        <button class="aia-kb-main" data-edit="${i.id}" ${ro ? 'disabled' : ''}>
+          <span class="aia-kb-title">${esc(i.title)}</span>
+          <span class="aia-kb-sub">${i.item_type === 'external' || i.item_type === 'document'
+            ? `${esc(i.source || '')} · ${_aiaFmtNum(i.chars)} chars` : esc((i.content || '').replace(/\s+/g, ' ').slice(0, 140))}</span>
+        </button>
+        <div class="aia-kb-ctl">
+          ${i.status === 'review'
+            ? (ro ? _aiaPill('Needs review', 'warn') : `<button class="btn btn-sm aia-btn-amber" data-approve="${i.id}">Approve</button>`)
+            : _aiaToggle('aia-kb-t-' + i.id, i.status === 'active', 'Active', ro)}
+          ${ro ? '' : `<button class="aia-icon-btn" data-edit="${i.id}" title="Edit" aria-label="Edit ${esc(i.title)}">${aiIcon('pen')}</button>
+          <button class="aia-icon-btn danger" data-del="${i.id}" title="Delete" aria-label="Delete ${esc(i.title)}">${aiIcon('trash')}</button>`}
+        </div>
+      </div>`).join('');
+    const byId = Object.fromEntries(data.items.map(i => [i.id, i]));
+    list.querySelectorAll('input[id^="aia-kb-t-"]').forEach(t => t.addEventListener('change', async () => {
+      const id = +t.id.replace('aia-kb-t-', '');
+      try { await Api.kb.update(id, { status: t.checked ? 'active' : 'inactive' }); load(); }
+      catch (e) { toast(e.message, 'error'); t.checked = !t.checked; }
+    }));
+    list.querySelectorAll('[data-approve]').forEach(b => b.addEventListener('click', async () => {
+      try { await Api.kb.update(+b.dataset.approve, { status: 'active' }); toast('Approved — the agent can use it now', 'success'); load(); }
+      catch (e) { toast(e.message, 'error'); }
+    }));
+    list.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => _aiaKbEdit(byId[+b.dataset.edit].id, load)));
+    list.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+      const it = byId[+b.dataset.del];
+      if (!(await _aiaConfirm('Delete entry?', `“${it.title}” will be removed from the knowledge base.`))) return;
+      try { await Api.kb.remove(it.id); toast('Deleted', 'success'); load(); } catch (e) { toast(e.message, 'error'); }
+    }));
+  };
+  let tmr;
+  page.querySelector('#aia-kb-q').addEventListener('input', e => { clearTimeout(tmr); tmr = setTimeout(() => { f.q = e.target.value; load(); }, 250); });
+  page.querySelectorAll('[data-type]').forEach(b => b.addEventListener('click', () => {
+    f.type = b.dataset.type;
+    page.querySelectorAll('[data-type]').forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-selected', String(x === b)); });
+    load();
+  }));
+  page.querySelector('#aia-kb-add')?.addEventListener('click', e => {
+    e.stopPropagation();
+    const items = [['faq', 'question', 'FAQ Entry', 'A question and its answer'],
+                   ['document', 'fileLines', 'Document', 'Upload a .txt, .md or .docx file'],
+                   ['external', 'globe', 'External Source', 'Import a public web page']];
+    const pop = cxPopover(e.currentTarget, items.map(([k, ic, t, s]) =>
+      `<button class="cx-pop-item aia-menu-item aia-menu-2 aia-menu-ic" data-k="${k}">${aiIcon(ic)}<span><span class="aia-menu-title">${t}</span><span class="aia-menu-sub">${s}</span></span></button>`).join(''),
+      { alignRight: true, cls: 'aia-pop aia-pop-wide' });
+    pop.querySelectorAll('[data-k]').forEach(b => b.addEventListener('click', ev => {
+      ev.stopPropagation(); cxClosePop();
+      ({ faq: () => _aiaKbFaq(null, load), document: () => _aiaKbDoc(load), external: () => _aiaKbExternal(load) })[b.dataset.k]();
+    }));
+  });
+  page.querySelector('#aia-kb-train')?.addEventListener('click', e => {
+    e.stopPropagation();
+    const pop = cxPopover(e.currentTarget, `
+      <button class="cx-pop-item aia-menu-item aia-menu-2 aia-menu-ic" data-k="reindex">${aiIcon('rotate')}<span><span class="aia-menu-title">Re-index</span><span class="aia-menu-sub">Refresh web pages and rebuild the search index</span></span></button>
+      <button class="cx-pop-item aia-menu-item aia-menu-2 aia-menu-ic" data-k="review">${aiIcon('bulb')}<span><span class="aia-menu-title">Review suggestions</span><span class="aia-menu-sub">Answers learned from conversations</span></span></button>`,
+      { alignRight: true, cls: 'aia-pop aia-pop-wide' });
+    pop.querySelector('[data-k="reindex"]').addEventListener('click', async ev => {
+      ev.stopPropagation(); cxClosePop();
+      toast('Re-indexing…');
+      try {
+        const r = await Api.kb.reindex();
+        toast(`Index rebuilt: ${r.passages} passages${r.refreshed_sources ? `, ${r.refreshed_sources} page(s) refreshed` : ''}${r.failed_sources ? `, ${r.failed_sources} failed` : ''}`, 'success');
+        load();
+      } catch (err) { toast(err.message, 'error'); }
+    });
+    pop.querySelector('[data-k="review"]').addEventListener('click', ev => { ev.stopPropagation(); cxClosePop(); navigateTo('ai-agent/training'); });
+  });
+  await load();
+}
+async function _aiaKbEdit(id, reload) {
+  let it;
+  try { it = await Api.kb.get(id); } catch (e) { return toast(e.message, 'error'); }
+  if (it.item_type === 'faq' || it.item_type === 'self_learned') return _aiaKbFaq(it, reload);
+  const m = _aiaModal(`Edit ${AIA_KB_TYPES[it.item_type]}`, `
+    <div class="aia-field"><label class="aia-field-label" for="aia-kbe-title">Title</label><input class="aia-input" id="aia-kbe-title" maxlength="500" value="${esc(it.title)}"></div>
+    ${it.source ? `<div class="aia-hint aia-src">${aiIcon(it.item_type === 'external' ? 'link' : 'fileLines')}${esc(it.source)}</div>` : ''}
+    <div class="aia-field"><label class="aia-field-label" for="aia-kbe-content">Extracted text</label>
+      <textarea class="aia-ta" id="aia-kbe-content" rows="14">${esc(it.content)}</textarea>
+      <div class="aia-ta-foot"><span class="aia-count" id="aia-kbe-count">${_aiaCount(it.content)}</span></div></div>`, {
+    wide: true,
+    footer: `<button class="btn btn-secondary btn-sm" data-close>Cancel</button><button class="btn btn-primary btn-sm" id="aia-kbe-save">Save</button>`,
+  });
+  const ta = m.el.querySelector('#aia-kbe-content');
+  ta.addEventListener('input', () => { m.el.querySelector('#aia-kbe-count').textContent = _aiaCount(ta.value); });
+  m.el.querySelector('#aia-kbe-save').addEventListener('click', async () => {
+    try {
+      await Api.kb.update(it.id, { title: m.el.querySelector('#aia-kbe-title').value.trim(), content: ta.value.trim() });
+      m.close(); toast('Saved', 'success'); reload();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+function _aiaKbFaq(it, reload) {
+  const m = _aiaModal(it ? (it.item_type === 'self_learned' ? 'Edit learned answer' : 'Edit FAQ') : 'Add FAQ entry', `
+    <div class="aia-field"><label class="aia-field-label" for="aia-faq-q">Question</label>
+      <input class="aia-input" id="aia-faq-q" maxlength="500" placeholder="e.g. Do you deliver on Sundays?" value="${esc(it?.title || '')}" autofocus></div>
+    <div class="aia-field"><label class="aia-field-label" for="aia-faq-a">Answer</label>
+      <textarea class="aia-ta" id="aia-faq-a" rows="7" placeholder="e.g. Yes — Sunday deliveries run 10am to 4pm in the city.">${esc(it?.content || '')}</textarea></div>
+    ${it?.status === 'review' ? '<div class="aia-hint">Saving keeps it in Needs Review; approve it from the list to make it active.</div>' : ''}`, {
+    footer: `<button class="btn btn-secondary btn-sm" data-close>Cancel</button><button class="btn btn-primary btn-sm" id="aia-faq-save">${it ? 'Save' : 'Add entry'}</button>`,
+  });
+  m.el.querySelector('#aia-faq-save').addEventListener('click', async () => {
+    const title = m.el.querySelector('#aia-faq-q').value.trim(), content = m.el.querySelector('#aia-faq-a').value.trim();
+    if (!title || !content) return toast('Enter a question and an answer', 'error');
+    try {
+      it ? await Api.kb.update(it.id, { title, content }) : await Api.kb.create({ item_type: 'faq', title, content });
+      m.close(); toast(it ? 'Saved' : 'FAQ added', 'success'); reload();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+function _aiaKbDoc(reload) {
+  const m = _aiaModal('Upload document', `
+    <label class="aia-drop" for="aia-doc-file">${aiIcon('upload')}<span id="aia-doc-name">Choose a .txt, .md or .docx file (max 5 MB)</span>
+      <input type="file" id="aia-doc-file" accept=".txt,.md,.markdown,.docx"></label>
+    <div class="aia-field"><label class="aia-field-label" for="aia-doc-title">Title <span class="aia-muted">(optional)</span></label>
+      <input class="aia-input" id="aia-doc-title" maxlength="500" placeholder="Defaults to the file name"></div>
+    <div class="aia-hint">The text is extracted and split into passages the agent can search. PDF isn’t supported yet — save it as .docx or .txt first.</div>`, {
+    footer: `<button class="btn btn-secondary btn-sm" data-close>Cancel</button><button class="btn btn-primary btn-sm" id="aia-doc-save" disabled>Upload</button>`,
+  });
+  const file = m.el.querySelector('#aia-doc-file'), save = m.el.querySelector('#aia-doc-save');
+  file.addEventListener('change', () => { m.el.querySelector('#aia-doc-name').textContent = file.files[0]?.name || 'Choose a file'; save.disabled = !file.files[0]; });
+  save.addEventListener('click', async () => {
+    save.disabled = true;
+    try { await Api.kb.upload(file.files[0], m.el.querySelector('#aia-doc-title').value.trim()); m.close(); toast('Document added', 'success'); reload(); }
+    catch (e) { toast(e.message, 'error'); save.disabled = false; }
+  });
+}
+function _aiaKbExternal(reload) {
+  const m = _aiaModal('Add external source', `
+    <div class="aia-field"><label class="aia-field-label" for="aia-ext-url">Page URL</label>
+      <input class="aia-input" id="aia-ext-url" type="url" placeholder="https://example.com/faq" autofocus></div>
+    <div class="aia-field"><label class="aia-field-label" for="aia-ext-title">Title <span class="aia-muted">(optional)</span></label>
+      <input class="aia-input" id="aia-ext-title" maxlength="500" placeholder="Defaults to the page title"></div>
+    <div class="aia-hint">Public HTML or text pages only (up to 2 MB). Use AI Training → Re-index to refresh it later.</div>`, {
+    footer: `<button class="btn btn-secondary btn-sm" data-close>Cancel</button><button class="btn btn-primary btn-sm" id="aia-ext-save">Import</button>`,
+  });
+  const save = m.el.querySelector('#aia-ext-save');
+  save.addEventListener('click', async () => {
+    const url = m.el.querySelector('#aia-ext-url').value.trim();
+    if (!url) return toast('Enter a URL', 'error');
+    save.disabled = true; save.textContent = 'Importing…';
+    try { await Api.kb.external({ url, title: m.el.querySelector('#aia-ext-title').value.trim() || null }); m.close(); toast('Page imported', 'success'); reload(); }
+    catch (e) { toast(e.message, 'error'); save.disabled = false; save.textContent = 'Import'; }
+  });
+}
+
+// ── Tools ── //
+async function _aiaRenderTools(page, stale) {
+  const d = AIA.draft, ro = _aiaReadonly(), tab = AIA.toolsTab;
+  const tool = (id, icon, title, tip, desc, on, extra = '') => `
+    <section class="aia-card aia-tool${on ? ' on' : ''}">
+      <div class="aia-tool-head">
+        <span class="aia-icbox">${aiIcon(icon)}</span>
+        <div class="aia-tool-text"><div class="aia-tool-title">${esc(title)} ${_aiaTip(tip)}</div><div class="aia-muted">${esc(desc)}</div></div>
+        ${_aiaToggle(id, on, title, ro)}
+      </div>${extra}
+    </section>`;
+  page.innerHTML = `
+    ${_aiaHead('tools')}
+    <div class="aia-tabs" role="tablist">
+      <button class="aia-tab${tab === 'builtin' ? ' on' : ''}" data-tab="builtin" role="tab" aria-selected="${tab === 'builtin'}">Built-in Tools</button>
+      <button class="aia-tab${tab === 'custom' ? ' on' : ''}" data-tab="custom" role="tab" aria-selected="${tab === 'custom'}">Custom Tools</button>
+    </div>
+    <div id="aia-tools-body">${tab === 'builtin' ? `
+      ${tool('aia-t-send', 'paper', 'Allow AI to Send Messages', 'Off = passive assistant: the agent writes a suggested reply as a private note in the chat for a teammate to send.',
+        'Reply to customers directly on WhatsApp.', d.allow_send_messages,
+        d.allow_send_messages ? '' : `<div class="aia-tool-note">${aiIcon('sticky')}Passive mode — replies are saved as private-note drafts and never sent.</div>`)}
+      ${tool('aia-t-ticket', 'ticket', 'Allow AI To Create Tickets', 'The agent can open a ticket linked to the chat, with a title and priority, when a customer needs follow-up.',
+        'Open tickets for problems a human must handle.', d.allow_create_tickets,
+        d.allow_create_tickets ? `<div class="aia-tool-extra"><label class="aia-field-label" for="aia-t-ticket-i">When should it create a ticket?</label>
+          ${_aiaTextarea('aia-t-ticket-i', d.ticket_instructions, { rows: 4, label: 'Ticket instructions', placeholder: 'e.g. Create a ticket for damaged items, refund requests and anything that needs a callback. Use high priority for angry customers.' })}</div>` : '')}
+      ${tool('aia-t-note', 'sticky', 'Allow AI To Create Private Notes', 'Private notes are visible to your team only, inside the chat. Never sent to the customer.',
+        'Leave internal notes for the team in the chat.', d.allow_private_notes,
+        d.allow_private_notes ? `<div class="aia-tool-extra"><label class="aia-field-label" for="aia-t-note-i">What should the notes contain?</label>
+          ${_aiaTextarea('aia-t-note-i', d.note_instructions, { rows: 4, label: 'Note instructions', placeholder: 'e.g. Summarise what the customer wants and anything a teammate should check.' })}</div>` : '')}
+      ` : stLoading()}
+    </div>
+    ${tab === 'builtin' ? _aiaSaveBar() : ''}`;
+  const rerender = () => _aiaRenderTools(page, stale);
+  page.querySelectorAll('[data-tab]').forEach(b => b.addEventListener('click', () => {
+    if (b.dataset.tab === AIA.toolsTab) return;
+    if (_aiaDirty() && !confirm('You have unsaved changes. Discard them?')) return;
+    AIA.draft = _aiaClone(AIA.saved);
+    AIA.toolsTab = b.dataset.tab;
+    rerender();
+  }));
+  if (tab === 'custom') return _aiaRenderCustomTools(page.querySelector('#aia-tools-body'), stale);
+  const bindT = (id, field) => page.querySelector('#' + id).addEventListener('change', e => { d[field] = e.target.checked; rerender(); });
+  bindT('aia-t-send', 'allow_send_messages');
+  bindT('aia-t-ticket', 'allow_create_tickets');
+  bindT('aia-t-note', 'allow_private_notes');
+  _aiaBindTextarea(page, 'aia-t-ticket-i', 'ticket_instructions', 'Ticket instructions');
+  _aiaBindTextarea(page, 'aia-t-note-i', 'note_instructions', 'Note instructions');
+  _aiaBindBar(page, rerender);
+}
+async function _aiaRenderCustomTools(box, stale) {
+  const ro = _aiaReadonly();
+  if (ro) { box.innerHTML = stEmpty('Only admins can view and manage custom tools.', 'lock'); return; }
+  let tools;
+  try { tools = await Api.ai.customTools(); } catch (e) { box.innerHTML = stEmpty(e.message); return; }
+  if (stale()) return;
+  box.innerHTML = `
+    <div class="aia-card aia-explain">${aiIcon('wrench')}<div>
+      <div class="aia-tool-title">Connect the agent to your systems</div>
+      <div class="aia-muted">A custom tool is an HTTPS endpoint the agent can call to look things up (order status, stock, appointments). It sends the declared parameters as a query string (GET) or JSON body (POST), waits up to 15 seconds and reads the first 4,000 characters of the response. Only public URLs are allowed.</div>
+    </div></div>
+    <div class="aia-row aia-row-plain"><div class="aia-field-label">${tools.length} tool${tools.length === 1 ? '' : 's'}</div><button class="btn btn-primary btn-sm" id="aia-ct-add">${aiIcon('plus')}Add tool</button></div>
+    <div class="aia-card aia-list">${tools.length ? tools.map(t => `
+      <div class="aia-kb-row">
+        <span class="aia-badge t-${t.method === 'GET' ? 'faq' : 'document'}">${esc(t.method)}</span>
+        <button class="aia-kb-main" data-edit="${t.id}"><span class="aia-kb-title aia-mono">${esc(t.name)}</span>
+          <span class="aia-kb-sub">${esc(t.description || t.url)}</span></button>
+        <div class="aia-kb-ctl">${_aiaToggle('aia-ct-t-' + t.id, t.enabled, 'Enabled')}
+          <button class="aia-icon-btn" data-edit="${t.id}" aria-label="Edit ${esc(t.name)}">${aiIcon('pen')}</button>
+          <button class="aia-icon-btn danger" data-del="${t.id}" aria-label="Delete ${esc(t.name)}">${aiIcon('trash')}</button></div>
+      </div>`).join('') : `<div class="aia-empty">${aiIcon('wrench')}<div class="aia-empty-title">No custom tools</div><div class="aia-muted">Add one to let the agent fetch live information from your systems.</div></div>`}
+    </div>`;
+  const reload = () => _aiaRenderCustomTools(box, stale);
+  const byId = Object.fromEntries(tools.map(t => [t.id, t]));
+  box.querySelector('#aia-ct-add').addEventListener('click', () => _aiaToolForm(null, reload));
+  box.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => _aiaToolForm(byId[+b.dataset.edit], reload)));
+  box.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+    const t = byId[+b.dataset.del];
+    if (!(await _aiaConfirm('Delete tool?', `The agent will no longer be able to call ${t.name}.`))) return;
+    try { await Api.ai.deleteCustomTool(t.id); reload(); } catch (e) { toast(e.message, 'error'); }
+  }));
+  box.querySelectorAll('input[id^="aia-ct-t-"]').forEach(inp => inp.addEventListener('change', async () => {
+    const t = byId[+inp.id.replace('aia-ct-t-', '')];
+    try { await Api.ai.updateCustomTool(t.id, { ..._aiaToolBody(t), enabled: inp.checked }); }
+    catch (e) { toast(e.message, 'error'); inp.checked = !inp.checked; }
+  }));
+}
+function _aiaToolBody(t) {
+  return { name: t.name, description: t.description, method: t.method, url: t.url, params: t.params || [],
+           enabled: t.enabled, timeout_seconds: t.timeout_seconds };
+}
+function _aiaToolForm(t, reload) {
+  const params = _aiaClone(t?.params || []);
+  const headers = [];
+  const m = _aiaModal(t ? `Edit ${t.name}` : 'Add custom tool', `
+    <div class="aia-two">
+      <div class="aia-field"><label class="aia-field-label" for="aia-ct-name">Name</label>
+        <input class="aia-input aia-mono" id="aia-ct-name" maxlength="41" placeholder="order_status" value="${esc(t?.name || '')}" autofocus>
+        <div class="aia-hint">Lowercase letters, digits and _ — the agent sees this name.</div></div>
+      <div class="aia-field"><label class="aia-field-label" for="aia-ct-method">Method</label>
+        <select class="aia-input" id="aia-ct-method"><option ${t?.method !== 'POST' ? 'selected' : ''}>GET</option><option ${t?.method === 'POST' ? 'selected' : ''}>POST</option></select></div>
+    </div>
+    <div class="aia-field"><label class="aia-field-label" for="aia-ct-desc">What it does</label>
+      <input class="aia-input" id="aia-ct-desc" maxlength="1000" placeholder="Looks up the delivery status of an order by its order ID" value="${esc(t?.description || '')}"></div>
+    <div class="aia-field"><label class="aia-field-label" for="aia-ct-url">URL</label>
+      <input class="aia-input" id="aia-ct-url" type="url" placeholder="https://api.example.com/orders/status" value="${esc(t?.url || '')}"></div>
+    <div class="aia-field"><div class="aia-field-label">Parameters</div><div id="aia-ct-params"></div>
+      <button type="button" class="aia-link" id="aia-ct-addp">${aiIcon('plus')}Add parameter</button></div>
+    <div class="aia-field"><div class="aia-field-label">Headers <span class="aia-muted">(e.g. Authorization — stored, never shown again)</span></div>
+      ${t?.header_names?.length ? `<div class="aia-hint">Saved: ${t.header_names.map(esc).join(', ')}. Add headers below to replace them all; leave empty to keep.</div>` : ''}
+      <div id="aia-ct-headers"></div><button type="button" class="aia-link" id="aia-ct-addh">${aiIcon('plus')}Add header</button></div>
+    <div class="aia-two">
+      <div class="aia-field"><label class="aia-field-label" for="aia-ct-timeout">Timeout (seconds)</label>
+        <input class="aia-input" id="aia-ct-timeout" type="number" min="1" max="15" value="${t?.timeout_seconds || 8}"></div>
+      <div class="aia-field"><span class="aia-field-label">Enabled</span>${_aiaToggle('aia-ct-enabled', t ? t.enabled : true, 'Enabled')}</div>
+    </div>`, {
+    wide: true,
+    footer: `<button class="btn btn-secondary btn-sm" data-close>Cancel</button><button class="btn btn-primary btn-sm" id="aia-ct-save">${t ? 'Save' : 'Add tool'}</button>`,
+  });
+  const pBox = m.el.querySelector('#aia-ct-params'), hBox = m.el.querySelector('#aia-ct-headers');
+  const drawParams = () => {
+    pBox.innerHTML = params.map((p, i) => `<div class="aia-prow" data-i="${i}">
+      <input class="aia-input aia-mono" data-f="name" placeholder="order_id" value="${esc(p.name || '')}" aria-label="Parameter name">
+      <select class="aia-input" data-f="type" aria-label="Type">${['string', 'number', 'integer', 'boolean'].map(x => `<option ${p.type === x ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <input class="aia-input" data-f="description" placeholder="Description" value="${esc(p.description || '')}" aria-label="Description">
+      <label class="aia-check"><input type="checkbox" data-f="required" ${p.required ? 'checked' : ''}>Required</label>
+      <button type="button" class="aia-icon-btn danger" data-rm="${i}" aria-label="Remove parameter">${aiIcon('xmark')}</button></div>`).join('')
+      || '<div class="aia-hint">No parameters.</div>';
+    pBox.querySelectorAll('.aia-prow').forEach(row => {
+      const p = params[+row.dataset.i];
+      row.querySelectorAll('[data-f]').forEach(inp => inp.addEventListener(inp.type === 'checkbox' ? 'change' : 'input', () => {
+        p[inp.dataset.f] = inp.type === 'checkbox' ? inp.checked : inp.value;
+      }));
+    });
+    pBox.querySelectorAll('[data-rm]').forEach(b => b.addEventListener('click', () => { params.splice(+b.dataset.rm, 1); drawParams(); }));
+  };
+  const drawHeaders = () => {
+    hBox.innerHTML = headers.map((h, i) => `<div class="aia-prow aia-hrow" data-i="${i}">
+      <input class="aia-input aia-mono" data-f="k" placeholder="Authorization" value="${esc(h.k)}" aria-label="Header name">
+      <input class="aia-input aia-mono" data-f="v" placeholder="Bearer …" value="${esc(h.v)}" aria-label="Header value" type="password" autocomplete="off">
+      <button type="button" class="aia-icon-btn danger" data-rm="${i}" aria-label="Remove header">${aiIcon('xmark')}</button></div>`).join('');
+    hBox.querySelectorAll('.aia-prow').forEach(row => row.querySelectorAll('[data-f]').forEach(inp =>
+      inp.addEventListener('input', () => { headers[+row.dataset.i][inp.dataset.f] = inp.value; })));
+    hBox.querySelectorAll('[data-rm]').forEach(b => b.addEventListener('click', () => { headers.splice(+b.dataset.rm, 1); drawHeaders(); }));
+  };
+  drawParams(); drawHeaders();
+  m.el.querySelector('#aia-ct-addp').addEventListener('click', () => { params.push({ name: '', type: 'string', description: '', required: false }); drawParams(); });
+  m.el.querySelector('#aia-ct-addh').addEventListener('click', () => { headers.push({ k: '', v: '' }); drawHeaders(); });
+  m.el.querySelector('#aia-ct-save').addEventListener('click', async () => {
+    const body = {
+      name: m.el.querySelector('#aia-ct-name').value.trim(), description: m.el.querySelector('#aia-ct-desc').value.trim(),
+      method: m.el.querySelector('#aia-ct-method').value, url: m.el.querySelector('#aia-ct-url').value.trim(),
+      params: params.filter(p => (p.name || '').trim()).map(p => ({ ...p, name: p.name.trim() })),
+      timeout_seconds: Math.max(1, Math.min(15, parseInt(m.el.querySelector('#aia-ct-timeout').value, 10) || 8)),
+      enabled: m.el.querySelector('#aia-ct-enabled').checked,
+    };
+    const hs = headers.filter(h => h.k.trim());
+    if (hs.length || !t) body.headers = Object.fromEntries(hs.map(h => [h.k.trim(), h.v]));
+    try {
+      t ? await Api.ai.updateCustomTool(t.id, body) : await Api.ai.createCustomTool(body);
+      m.close(); toast(t ? 'Tool saved' : 'Tool added', 'success'); reload();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
+// ── Date ranges (Credit Usage / Analytics) ── //
+const AIA_RANGES = { '7d': 'Last 7 days', '30d': 'Last 30 days', '90d': 'Last 90 days', month: 'This month' };
+function _aiaRangeQuery(key) {
+  const now = new Date();
+  let from;
+  if (key === 'month') from = new Date(now.getFullYear(), now.getMonth(), 1);
+  else { from = new Date(now); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() - (parseInt(key, 10) - 1)); }
+  return { from: from.toISOString(), to: new Date(now.getTime() + 60000).toISOString() };
+}
+function _aiaRangeBtn(id, key) {
+  return `<button class="an-btn" id="${id}" aria-haspopup="true">${aiIcon('calendar', 'an-btn-lead')}<span>${esc(AIA_RANGES[key])}</span>${aiIcon('down', 'an-caret')}</button>`;
+}
+function _aiaBindRange(page, id, getKey, setKey) {
+  page.querySelector('#' + id).addEventListener('click', e => {
+    e.stopPropagation();
+    const pop = cxPopover(e.currentTarget, Object.entries(AIA_RANGES).map(([k, l]) =>
+      `<button class="cx-pop-item aia-menu-item${k === getKey() ? ' active' : ''}" data-k="${k}"><span class="aia-menu-title">${l}${k === getKey() ? aiIcon('check') : ''}</span></button>`).join(''),
+      { alignRight: true, cls: 'aia-pop' });
+    pop.querySelectorAll('[data-k]').forEach(b => b.addEventListener('click', ev => { ev.stopPropagation(); cxClosePop(); setKey(b.dataset.k); }));
+  });
+}
+function _aiaDayLabel(ymd) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+}
+function _aiaChartBase() {
+  return {
+    grid: _anCss('--border', '#e5e7eb'), tick: _anCss('--text-3', '#9ca3af'),
+  };
+}
+function _aiaStat(label, value, icon, sub = '') {
+  return `<div class="aia-stat"><div class="aia-stat-top"><span>${esc(label)}</span>${aiIcon(icon)}</div>
+    <div class="aia-stat-val">${value}</div>${sub ? `<div class="aia-stat-sub">${sub}</div>` : ''}</div>`;
+}
+
+// ── Credit usage ── //
+async function _aiaRenderUsage(page, stale) {
+  page.innerHTML = `${_aiaHead('usage', _aiaRangeBtn('aia-u-range', AIA.usageRange))}<div id="aia-u-body">${stLoading()}</div>`;
+  _aiaBindRange(page, 'aia-u-range', () => AIA.usageRange, k => { AIA.usageRange = k; _aiaRenderUsage(page, stale); });
+  const data = await Api.ai.usage(_aiaRangeQuery(AIA.usageRange));
+  if (stale()) return;
+  const t = data.totals;
+  const maxP = Math.max(1, ...data.by_purpose.map(p => p.tokens));
+  page.querySelector('#aia-u-body').innerHTML = `
+    <div class="aia-stats">
+      ${_aiaStat('Total tokens', _aiaFmtNum(t.total_tokens), 'coins')}
+      ${_aiaStat('Requests', _aiaFmtNum(t.requests), 'bolt', t.failed ? `${_aiaFmtNum(t.failed)} failed` : 'All succeeded')}
+      ${_aiaStat('Input tokens', _aiaFmtNum(t.prompt_tokens), 'upload')}
+      ${_aiaStat('Output tokens', _aiaFmtNum(t.candidate_tokens), 'message', 'Includes thinking tokens')}
+    </div>
+    ${_aiaCard('Daily tokens', `<div class="aia-chart"><canvas id="aia-u-chart" aria-label="Daily token usage chart" role="img"></canvas></div>`)}
+    ${_aiaCard('By feature', data.by_purpose.length ? `<div class="aia-table-wrap"><table class="aia-table">
+      <thead><tr><th>Feature</th><th class="num">Requests</th><th class="num">Tokens</th><th class="aia-share-h">Share</th></tr></thead>
+      <tbody>${data.by_purpose.map(p => `<tr><td>${esc(AIA_PURPOSES[p.purpose] || p.purpose)}</td><td class="num">${_aiaFmtNum(p.requests)}</td>
+        <td class="num">${_aiaFmtNum(p.tokens)}</td><td><div class="aia-share"><i style="width:${Math.max(2, p.tokens / maxP * 100)}%"></i></div></td></tr>`).join('')}</tbody>
+      </table></div>` : `<div class="aia-empty">${aiIcon('coins')}<div class="aia-muted">No AI usage in this period.</div></div>`)}
+    <p class="aia-foot-note">Model: ${esc(data.model)}. Cost estimates aren’t shown — check billing in Google AI Studio.</p>`;
+  const b = _aiaChartBase(), green = _anCss('--an-green', '#16a34a');
+  const canvas = document.getElementById('aia-u-chart');
+  if (canvas && typeof Chart !== 'undefined') {
+    AIA.charts.push(new Chart(canvas, {
+      type: 'bar',
+      data: { labels: data.daily.map(d => _aiaDayLabel(d.date)), datasets: [{ label: 'Tokens', data: data.daily.map(d => d.tokens), backgroundColor: green, borderRadius: 3, maxBarThickness: 22 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => ` ${_aiaFmtNum(c.raw)} tokens · ${_aiaFmtNum(data.daily[c.dataIndex].requests)} requests` } } },
+        scales: {
+          x: { grid: { display: false }, border: { color: b.grid }, ticks: { color: b.tick, font: { family: 'Inter', size: 11 }, maxRotation: 0, autoSkipPadding: 14 } },
+          y: { beginAtZero: true, grid: { color: b.grid }, border: { display: false }, ticks: { color: b.tick, font: { family: 'Inter', size: 11 }, precision: 0 } },
+        },
+      },
+    }));
+  }
+}
+
+// ── Self-training ── //
+async function _aiaRenderTraining(page, stale) {
+  const ro = _aiaReadonly(), tab = AIA.trainTab;
+  page.innerHTML = `
+    ${_aiaHead('training', ro ? '' : `<button class="btn btn-primary btn-sm" id="aia-tr-gen">${aiIcon('wand')}Generate suggestions</button>`)}
+    <div class="aia-card aia-explain">${aiIcon('bulb')}<div><div class="aia-tool-title">How it works</div>
+      <div class="aia-muted">When a teammate answers a question the agent couldn’t (or any recent conversation with a teammate reply), Generate suggestions asks Gemini to pull out reusable questions and answers. Personal details are skipped. Nothing is used until you approve it.</div></div></div>
+    <div class="aia-tabs" role="tablist">
+      <button class="aia-tab${tab === 'review' ? ' on' : ''}" data-tab="review" role="tab">Needs Review <span class="aia-seg-n" id="aia-tr-n-review"></span></button>
+      <button class="aia-tab${tab === 'active' ? ' on' : ''}" data-tab="active" role="tab">Approved <span class="aia-seg-n" id="aia-tr-n-active"></span></button>
+    </div>
+    <div class="aia-card aia-list" id="aia-tr-list">${stLoading()}</div>`;
+  page.querySelectorAll('[data-tab]').forEach(b => b.addEventListener('click', () => { AIA.trainTab = b.dataset.tab; _aiaRenderTraining(page, stale); }));
+  const load = async () => {
+    const [rev, act] = await Promise.all([Api.kb.list({ item_type: 'self_learned', status: 'review' }), Api.kb.list({ item_type: 'self_learned', status: 'active' })]);
+    if (stale()) return;
+    page.querySelector('#aia-tr-n-review').textContent = rev.items.length;
+    page.querySelector('#aia-tr-n-active').textContent = act.items.length;
+    const items = (tab === 'review' ? rev : act).items;
+    const list = page.querySelector('#aia-tr-list');
+    if (!items.length) {
+      list.innerHTML = `<div class="aia-empty">${aiIcon(tab === 'review' ? 'bulb' : 'circleCheck')}<div class="aia-empty-title">${tab === 'review' ? 'No suggestions to review' : 'Nothing approved yet'}</div>
+        <div class="aia-muted">${tab === 'review' ? 'Click Generate suggestions to learn from recent conversations.' : 'Approved answers appear here and in the knowledge base.'}</div></div>`;
+      return;
+    }
+    list.innerHTML = items.map(i => `
+      <div class="aia-sug">
+        <div class="aia-sug-q">${aiIcon('question')}<span>${esc(i.title)}</span></div>
+        <div class="aia-sug-a">${esc(i.content)}</div>
+        <div class="aia-sug-foot"><span class="aia-muted">${i.origin_chat_id ? `Learned from chat #${i.origin_chat_id} · ` : ''}${esc(_aiaFmtTime(i.created_at))}</span>
+          ${ro ? '' : `<span class="aia-sug-actions">
+            ${tab === 'review' ? `<button class="btn btn-sm btn-secondary" data-dismiss="${i.id}">Dismiss</button>
+            <button class="btn btn-sm btn-secondary" data-edit="${i.id}">${aiIcon('pen')}Edit</button>
+            <button class="btn btn-sm btn-primary" data-approve="${i.id}">${aiIcon('check')}Approve</button>`
+            : `<button class="btn btn-sm btn-secondary" data-edit="${i.id}">${aiIcon('pen')}Edit</button>
+               <button class="btn btn-sm btn-secondary" data-unapprove="${i.id}">Move to review</button>`}</span>`}
+        </div>
+      </div>`).join('');
+    const byId = Object.fromEntries(items.map(i => [i.id, i]));
+    list.querySelectorAll('[data-approve]').forEach(b => b.addEventListener('click', async () => {
+      try { await Api.kb.update(+b.dataset.approve, { status: 'active' }); toast('Approved — added to the knowledge base', 'success'); load(); } catch (e) { toast(e.message, 'error'); }
+    }));
+    list.querySelectorAll('[data-unapprove]').forEach(b => b.addEventListener('click', async () => {
+      try { await Api.kb.update(+b.dataset.unapprove, { status: 'review' }); load(); } catch (e) { toast(e.message, 'error'); }
+    }));
+    list.querySelectorAll('[data-dismiss]').forEach(b => b.addEventListener('click', async () => {
+      try { await Api.kb.remove(+b.dataset.dismiss); toast('Dismissed', 'success'); load(); } catch (e) { toast(e.message, 'error'); }
+    }));
+    list.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => _aiaKbFaq(byId[+b.dataset.edit], load)));
+  };
+  page.querySelector('#aia-tr-gen')?.addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.innerHTML = `<span class="spinner aia-btn-spin"></span>Generating…`;
+    try {
+      const r = await Api.ai.generateSuggestions();
+      toast(r.created ? `${r.created} new suggestion${r.created > 1 ? 's' : ''} to review` : (r.message || 'No new suggestions found'), r.created ? 'success' : 'default');
+      AIA.trainTab = 'review';
+      if (!stale()) _aiaRenderTraining(page, stale);
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false; btn.innerHTML = `${aiIcon('wand')}Generate suggestions`;
+    }
+  });
+  await load();
+}
+
+// ── Analytics ── //
+async function _aiaRenderAnalytics(page, stale) {
+  page.innerHTML = `${_aiaHead('analytics', _aiaRangeBtn('aia-a-range', AIA.anRange))}<div id="aia-a-body">${stLoading()}</div>`;
+  _aiaBindRange(page, 'aia-a-range', () => AIA.anRange, k => { AIA.anRange = k; _aiaRenderAnalytics(page, stale); });
+  const data = await Api.ai.analytics(_aiaRangeQuery(AIA.anRange));
+  if (stale()) return;
+  const s = data.stats;
+  const series = [['tickets', 'Tickets Created', '--an-green'], ['notes', 'Private Notes', '--an-blue'], ['replies', 'AI Replies', '--an-amber']];
+  page.querySelector('#aia-a-body').innerHTML = `
+    <div class="aia-stats">
+      ${_aiaStat('Messages Sent', _aiaFmtNum(s.messages_sent), 'paper', s.drafts ? `+ ${_aiaFmtNum(s.drafts)} drafts` : 'By the AI agent')}
+      ${_aiaStat('Tickets Created', _aiaFmtNum(s.tickets_created), 'ticket', 'By the AI agent')}
+      ${_aiaStat('Active Chats', s.active_chats == null ? '—' : _aiaFmtNum(s.active_chats), 'message', 'AI turned on right now')}
+      ${_aiaStat('Private Notes', _aiaFmtNum(s.private_notes), 'sticky', 'By the AI agent')}
+    </div>
+    ${_aiaCard('Tickets & Private Notes', `
+      <div class="aia-legend">${series.map(([, l, c]) => `<span><i style="background:var(${c})"></i>${l}</span>`).join('')}</div>
+      <div class="aia-chart"><canvas id="aia-a-chart" role="img" aria-label="Tickets, notes and replies per day"></canvas></div>`)}
+    ${_aiaCard('By chat', data.chats.length ? `<div class="aia-table-wrap"><table class="aia-table">
+      <thead><tr><th>Chat</th><th class="num">Messages Sent</th><th class="num">Total Tokens</th><th class="num">Tool Calls</th></tr></thead>
+      <tbody>${data.chats.map(c => `<tr><td><button class="aia-link aia-chatlink" data-chat="${c.chat_id}">${esc(c.chat_name)}</button></td>
+        <td class="num">${_aiaFmtNum(c.messages_sent)}</td><td class="num">${_aiaFmtNum(c.total_tokens)}</td><td class="num">${_aiaFmtNum(c.tool_calls)}</td></tr>`).join('')}</tbody>
+      </table></div>` : `<div class="aia-empty">${aiIcon('chartLine')}<div class="aia-muted">The agent hasn’t replied in any chat in this period.</div></div>`)}`;
+  _aiaBindChatLinks(page);
+  const b = _aiaChartBase();
+  const canvas = document.getElementById('aia-a-chart');
+  if (canvas && typeof Chart !== 'undefined') {
+    AIA.charts.push(new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: data.daily.map(d => _aiaDayLabel(d.date)),
+        datasets: series.map(([k, l, c]) => {
+          const col = _anCss(c, '#16a34a');
+          return { label: l, data: data.daily.map(d => d[k]), borderColor: col, backgroundColor: col, borderWidth: 1.8,
+                   pointRadius: 0, pointHoverRadius: 3.5, pointHitRadius: 8, tension: 0.3, cubicInterpolationMode: 'monotone' };
+        }),
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false, interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false }, border: { color: b.grid }, ticks: { color: b.tick, font: { family: 'Inter', size: 11 }, maxRotation: 0, autoSkipPadding: 14 } },
+          y: { beginAtZero: true, grid: { color: b.grid }, border: { display: false }, ticks: { color: b.tick, font: { family: 'Inter', size: 11 }, precision: 0 } },
+        },
+      },
+    }));
+  }
+}
+function _aiaBindChatLinks(root) {
+  root.querySelectorAll('[data-chat]').forEach(b => b.addEventListener('click', e => {
+    e.stopPropagation();
+    const id = +b.dataset.chat;
+    navigateTo('inbox');
+    const started = Date.now();
+    (function wait() {
+      if (State.currentView !== 'inbox') return;
+      if (document.getElementById('chat-list') || Date.now() - started > 3000) return openChat(id);
+      setTimeout(wait, 100);
+    })();
+  }));
+}
+
+// ── Logs ── //
+function _aiaDecisionPill(r) {
+  const cls = { replied: 'ok', drafted: 'info', skipped: '', error: 'bad' }[r.decision] || '';
+  return _aiaPill(r.decision === 'drafted' ? 'Drafted' : r.decision.charAt(0).toUpperCase() + r.decision.slice(1), cls);
+}
+async function _aiaRenderLogs(page, stale) {
+  const f = AIA.logs;
+  page.innerHTML = `
+    ${_aiaHead('logs', `<button class="an-btn" id="aia-l-refresh">${aiIcon('rotate', 'an-btn-lead')}<span>Refresh</span></button>`)}
+    <div class="aia-toolbar">
+      <label class="st-search aia-search">${aiIcon('search')}<input type="search" id="aia-l-q" placeholder="Search chat" value="${esc(f.q)}" aria-label="Search chat"></label>
+      <div class="aia-segctl" id="aia-l-dec" role="tablist" aria-label="Decision"></div>
+      <select class="aia-input aia-select-native" id="aia-l-reason" aria-label="Reason">
+        <option value="">Any reason</option>${Object.entries(AIA_REASONS).map(([k, l]) => `<option value="${k}" ${f.reason === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="aia-card aia-list" id="aia-l-list">${stLoading()}</div>
+    <div class="aia-pager" id="aia-l-pager"></div>`;
+  const load = async () => {
+    const q = { page: f.page, page_size: 25 };
+    if (f.decision) q.decision = f.decision;
+    if (f.reason) q.reason = f.reason;
+    if (f.q.trim()) q.q = f.q.trim();
+    let data;
+    try { data = await Api.ai.runs(q); } catch (e) { page.querySelector('#aia-l-list').innerHTML = stEmpty(e.message); return; }
+    if (stale()) return;
+    const c = data.counts || {};
+    const all = Object.values(c).reduce((a, b) => a + b, 0);
+    page.querySelector('#aia-l-dec').innerHTML = [['', 'All', all], ['replied', 'Replied', c.replied || 0], ['drafted', 'Drafted', c.drafted || 0], ['skipped', 'Skipped', c.skipped || 0], ['error', 'Errors', c.error || 0]]
+      .map(([k, l, n]) => `<button class="aia-seg-btn${f.decision === k ? ' on' : ''}" data-dec="${k}" role="tab" aria-selected="${f.decision === k}">${l} <span class="aia-seg-n">${_aiaFmtNum(n)}</span></button>`).join('');
+    page.querySelectorAll('[data-dec]').forEach(b => b.addEventListener('click', () => { f.decision = b.dataset.dec; f.page = 1; load(); }));
+    const list = page.querySelector('#aia-l-list');
+    if (!data.items.length) {
+      list.innerHTML = `<div class="aia-empty">${aiIcon('listUl')}<div class="aia-empty-title">No activity${all ? ' matches these filters' : ' yet'}</div>
+        <div class="aia-muted">Each incoming message the agent evaluates shows up here with its decision.</div></div>`;
+      page.querySelector('#aia-l-pager').innerHTML = '';
+      return;
+    }
+    list.innerHTML = `<div class="aia-table-wrap"><table class="aia-table aia-table-click">
+      <thead><tr><th>Time</th><th>Chat</th><th>Decision</th><th class="num">Tokens</th><th class="num">Latency</th><th>Tools</th></tr></thead>
+      <tbody>${data.items.map(r => `<tr data-run="${r.id}" tabindex="0">
+        <td class="aia-nowrap">${esc(_aiaFmtTime(r.created_at))}</td>
+        <td>${esc(r.chat_name || (r.chat_id ? '#' + r.chat_id : '—'))}</td>
+        <td>${_aiaDecisionPill(r)} ${r.reason ? `<span class="aia-muted aia-reason">${esc(AIA_REASONS[r.reason] || r.reason)}</span>` : ''}</td>
+        <td class="num">${r.tokens ? _aiaFmtNum(r.tokens) : '—'}</td>
+        <td class="num">${r.latency_ms ? (r.latency_ms / 1000).toFixed(1) + ' s' : '—'}</td>
+        <td>${r.tools.length ? r.tools.map(t => `<span class="aia-tag">${esc(_aiaToolLabel(t))}</span>`).join('') : '<span class="aia-muted">—</span>'}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+    list.querySelectorAll('[data-run]').forEach(tr => {
+      const open = () => _aiaRunDetail(+tr.dataset.run);
+      tr.addEventListener('click', open);
+      tr.addEventListener('keydown', e => { if (e.key === 'Enter') open(); });
+    });
+    const pages = Math.max(1, Math.ceil(data.total / data.page_size));
+    page.querySelector('#aia-l-pager').innerHTML = `<span class="aia-muted">${_aiaFmtNum(data.total)} evaluation${data.total === 1 ? '' : 's'} · page ${data.page} of ${pages}</span>
+      <button class="btn btn-secondary btn-sm" id="aia-l-prev" ${data.page <= 1 ? 'disabled' : ''}>Previous</button>
+      <button class="btn btn-secondary btn-sm" id="aia-l-next" ${data.page >= pages ? 'disabled' : ''}>Next</button>`;
+    page.querySelector('#aia-l-prev').addEventListener('click', () => { f.page--; load(); });
+    page.querySelector('#aia-l-next').addEventListener('click', () => { f.page++; load(); });
+  };
+  let tmr;
+  page.querySelector('#aia-l-q').addEventListener('input', e => { clearTimeout(tmr); tmr = setTimeout(() => { f.q = e.target.value; f.page = 1; load(); }, 250); });
+  page.querySelector('#aia-l-reason').addEventListener('change', e => { f.reason = e.target.value; f.page = 1; load(); });
+  page.querySelector('#aia-l-refresh').addEventListener('click', () => load());
+  await load();
+}
+async function _aiaRunDetail(id) {
+  let r;
+  try { r = await Api.ai.run(id); } catch (e) { return toast(e.message, 'error'); }
+  const row = (k, v) => v ? `<div class="aia-dl-row"><dt>${esc(k)}</dt><dd>${v}</dd></div>` : '';
+  const m = _aiaModal('Evaluation details', `
+    <dl class="aia-dl">
+      ${row('Time', esc(_aiaFmtTime(r.created_at)))}
+      ${row('Chat', r.chat_id ? `<button class="aia-link aia-chatlink" data-chat="${r.chat_id}">${esc(r.chat_name || '#' + r.chat_id)}</button>` : '')}
+      ${row('Decision', `${_aiaDecisionPill(r)} ${r.reason ? esc(AIA_REASONS[r.reason] || r.reason) : ''}`)}
+      ${row('Detail', esc(r.detail))}
+      ${row('Tokens', r.tokens ? _aiaFmtNum(r.tokens) : '')}
+      ${row('Latency', r.latency_ms ? (r.latency_ms / 1000).toFixed(2) + ' s' : '')}
+      ${row('Knowledge used', (r.kb_titles || []).map(t => `<span class="aia-tag">${esc(t)}</span>`).join(''))}
+      ${row('Answer known', r.decision === 'replied' || r.decision === 'drafted' ? (r.kb_miss ? 'No — said it didn’t know' : 'Yes') : '')}
+      ${row('Tools', (r.tools_detail || []).map(t => `<span class="aia-tag">${esc(_aiaToolLabel(t.name))}${t.ticket_id ? ' #' + t.ticket_id : ''}${t.ok === false ? ' (failed)' : ''}</span>`).join(''))}
+    </dl>
+    ${r.message_preview ? `<div class="aia-field-label">Customer message</div><div class="aia-bubble in">${esc(r.message_preview)}</div>` : ''}
+    ${r.reply ? `<div class="aia-field-label">${r.decision === 'drafted' ? 'Draft reply (not sent)' : 'Agent reply'}</div><div class="aia-bubble out">${esc(r.reply)}</div>` : ''}`, { wide: true });
+  m.el.querySelectorAll('[data-chat]').forEach(b => b.addEventListener('click', () => m.close()));
+  _aiaBindChatLinks(m.el);
+}
+
+// ── Flagging ── //
+function _aiaRenderFlagging(page) {
+  const d = AIA.draft, ro = _aiaReadonly();
+  page.innerHTML = `
+    ${_aiaHead('flagging')}
+    <section class="aia-card">
+      <div class="aia-tool-head">
+        <span class="aia-icbox">${aiIcon('flag')}</span>
+        <div class="aia-tool-text"><div class="aia-tool-title">Auto-flag incoming messages</div>
+          <div class="aia-muted">Every new customer message is checked against your criteria; matches are flagged in the inbox.</div></div>
+        ${_aiaToggle('aia-flag-on', d.flag_enabled, 'Auto-flag incoming messages', ro)}
+      </div>
+    </section>
+    ${_aiaCard('Flag Criteria', `
+      <p class="aia-help">Describe which messages are important enough to flag.</p>
+      ${_aiaTextarea('aia-flag-crit', d.flag_criteria, { rows: 6, label: 'Flag criteria', placeholder: 'e.g. urgent requests, complaints, refund or cancellation requests, angry or frustrated customers, payment issues' })}
+      <div class="aia-note">${aiIcon('info')}<span>Each chat can opt out in its Settings tab (“Allow AI Flagging”). Messages from internal contacts are never flagged.</span></div>`)}
+    ${_aiaSaveBar()}`;
+  const rerender = () => _aiaRenderFlagging(page);
+  page.querySelector('#aia-flag-on').addEventListener('change', e => { d.flag_enabled = e.target.checked; _aiaUpdateBar(); });
+  _aiaBindTextarea(page, 'aia-flag-crit', 'flag_criteria', 'Flag Criteria');
+  _aiaBindBar(page, rerender);
+}
+
+// ── Internal contacts ── //
+function _aiaFmtNumber(n) { return n.length > 10 ? `+${n.slice(0, n.length - 10)} ${n.slice(-10, -5)} ${n.slice(-5)}` : n; }
+async function _aiaRenderInternal(page, stale) {
+  const ro = _aiaReadonly();
+  page.innerHTML = `
+    ${_aiaHead('internal', ro ? '' : `
+      <button class="btn btn-secondary btn-sm" id="aia-ic-import">${aiIcon('phone')}Import our phones</button>
+      <button class="btn btn-primary btn-sm" id="aia-ic-add">${aiIcon('plus')}Add number</button>`)}
+    <div class="aia-card aia-list" id="aia-ic-list">${stLoading()}</div>`;
+  const load = async () => {
+    const rows = await Api.ai.internalContacts();
+    if (stale()) return;
+    const list = page.querySelector('#aia-ic-list');
+    list.innerHTML = rows.length ? rows.map(r => `
+      <div class="aia-kb-row">
+        <span class="aia-icbox aia-icbox-sm">${aiIcon('userShield')}</span>
+        <div class="aia-kb-main aia-static"><span class="aia-kb-title aia-mono">${esc(_aiaFmtNumber(r.number))}</span>
+          <span class="aia-kb-sub">${esc(r.label || 'Internal contact')} · added ${esc(_aiaFmtTime(r.created_at))}</span></div>
+        ${ro ? '' : `<div class="aia-kb-ctl"><button class="aia-icon-btn danger" data-del="${r.id}" aria-label="Remove ${esc(r.number)}">${aiIcon('trash')}</button></div>`}
+      </div>`).join('')
+      : `<div class="aia-empty">${aiIcon('addressBook')}<div class="aia-empty-title">No internal contacts</div>
+         <div class="aia-muted">Add teammates’ personal numbers and your own WhatsApp numbers so the agent ignores them.</div></div>`;
+    list.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+      try { await Api.ai.deleteInternalContact(+b.dataset.del); load(); } catch (e) { toast(e.message, 'error'); }
+    }));
+  };
+  page.querySelector('#aia-ic-import')?.addEventListener('click', async () => {
+    try { const r = await Api.ai.importPhonesInternal(); toast(r.added ? `Added ${r.added} number${r.added > 1 ? 's' : ''}` : 'All our numbers are already listed', 'success'); load(); }
+    catch (e) { toast(e.message, 'error'); }
+  });
+  page.querySelector('#aia-ic-add')?.addEventListener('click', () => {
+    const m = _aiaModal('Add internal contact', `
+      <div class="aia-field"><label class="aia-field-label" for="aia-ic-num">Phone number</label>
+        <input class="aia-input" id="aia-ic-num" type="tel" placeholder="+91 98765 43210" autofocus>
+        <div class="aia-hint">Include the country code.</div></div>
+      <div class="aia-field"><label class="aia-field-label" for="aia-ic-label">Label <span class="aia-muted">(optional)</span></label>
+        <input class="aia-input" id="aia-ic-label" maxlength="255" placeholder="e.g. Priya (sales)"></div>`, {
+      footer: `<button class="btn btn-secondary btn-sm" data-close>Cancel</button><button class="btn btn-primary btn-sm" id="aia-ic-save">Add</button>`,
+    });
+    m.el.querySelector('#aia-ic-save').addEventListener('click', async () => {
+      try {
+        await Api.ai.addInternalContact({ number: m.el.querySelector('#aia-ic-num').value.trim(), label: m.el.querySelector('#aia-ic-label').value.trim() });
+        m.close(); toast('Added', 'success'); load();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+  });
+  await load();
+}
+
+// ── Playground (slide-over) ── //
+function _aiaTogglePlayground(open) {
+  const panel = document.getElementById('aia-pg'), tab = document.getElementById('aia-pg-tab');
+  if (!panel) return;
+  AIA.pg.open = open;
+  panel.hidden = !open;
+  tab.hidden = open;
+  tab.setAttribute('aria-expanded', String(open));
+  document.getElementById('aia-shell')?.classList.toggle('pg-open', open);
+  if (open) { _aiaPgRender(); setTimeout(() => document.getElementById('aia-pg-input')?.focus(), 30); }
+  else tab.focus();
+}
+function _aiaPgRender() {
+  const panel = document.getElementById('aia-pg');
+  if (!panel) return;
+  const pg = AIA.pg, d = AIA.draft || {};
+  const unsaved = Object.keys(AIA_FIELDS).some(k => _aiaDirty(k));
+  panel.innerHTML = `
+    <div class="aia-pg-head">
+      <div class="aia-pg-title">${aiIcon('robot')}<div><h2>Playground</h2><p>Chat as a customer with ${esc(d.agent_name || 'the agent')}.</p></div></div>
+      <button class="aia-icon-btn" id="aia-pg-reset" title="Clear conversation" aria-label="Clear conversation">${aiIcon('eraser')}</button>
+      <button class="aia-icon-btn" id="aia-pg-close" title="Close" aria-label="Close playground">${aiIcon('xmark')}</button>
+    </div>
+    <div class="aia-pg-note">${aiIcon('info')}<span>Uses your current settings${unsaved ? ' <b>including unsaved changes</b>' : ''}. Nothing is sent on WhatsApp and no tickets or notes are created. Operating hours, delay and snooze don’t apply here.</span></div>
+    <div class="aia-pg-msgs" id="aia-pg-msgs" aria-live="polite">
+      ${pg.messages.length ? '' : `<div class="aia-pg-empty">${aiIcon('message')}<p>Send a message the way a customer would, e.g. “Do you deliver on Sundays?”</p></div>`}
+      ${pg.messages.map(m => {
+        if (m.role === 'customer') return `<div class="aia-pg-msg me"><div class="aia-bubble out">${esc(m.text)}</div></div>`;
+        if (m.role === 'system') return `<div class="aia-pg-sys">${aiIcon(m.icon || 'ban')}<span>${esc(m.text)}</span></div>`;
+        const meta = m.meta || {};
+        return `<div class="aia-pg-msg"><div class="aia-bubble in">${esc(m.text)}</div>
+          <div class="aia-pg-meta">
+            ${meta.would_send === false ? `<span class="aia-tag warn">${aiIcon('sticky')}Draft only — sending is off</span>` : ''}
+            ${meta.known === false ? `<span class="aia-tag warn">${aiIcon('question')}Not in knowledge</span>` : ''}
+            ${(meta.knowledge || []).map(k => `<span class="aia-tag">${aiIcon('book')}${esc(k.title)}</span>`).join('')}
+            ${(meta.actions || []).map(a => a.type === 'create_ticket' ? `<span class="aia-tag ok">${aiIcon('ticket')}Would create ticket: ${esc(a.title)} (${esc(a.priority)})</span>`
+              : a.type === 'private_note' ? `<span class="aia-tag ok" title="${esc(a.content)}">${aiIcon('sticky')}Would add note: ${esc(a.content.slice(0, 80))}</span>`
+              : `<span class="aia-tag">${aiIcon('wrench')}Called ${esc(a.name)}${a.ok ? '' : ' (failed)'}</span>`).join('')}
+            ${meta.tokens ? `<span class="aia-muted">${_aiaFmtNum(meta.tokens)} tokens</span>` : ''}
+          </div></div>`;
+      }).join('')}
+      ${pg.busy ? `<div class="aia-pg-msg"><div class="aia-bubble in aia-typing"><i></i><i></i><i></i></div></div>` : ''}
+    </div>
+    <div class="aia-pg-foot">
+      <label class="aia-check"><input type="checkbox" id="aia-pg-rules" ${pg.rules ? 'checked' : ''}>Apply activation rules</label>
+      <div class="aia-pg-compose">
+        <textarea id="aia-pg-input" rows="1" placeholder="Type a customer message…" aria-label="Customer message" ${pg.busy ? 'disabled' : ''}></textarea>
+        <button class="btn btn-primary aia-pg-send" id="aia-pg-send" aria-label="Send" ${pg.busy ? 'disabled' : ''}>${aiIcon('paper')}</button>
+      </div>
+    </div>`;
+  const msgs = panel.querySelector('#aia-pg-msgs');
+  msgs.scrollTop = msgs.scrollHeight;
+  panel.querySelector('#aia-pg-close').addEventListener('click', () => _aiaTogglePlayground(false));
+  panel.querySelector('#aia-pg-reset').addEventListener('click', () => { pg.messages = []; _aiaPgRender(); });
+  panel.querySelector('#aia-pg-rules').addEventListener('change', e => { pg.rules = e.target.checked; });
+  const input = panel.querySelector('#aia-pg-input');
+  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(120, input.scrollHeight) + 'px'; });
+  input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _aiaPgSend(); } });
+  panel.querySelector('#aia-pg-send').addEventListener('click', _aiaPgSend);
+  panel.onkeydown = e => { if (e.key === 'Escape' && !document.querySelector('.aia-modal-ov')) _aiaTogglePlayground(false); };
+}
+async function _aiaPgSend() {
+  const pg = AIA.pg, input = document.getElementById('aia-pg-input');
+  const text = (input?.value || '').trim();
+  if (!text || pg.busy) return;
+  pg.messages.push({ role: 'customer', text });
+  pg.busy = true;
+  _aiaPgRender();
+  const settings = {};
+  Object.values(AIA_FIELDS).flat().forEach(k => { if (AIA.draft && k in AIA.draft) settings[k] = AIA.draft[k]; });
+  const history = pg.messages.filter(m => m.role === 'customer' || (m.role === 'agent' && m.text)).slice(-30)
+    .map(m => ({ role: m.role, text: m.text.slice(0, 4000) }));
+  try {
+    const r = await Api.ai.playground({ settings, messages: history, check_rules: pg.rules });
+    if (r.decision && !r.decision.should_respond) {
+      pg.messages.push({ role: 'system', icon: 'ban', text: `The agent would stay silent${r.decision.reason ? ': ' + r.decision.reason : ''} (activation rules).` });
+    } else if (!r.reply) {
+      pg.messages.push({ role: 'system', icon: 'ban', text: 'The agent chose not to reply.' });
+      if (r.actions?.length) pg.messages.push({ role: 'agent', text: '(no message)', meta: r });
+    } else {
+      pg.messages.push({ role: 'agent', text: r.reply, meta: r });
+    }
+  } catch (e) {
+    pg.messages.push({ role: 'system', icon: 'triangle', text: e.message || 'The AI service failed to respond.' });
+  }
+  pg.busy = false;
+  _aiaPgRender();
+}
+
+const AIA_RENDER = {
+  overview: _aiaRenderOverview,
+  activation: async page => {
+    try { AIA.phones = await Api.phones.list(); } catch (_) { AIA.phones = State.phones || []; }
+    _aiaRenderActivation(page);
+  },
+  personalization: _aiaRenderPersonalization,
+  knowledge: _aiaRenderKnowledge,
+  tools: _aiaRenderTools,
+  usage: _aiaRenderUsage,
+  training: _aiaRenderTraining,
+  analytics: _aiaRenderAnalytics,
+  logs: _aiaRenderLogs,
+  flagging: _aiaRenderFlagging,
+  internal: _aiaRenderInternal,
+};
+
+// Re-draw charts when the theme flips so they pick up the new colours
+new MutationObserver(() => {
+  if (State.currentView === 'ai-agent' && AIA.charts.length && (AIA.sub === 'usage' || AIA.sub === 'analytics')) renderAIAgent(AIA.sub);
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
 // ── AUTOMATION VIEW ─────────────────────────────────────────────── //
 async function renderAutomation() {
