@@ -132,6 +132,7 @@ def _settings_out(cfg, db: Session | None = None) -> dict:
     from app.models.ai_settings import (
         DEFAULT_ACTIVATION_RULES, PERSONALITIES, default_hours_schedule, required_steps_done,
     )
+    from app.services.business_time import business_tz
     sched = cfg.hours_schedule or None
     if not sched:
         sched = default_hours_schedule()
@@ -163,6 +164,7 @@ def _settings_out(cfg, db: Session | None = None) -> dict:
         "note_instructions": cfg.note_instructions or "",
         "flag_enabled": bool(cfg.flag_enabled),
         "flag_criteria": cfg.flag_criteria or "",
+        "timezone": business_tz().key,
     }
     if db is not None:
         out["setup"] = _setup_status(db, cfg)

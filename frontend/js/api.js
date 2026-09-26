@@ -16,10 +16,13 @@ const Api = (() => {
   }
 
   async function req(method, path, body, opts = {}) {
+    const isForm = typeof FormData !== 'undefined' && body instanceof FormData;
+    const h = headers(opts.headers || {});
+    if (isForm) delete h['Content-Type'];  // the browser sets the multipart boundary
     const r = await fetch(BASE + path, {
       method,
-      headers: headers(opts.headers || {}),
-      body: body != null ? JSON.stringify(body) : undefined,
+      headers: h,
+      body: isForm ? body : (body != null ? JSON.stringify(body) : undefined),
     });
     if (r.status === 401 && _token) { clearToken(); window.location.reload(); return; }
     if (r.status === 403) {
@@ -226,6 +229,37 @@ const Api = (() => {
     settings:      ()   => get('/ai/settings'),
     saveSettings:  (b)  => req('PUT', '/ai/settings', b),
     assistant:     (b)  => post('/ai/assistant', b),
+    playground:    (b)  => post('/ai/playground', b),
+    internalContacts:      ()   => get('/ai/internal-contacts'),
+    addInternalContact:    (b)  => post('/ai/internal-contacts', b),
+    importPhonesInternal:  ()   => post('/ai/internal-contacts/import-phones'),
+    deleteInternalContact: (id) => del(`/ai/internal-contacts/${id}`),
+    customTools:      ()      => get('/ai/custom-tools'),
+    createCustomTool: (b)     => post('/ai/custom-tools', b),
+    updateCustomTool: (id, b) => req('PUT', `/ai/custom-tools/${id}`, b),
+    deleteCustomTool: (id)    => del(`/ai/custom-tools/${id}`),
+    usage:     (q)  => get('/ai/usage', q),
+    analytics: (q)  => get('/ai/analytics', q),
+    runs:      (q)  => get('/ai/runs', q),
+    run:       (id) => get(`/ai/runs/${id}`),
+    generateSuggestions: () => post('/ai/self-training/generate'),
+  };
+
+  // AI knowledge base
+  const kb = {
+    list:     (q)       => get('/knowledge-base', q),
+    get:      (id)      => get(`/knowledge-base/${id}`),
+    create:   (b)       => post('/knowledge-base', b),
+    update:   (id, b)   => patch(`/knowledge-base/${id}`, b),
+    remove:   (id)      => del(`/knowledge-base/${id}`),
+    external: (b)       => post('/knowledge-base/external', b),
+    reindex:  ()        => post('/knowledge-base/reindex'),
+    upload:   (file, title) => {
+      const fd = new FormData();
+      fd.append('file', file, file.name);
+      if (title) fd.append('title', title);
+      return req('POST', '/knowledge-base/upload', fd);
+    },
   };
 
   // Activity logs
@@ -346,7 +380,7 @@ const Api = (() => {
   return {
     setToken, clearToken, getToken,
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
-    phones, analytics, automation, bulk, ai, search,
+    phones, analytics, automation, bulk, ai, kb, search,
     logs, groups, scheduled, exports: exportsApi,
     tasks, properties, org, media, developer,
   };
