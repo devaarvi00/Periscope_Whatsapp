@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Events our webhook subscribes to. group.v2.participants feeds the group
 # analytics (members joined / exited); reactions feed tickets + analytics.
-WEBHOOK_EVENTS = ["message.any", "message.reaction", "group.v2.participants", "session.status"]
+WEBHOOK_EVENTS = ["message.any", "message.reaction", "message.revoked", "group.v2.participants", "session.status"]
 
 
 class WAHAError(Exception):
