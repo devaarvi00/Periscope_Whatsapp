@@ -63,12 +63,32 @@ const Api = (() => {
       post('/auth/change-password', { current_password, new_password }),
     notificationPrefs:     ()      => get('/auth/me/notification-prefs'),
     saveNotificationPrefs: (prefs) => req('PUT', '/auth/me/notification-prefs', prefs),
+    uiPrefs:        ()          => get('/auth/me/preferences'),
+    saveUiPrefs:    (prefs)     => req('PUT', '/auth/me/preferences', prefs),
+    updateMe:       (b)         => patch('/auth/me', b),
+    team:           (inactive)  => get('/auth/agents', inactive ? { include_inactive: true } : undefined),
+    updateAgent:    (id, b)     => patch(`/auth/agents/${id}`, b),
   };
 
   // Organization (workspace identity for the sidebar switcher)
   const org = {
     get:    ()  => get('/org'),
     update: (b) => patch('/org', b),
+    uploadLogo: (dataUrl) => req('PUT', '/org/logo', { data_url: dataUrl }),
+    deleteLogo: ()  => del('/org/logo'),
+    // Logo bytes need the auth header, so they come back as a blob (null = none)
+    logoBlob: async () => {
+      const r = await fetch(BASE + '/org/logo', { headers: headers() });
+      if (!r.ok) return null;
+      return r.blob();
+    },
+    // 404 (older server) → null, meaning "no restrictions"
+    permissions: async () => {
+      const r = await fetch(BASE + '/org/permissions', { headers: headers() });
+      if (r.status === 401 && _token) { clearToken(); window.location.reload(); return null; }
+      if (!r.ok) return null;
+      return r.json();
+    },
   };
 
   // Inbox
@@ -115,7 +135,7 @@ const Api = (() => {
 
   // Labels
   const labels = {
-    list:   ()      => get('/labels'),
+    list:   (type)  => get('/labels', type ? { type } : undefined),
     create: (b)     => post('/labels', b),
     update: (id, b) => patch(`/labels/${id}`, b),
     del:    (id)    => del(`/labels/${id}`),
@@ -132,6 +152,7 @@ const Api = (() => {
   const quickReplies = {
     list:   ()      => get('/quick-replies'),
     create: (b)     => post('/quick-replies', b),
+    update: (id, b) => patch(`/quick-replies/${id}`, b),
     del:    (id)    => del(`/quick-replies/${id}`),
   };
 
@@ -307,6 +328,18 @@ const Api = (() => {
     chatActions: (q) => download('/exports/chat_actions.csv' + _exportQs(q ?? 30), 'chat_actions.csv'),
   };
 
+  // Developer API: API keys + outbound webhooks (admin only)
+  const developer = {
+    apiKeys:       ()      => get('/developer/api-keys'),
+    createApiKey:  (name)  => post('/developer/api-keys', { name }),
+    revokeApiKey:  (id)    => del(`/developer/api-keys/${id}`),
+    webhookEvents: ()      => get('/developer/webhook-events'),
+    webhooks:      ()      => get('/developer/webhooks'),
+    createWebhook: (b)     => post('/developer/webhooks', b),
+    testWebhook:   (id)    => post(`/developer/webhooks/${id}/test`),
+    deleteWebhook: (id)    => del(`/developer/webhooks/${id}`),
+  };
+
   // Search
   const search = (q) => get('/search', { q });
 
@@ -315,6 +348,6 @@ const Api = (() => {
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
     phones, analytics, automation, bulk, ai, search,
     logs, groups, scheduled, exports: exportsApi,
-    tasks, properties, org, media,
+    tasks, properties, org, media, developer,
   };
 })();

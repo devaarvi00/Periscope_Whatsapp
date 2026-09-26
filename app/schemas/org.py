@@ -6,8 +6,21 @@ class OrgOut(BaseModel):
     name: str
     support_email: str | None = None
     support_url: str | None = None
+    has_logo: bool = False
+    # Changes whenever the logo does — clients use it to cache-bust GET /org/logo
+    logo_version: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+# 512 KB of image → ~700 KB of base64
+ORG_LOGO_MAX_BYTES = 512 * 1024
+
+
+class OrgLogoUpload(BaseModel):
+    """PUT /org/logo — a data: URL (PNG or JPEG, <= 512 KB)."""
+
+    data_url: str = Field(max_length=ORG_LOGO_MAX_BYTES * 4 // 3 + 64)
 
 
 class OrgUpdate(BaseModel):

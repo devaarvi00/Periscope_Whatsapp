@@ -25,3 +25,6 @@ class Agent(Base, TimestampMixin):
     # JSON-encoded per-agent notification settings (see schemas.auth.NotificationPrefs);
     # NULL means "use defaults".
     notification_prefs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSON-encoded per-agent interface preferences (see schemas.auth.UiPrefs);
+    # NULL means "use defaults / whatever this browser has".
+    ui_prefs: Mapped[str | None] = mapped_column(Text, nullable=True)
