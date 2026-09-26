@@ -1144,6 +1144,13 @@ textarea{resize:vertical;min-height:80px;}
 .pill-urgent{background:#fef2f2;color:#9f1239;border:1px solid #fee2e2;}
 .pill-active{background:var(--accent-light);color:var(--accent-dark);border:1px solid var(--accent);}
 .pill-inactive{background:var(--surface-3);color:var(--text-3);border:1px solid var(--border);}
+:root[data-theme="dark"] .pill-open{background:rgba(59,130,246,.14);color:#93c5fd;border-color:rgba(59,130,246,.3);}
+:root[data-theme="dark"] .pill-in_progress{background:rgba(249,115,22,.14);color:#fdba74;border-color:rgba(249,115,22,.3);}
+:root[data-theme="dark"] .pill-resolved{border-color:rgba(34,197,94,.3);}
+:root[data-theme="dark"] .pill-low{background:rgba(34,197,94,.12);color:#86efac;border-color:rgba(34,197,94,.3);}
+:root[data-theme="dark"] .pill-medium{background:rgba(245,158,11,.14);color:#fcd34d;border-color:rgba(245,158,11,.3);}
+:root[data-theme="dark"] .pill-high{background:rgba(244,63,94,.14);color:#fda4af;border-color:rgba(244,63,94,.3);}
+:root[data-theme="dark"] .pill-urgent{background:rgba(239,68,68,.16);color:#fca5a5;border-color:rgba(239,68,68,.35);}
 
 /* ── Analytics ─────────────────────────────────────────────────── */
 .metrics-grid{
