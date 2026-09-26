@@ -105,6 +105,12 @@ const Api = (() => {
     create: (b)     => post('/contacts', b),
     update: (id, b) => patch(`/contacts/${id}`, b),
     del:    (id)    => del(`/contacts/${id}`),
+    sync:        ()          => post('/contacts/sync'),
+    picture:     (id)        => get(`/contacts/${id}/picture`),
+    addLabel:    (id, lid)   => post(`/contacts/${id}/labels/${lid}`),
+    removeLabel: (id, lid)   => del(`/contacts/${id}/labels/${lid}`),
+    bulkLabel:   (ids, label_id) => post('/contacts/bulk-label', { ids, label_id }),
+    bulkDelete:  (ids)       => post('/contacts/bulk-delete', { ids }),
   };
 
   // Labels

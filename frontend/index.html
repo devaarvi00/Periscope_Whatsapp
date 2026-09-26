@@ -21,10 +21,29 @@
 <link rel="stylesheet" href="/static/css/analytics.css?v=2">
 <link rel="stylesheet" href="/static/css/settings.css?v=1">
 <link rel="stylesheet" href="/static/css/settings-org.css?v=1">
-<link rel="stylesheet" href="/static/css/contacts.css?v=1">
+<link rel="stylesheet" href="/static/css/contacts.css?v=2">
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 </head>
 <body>
+
+<!-- BOOT LOADER (session restore / first view render) -->
+<div id="boot-loader" class="boot-loader" role="status" aria-live="polite" hidden>
+  <div class="boot-inner">
+    <div class="boot-logo" id="boot-logo">
+      <svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <circle cx="256" cy="256" r="256" fill="#15803D"/>
+        <path fill="#fff" d="M148 128h72v112h72V128h72v256h-72V304h-72v80h-72z"/>
+      </svg>
+    </div>
+    <p class="boot-text">Loading your workspace...</p>
+    <div class="boot-bar" aria-hidden="true"></div>
+    <p class="boot-slow" id="boot-slow" hidden>This is taking longer than usual.</p>
+    <button type="button" class="boot-logout" id="boot-logout">
+      Logout
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+    </button>
+  </div>
+</div>
 
 <!-- LOGIN SCREEN -->
 <div id="login-screen" class="login-screen">
@@ -356,10 +375,14 @@
 </div>
 
 <script>
+  // Pre-boot: with a saved token, show the workspace loader (not the login
+  // screen) until app.js has restored the session and rendered the first view
   (function() {
-    if (localStorage.getItem('token')) {
+    var t = null;
+    try { t = localStorage.getItem('token'); } catch (_) {}
+    if (t) {
       document.getElementById('login-screen').style.display = 'none';
-      document.getElementById('app-shell').style.display = 'flex';
+      document.getElementById('boot-loader').hidden = false;
     }
   })();
 </script>
@@ -413,8 +436,8 @@
 </div>
 
 <script src="/static/vendor/chartjs/chart.umd.js?v=4.4.7"></script>
-<script src="/static/js/api.js?v=43"></script>
-<script src="/static/js/app.js?v=50"></script>
+<script src="/static/js/api.js?v=44"></script>
+<script src="/static/js/app.js?v=51"></script>
 <script src="/static/js/settings-org.js?v=1"></script>
 </body>
 </html>

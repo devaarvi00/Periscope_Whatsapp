@@ -248,29 +248,89 @@ function formatAction(action) {
 
 // ── Auth ───────────────────────────────────────────────────────── //
 async function checkAuth() {
-  if (!Api.getToken()) { showLogin(); return; }
+  if (!Api.getToken()) { hideBootLoader(); showLogin(); return; }
+  showBootLoader();
   try {
     State.agent = await Api.auth.me();
-    showApp();
-  } catch(_) { showLogin(); }
+  } catch(_) { hideBootLoader(); showLogin(); return; }
+  await bootIntoApp();
 }
+
+// ── Boot loader: covers session restore / post-login until the first view renders ──
+const BOOT_SLOW_MS = 15000;
+let _bootSeq = 0, _bootSlowTimer = null;
+
+function showBootLoader() {
+  const el = document.getElementById('boot-loader');
+  if (!el) return;
+  el.hidden = false;
+  document.getElementById('login-screen').style.display = 'none';
+  const slow = document.getElementById('boot-slow');
+  if (slow) slow.hidden = true;
+  clearTimeout(_bootSlowTimer);
+  // Past 15s keep the loader, but say so (Logout stays available)
+  _bootSlowTimer = setTimeout(() => { if (slow && !el.hidden) slow.hidden = false; }, BOOT_SLOW_MS);
+}
+
+function hideBootLoader() {
+  clearTimeout(_bootSlowTimer);
+  const el = document.getElementById('boot-loader');
+  if (el) el.hidden = true;
+}
+
+// Org logo (when the workspace has one) replaces the default H mark
+function renderBootLogo() {
+  const box = document.getElementById('boot-logo');
+  const url = State.org?.logo_url;
+  if (!box || typeof url !== 'string' || !/^(https:\/\/|\/(?!\/))/.test(url) || box.querySelector('img')) return;
+  const img = new Image();
+  img.alt = '';
+  img.onload = () => { box.replaceChildren(img); box.classList.add('has-img'); };
+  img.src = url;
+}
+
+async function bootIntoApp() {
+  const seq = ++_bootSeq;
+  showBootLoader();
+  // Org first (bounded) so the sidebar + loader show the workspace identity
+  await Promise.race([loadOrg(), new Promise(r => setTimeout(r, 4000))]);
+  if (seq !== _bootSeq || !State.agent) return;
+  renderBootLogo();
+  try { await showApp({ orgLoaded: true }); } catch (_) {}
+  if (seq === _bootSeq && State.agent) hideBootLoader();
+}
+
+document.getElementById('boot-logout')?.addEventListener('click', () => {
+  _bootSeq++;          // abandon the in-flight boot
+  hideBootLoader();
+  logoutFn();
+});
 
 function showLogin() {
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('app-shell').style.display = 'none';
+  // Reset the sign-in button (it stays in its spinner state after a login)
+  const btn = document.getElementById('login-btn');
+  if (btn) btn.disabled = false;
+  const arrow = document.getElementById('login-btn-arrow');
+  const spinner = document.getElementById('login-btn-spinner');
+  if (arrow) arrow.style.display = 'inline';
+  if (spinner) spinner.style.display = 'none';
 }
 
-function showApp() {
+// Returns a promise that settles once the first view has rendered
+function showApp(opts = {}) {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app-shell').style.display = 'flex';
   renderAgent();
   const hashRoute = decodeURIComponent(location.hash.replace('#', ''));
-  navigateTo(_parseRoute(hashRoute) ? hashRoute : 'dashboard');
-  loadOrg();
+  const firstView = navigateTo(_parseRoute(hashRoute) ? hashRoute : 'dashboard');
+  if (!opts.orgLoaded) loadOrg();
   refreshUnreadBadge();
   loadLabels();
   loadPhones();
   connectWS();
+  return Promise.resolve(firstView);
 }
 
 function renderAgent() {
@@ -391,9 +451,7 @@ document.getElementById('login-form').addEventListener('submit', async e => {
     console.log('[login] response', res);
     Api.setToken(res.access_token);
     State.agent = { id: res.agent_id, name: res.name, email: res.email, role: res.role };
-    console.log('[login] calling showApp');
-    showApp();
-    console.log('[login] showApp done');
+    await bootIntoApp();
   } catch(err) {
     console.error('[login] error', err);
     errMsg.textContent    = err.message || 'Invalid email or password';
@@ -413,6 +471,9 @@ function logoutFn() {
   closeLabelPicker();
   closeWsMenu();
   closeModal();
+  ctClosePopover();
+  closeContactDrawer();
+  Object.assign(CT, { search: '', filters: { labels: [], type: '', hasPhone: '', phoneId: '' } });
   Api.clearToken();
   // Reset in-memory state so the next login starts clean
   Object.assign(State, {
@@ -783,7 +844,7 @@ function navigateTo(route) {
   const main = document.getElementById('main-content');
   if (!keepShell) main.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
   if (view === 'analytics') return renderAnalytics(r.sub);
-  ({
+  return ({
     dashboard:        renderDashboard,
     inbox:            renderInbox,
     tickets:          renderTickets,
@@ -4311,99 +4372,626 @@ async function showEditTicketModal(ticket) {
 }
 
 // ── CONTACTS VIEW ───────────────────────────────────────────────── //
+// Server-paged table (50/page, infinite scroll) with filters, bulk actions
+// and a details drawer. Styles: css/contacts.css (ct-*).
+const CT_PAGE = 50;
+const CT = {
+  items: [], total: 0, offset: 0, loading: false, done: false, seq: 0,
+  search: '', filters: { labels: [], type: '', hasPhone: '', phoneId: '' },
+  selected: new Set(), io: null, picIO: null, picQueue: [], picBusy: 0,
+};
+
+const CT_ICON = {
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+  filter: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="17" x2="14" y2="17"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  updown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="7 9 12 4 17 9"/><polyline points="7 15 12 20 17 15"/></svg>',
+  person: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="8.5" r="4"/><path d="M4 20.5c0-4.1 3.6-7 8-7s8 2.9 8 7z"/></svg>',
+  grid: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2"/></svg>',
+  lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>',
+  sync: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
+  download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M9 6V4h6v2"/></svg>',
+  tag: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>',
+  chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+};
+
+// "919726256851" → "+91 97262 56851"; masked / missing numbers never render digits
+function ctFormatPhone(num) {
+  if (!num) return '';
+  const d = String(num).replace(/\D/g, '');
+  if (!d) return '';
+  if (d.length === 12 && d.startsWith('91')) return `+91 ${d.slice(2, 7)} ${d.slice(7)}`;
+  if (d.length === 11 && d.startsWith('1')) return `+1 ${d.slice(1, 4)} ${d.slice(4, 7)} ${d.slice(7)}`;
+  if (d.length === 12 && d.startsWith('44')) return `+44 ${d.slice(2, 6)} ${d.slice(6)}`;
+  if (d.length === 11 && d.startsWith('971')) return `+971 ${d.slice(3, 5)} ${d.slice(5, 8)} ${d.slice(8)}`;
+  return '+' + d.replace(/(\d{3})(?=\d{4,})/g, '$1 ');
+}
+function ctIsMasked(c) { return c.phone_number === '***masked***'; }
+function ctDisplayName(c) {
+  return (c.name || '').trim() || (c.pushname || '').trim()
+    || (c.phone_number && !ctIsMasked(c) ? ctFormatPhone(c.phone_number) : '') || 'WhatsApp user';
+}
+
+function ctAvatarHTML(c, size = '') {
+  const url = c.picture_url;
+  return `<span class="ct-avatar ${size}" data-pic="${c.id}">${url
+    ? `<img src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">`
+    : ''}${CT_ICON.person}</span>`;
+}
+
+function ctPhoneHTML(c) {
+  if (ctIsMasked(c)) return `<span class="ct-masked" title="Number hidden by an admin">${CT_ICON.lock}Masked</span>`;
+  if (!c.phone_number) return '<span class="ct-dash">—</span>';
+  return `<span class="ct-phone">${esc(ctFormatPhone(c.phone_number))}</span>`;
+}
+
+function ctLabelsHTML(c, all = false) {
+  const labels = (c.labels || []).map(id => State.labels.find(l => l.id === id)).filter(Boolean);
+  const shown = all ? labels : labels.slice(0, 2);
+  const more = labels.length - shown.length;
+  const chips = shown.map(l =>
+    `<span class="ct-chip" style="--chip:${safeColor(l.color)}" title="${esc(l.name)}"><span class="ct-chip-dot"></span><span class="ct-chip-txt">${esc(l.name)}</span></span>`).join('');
+  const moreHTML = more > 0 ? `<span class="ct-more" title="${esc(labels.slice(2).map(l => l.name).join(', '))}">+${more}</span>` : '';
+  return `<div class="ct-labels">${chips}${moreHTML}<button type="button" class="ct-add-label" data-label="${c.id}"${chips ? ' title="Edit labels"' : ''}>${chips ? CT_ICON.plus : `${CT_ICON.plus}Label`}</button></div>`;
+}
+
+function ctTypeHTML(c) {
+  return c.is_internal
+    ? `<span class="ct-type ct-internal">${CT_ICON.grid}Internal</span>`
+    : `<span class="ct-type ct-external">${CT_ICON.grid}External</span>`;
+}
+
+function ctRowHTML(c) {
+  const sel = CT.selected.has(c.id);
+  return `<tr class="ct-row${sel ? ' is-selected' : ''}" data-cid="${c.id}">
+    <td class="ct-cb"><input type="checkbox" class="ct-check" data-cid="${c.id}" ${sel ? 'checked' : ''} aria-label="Select ${esc(ctDisplayName(c))}"></td>
+    <td><div class="ct-name-cell">${ctAvatarHTML(c)}<span class="ct-name" title="${esc(ctDisplayName(c))}">${esc(ctDisplayName(c))}</span></div></td>
+    <td>${ctPhoneHTML(c)}</td>
+    <td>${c.username ? esc(c.username) : '<span class="ct-dash">—</span>'}</td>
+    <td>${ctLabelsHTML(c)}</td>
+    <td>${c.pushname ? `<span class="ct-push" title="${esc(c.pushname)}">~ ${esc(c.pushname)}</span>` : '<span class="ct-dash">—</span>'}</td>
+    <td>${ctTypeHTML(c)}</td>
+  </tr>`;
+}
+
+function ctActiveFilterCount() {
+  const f = CT.filters;
+  return f.labels.length + (f.type ? 1 : 0) + (f.hasPhone ? 1 : 0) + (f.phoneId ? 1 : 0);
+}
+
+function ctQuery() {
+  const q = { limit: CT_PAGE, offset: CT.offset };
+  const f = CT.filters;
+  if (CT.search) q.search = CT.search;
+  if (f.labels.length) q.label_ids = f.labels.join(',');
+  if (f.type) q.type = f.type;
+  if (f.hasPhone) q.has_phone = f.hasPhone === 'yes';
+  if (f.phoneId) q.phone_id = f.phoneId;
+  return q;
+}
+
 async function renderContacts() {
   const main = document.getElementById('main-content');
+  CT.selected.clear();
+  const admin = isAdmin();
   main.innerHTML = `
-    <div class="flex-col h-full">
-      <div class="section-header">
-        <h2>Contacts</h2>
-        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem;align-items:center">
-          <div class="search-bar"><input type="search" id="contact-search" placeholder="Search…" style="width:200px"></div>
-          <button class="btn btn-primary btn-sm" id="new-contact-btn">+ New Contact</button>
+    <div class="ct-page">
+      <div class="ct-toolbar">
+        <label class="ct-search">${CT_ICON.search}
+          <input type="search" id="ct-search" placeholder="Search contacts..." value="${esc(CT.search)}" autocomplete="off">
+        </label>
+        <button type="button" class="ct-btn" id="ct-filter-btn" aria-haspopup="dialog">${CT_ICON.filter}<span>Filter</span><span class="ct-badge" id="ct-filter-count" hidden></span></button>
+        <span class="ct-count" id="ct-count"></span>
+        <div class="ct-toolbar-right">
+          <button type="button" class="ct-btn" id="ct-add-btn">${CT_ICON.plus}<span>Add contact</span></button>
+          <button type="button" class="ct-btn" id="ct-actions-btn" aria-haspopup="menu">Actions${CT_ICON.updown}</button>
         </div>
       </div>
-      <div class="list-container" id="contacts-list">
-        <div class="loading-center"><div class="spinner"></div></div>
+      <div class="ct-scroll" id="ct-scroll">
+        <table class="ct-table">
+          <thead><tr>
+            <th class="ct-cb"><input type="checkbox" id="ct-all" aria-label="Select all loaded contacts"></th>
+            <th>Contact Name</th><th>Phone</th><th>Username</th><th>Labels</th><th>WhatsApp Pushname</th><th>Internal / External</th>
+          </tr></thead>
+          <tbody id="ct-body"></tbody>
+        </table>
+        <div class="ct-foot" id="ct-foot"></div>
       </div>
     </div>`;
 
-  await loadContacts();
-  const debouncedLoad = debounce(loadContacts, 300);
-  document.getElementById('contact-search').addEventListener('input', e => {
-    State.contacts.search = e.target.value;
-    debouncedLoad();
+  const search = document.getElementById('ct-search');
+  const onSearch = debounce(() => { CT.search = search.value.trim(); ctReload(); }, 300);
+  search.addEventListener('input', onSearch);
+  document.getElementById('ct-filter-btn').addEventListener('click', e => { e.stopPropagation(); ctOpenFilter(e.currentTarget); });
+  document.getElementById('ct-actions-btn').addEventListener('click', e => { e.stopPropagation(); ctOpenActions(e.currentTarget, admin); });
+  document.getElementById('ct-add-btn').addEventListener('click', () => showContactModal());
+  document.getElementById('ct-all').addEventListener('change', e => {
+    CT.items.forEach(c => e.target.checked ? CT.selected.add(c.id) : CT.selected.delete(c.id));
+    document.querySelectorAll('#ct-body .ct-row').forEach(tr => {
+      tr.classList.toggle('is-selected', e.target.checked);
+      tr.querySelector('.ct-check').checked = e.target.checked;
+    });
+    ctUpdateSelection();
   });
-  document.getElementById('new-contact-btn').addEventListener('click', () => showContactModal());
+
+  const body = document.getElementById('ct-body');
+  body.addEventListener('click', e => {
+    const cb = e.target.closest('.ct-check');
+    if (cb) {
+      const id = +cb.dataset.cid;
+      cb.checked ? CT.selected.add(id) : CT.selected.delete(id);
+      cb.closest('tr').classList.toggle('is-selected', cb.checked);
+      ctUpdateSelection();
+      return;
+    }
+    if (e.target.closest('.ct-cb')) return;
+    const lb = e.target.closest('.ct-add-label');
+    if (lb) { e.stopPropagation(); ctPickLabels(lb, CT.items.find(c => c.id === +lb.dataset.label)); return; }
+    const tr = e.target.closest('.ct-row');
+    if (tr) openContactDrawer(+tr.dataset.cid);
+  });
+
+  if (!State.labels.length) await loadLabels();
+  ctUpdateFilterBadge();
+  await ctReload();
+}
+
+function ctUpdateFilterBadge() {
+  const n = ctActiveFilterCount();
+  const b = document.getElementById('ct-filter-count');
+  if (!b) return;
+  b.hidden = !n; b.textContent = n;
+  document.getElementById('ct-filter-btn')?.classList.toggle('is-active', !!n);
+}
+
+function ctUpdateSelection() {
+  const all = document.getElementById('ct-all');
+  if (all) {
+    const loaded = CT.items.filter(c => CT.selected.has(c.id)).length;
+    all.checked = !!CT.items.length && loaded === CT.items.length;
+    all.indeterminate = loaded > 0 && loaded < CT.items.length;
+  }
+  ctUpdateCount();
+}
+
+function ctUpdateCount() {
+  const el = document.getElementById('ct-count');
+  if (!el) return;
+  const n = CT.total.toLocaleString('en-IN');
+  el.textContent = CT.selected.size ? `${CT.selected.size} of ${n} selected` : `${n} contact${CT.total === 1 ? '' : 's'}`;
+}
+
+async function ctReload() {
+  CT.items = []; CT.offset = 0; CT.done = false; CT.loading = false;
+  CT.selected.clear();
+  const body = document.getElementById('ct-body');
+  if (body) body.innerHTML = '';
+  const scroll = document.getElementById('ct-scroll');
+  if (scroll) scroll.scrollTop = 0;
+  await ctLoadMore();
+}
+
+async function ctLoadMore() {
+  if (CT.loading || CT.done) return;
+  CT.loading = true;
+  const seq = ++CT.seq;
+  const foot = document.getElementById('ct-foot');
+  if (foot) foot.innerHTML = '<div class="ct-loading"><div class="spinner"></div></div>';
+  try {
+    const res = await Api.contacts.list(ctQuery());
+    if (seq !== CT.seq || State.currentView !== 'contacts') return;
+    const body = document.getElementById('ct-body');
+    if (!body) return;
+    CT.total = res.total;
+    CT.items.push(...res.items);
+    CT.offset += res.items.length;
+    CT.done = res.items.length < CT_PAGE || CT.offset >= res.total;
+    body.insertAdjacentHTML('beforeend', res.items.map(ctRowHTML).join(''));
+    ctObservePictures(body);
+    ctUpdateSelection();
+    ctRenderFoot();
+  } catch (e) {
+    if (seq !== CT.seq) return;
+    if (foot) foot.innerHTML = `<div class="ct-empty">Could not load contacts. <button type="button" class="ct-link" id="ct-retry">Retry</button></div>`;
+    document.getElementById('ct-retry')?.addEventListener('click', () => ctLoadMore());
+    toast(e.message || 'Failed to load contacts', 'error');
+  } finally {
+    if (seq === CT.seq) CT.loading = false;
+  }
+}
+
+function ctRenderFoot() {
+  const foot = document.getElementById('ct-foot');
+  if (!foot) return;
+  if (!CT.items.length) {
+    const filtered = CT.search || ctActiveFilterCount();
+    foot.innerHTML = `<div class="ct-empty">
+      <span class="ct-empty-ic">${CT_ICON.person}</span>
+      <strong>${filtered ? 'No contacts match' : 'No contacts yet'}</strong>
+      <span>${filtered ? 'Try a different search or clear the filters.'
+        : (isAdmin() ? 'Import them from your connected WhatsApp numbers.' : 'Ask an admin to sync contacts from WhatsApp.')}</span>
+      ${!filtered && isAdmin() ? `<button type="button" class="ct-btn ct-btn-primary" id="ct-empty-sync">${CT_ICON.sync}Sync from WhatsApp</button>` : ''}
+    </div>`;
+    document.getElementById('ct-empty-sync')?.addEventListener('click', ctSync);
+    return;
+  }
+  if (CT.done) { foot.innerHTML = ''; return; }
+  foot.innerHTML = '<div class="ct-sentinel" id="ct-sentinel"></div>';
+  if (CT.io) CT.io.disconnect();
+  CT.io = new IntersectionObserver(entries => {
+    if (entries.some(en => en.isIntersecting)) ctLoadMore();
+  }, { root: document.getElementById('ct-scroll'), rootMargin: '300px' });
+  CT.io.observe(document.getElementById('ct-sentinel'));
+}
+
+// Lazy WhatsApp profile pictures for rows scrolled into view (4 requests at a time)
+function ctObservePictures(body) {
+  if (!CT.picIO) {
+    CT.picIO = new IntersectionObserver(entries => {
+      entries.forEach(en => {
+        if (!en.isIntersecting) return;
+        CT.picIO.unobserve(en.target);
+        CT.picQueue.push(+en.target.dataset.pic);
+      });
+      ctPumpPictures();
+    }, { rootMargin: '200px' });
+  }
+  body.querySelectorAll('.ct-avatar[data-pic]:not([data-observed])').forEach(el => {
+    el.dataset.observed = '1';
+    const c = CT.items.find(x => x.id === +el.dataset.pic);
+    if (c && !c.picture_url && !ctIsMasked(c)) CT.picIO.observe(el);
+  });
+}
+
+function ctPumpPictures() {
+  while (CT.picBusy < 4 && CT.picQueue.length) {
+    const id = CT.picQueue.shift();
+    CT.picBusy++;
+    Api.contacts.picture(id).then(r => {
+      if (!r || !r.url) return;
+      const c = CT.items.find(x => x.id === id);
+      if (c) c.picture_url = r.url;
+      document.querySelectorAll(`.ct-avatar[data-pic="${id}"]`).forEach(el => {
+        if (el.querySelector('img')) return;
+        const img = document.createElement('img');
+        img.alt = ''; img.referrerPolicy = 'no-referrer'; img.src = r.url;
+        img.onerror = () => img.remove();
+        el.prepend(img);
+      });
+    }).catch(() => {}).finally(() => { CT.picBusy--; ctPumpPictures(); });
+  }
+}
+
+function ctReplaceRow(c) {
+  const i = CT.items.findIndex(x => x.id === c.id);
+  if (i >= 0) CT.items[i] = { ...CT.items[i], ...c };
+  const tr = document.querySelector(`#ct-body .ct-row[data-cid="${c.id}"]`);
+  if (tr && i >= 0) {
+    tr.outerHTML = ctRowHTML(CT.items[i]);
+    ctObservePictures(document.getElementById('ct-body'));
+  }
+}
+
+function ctPickLabels(anchor, contact, onChange) {
+  if (!contact) return;
+  openLabelPicker(anchor, {
+    applied: new Set(contact.labels || []),
+    onToggle: async (label, on) => {
+      if (on) await Api.contacts.addLabel(contact.id, label.id);
+      else await Api.contacts.removeLabel(contact.id, label.id);
+      const set = new Set(contact.labels || []);
+      on ? set.add(label.id) : set.delete(label.id);
+      contact.labels = [...set];
+      ctReplaceRow(contact);
+      if (onChange) onChange(contact);
+    },
+  });
+}
+
+// Small anchored popover (filter panel / actions menu); closes on outside click / Esc
+let _ctPop = null;
+function ctClosePopover() {
+  if (!_ctPop) return;
+  _ctPop.el.remove();
+  document.removeEventListener('click', _ctPop.outside, true);
+  document.removeEventListener('keydown', _ctPop.key);
+  _ctPop.anchor?.setAttribute('aria-expanded', 'false');
+  _ctPop = null;
+}
+function ctPopover(anchor, cls, html, align = 'left') {
+  const same = _ctPop && _ctPop.anchor === anchor;
+  ctClosePopover();
+  if (same) return null;
+  const el = document.createElement('div');
+  el.className = 'ct-pop ' + cls;
+  el.innerHTML = html;
+  document.body.appendChild(el);
+  const r = anchor.getBoundingClientRect();
+  const w = el.offsetWidth;
+  const left = align === 'right' ? r.right - w : r.left;
+  el.style.left = Math.max(8, Math.min(left, window.innerWidth - w - 8)) + 'px';
+  el.style.top = (r.bottom + 6) + 'px';
+  const outside = e => { if (!el.contains(e.target) && !anchor.contains(e.target) && !e.target.closest('.label-picker')) ctClosePopover(); };
+  const key = e => { if (e.key === 'Escape') { ctClosePopover(); anchor.focus(); } };
+  document.addEventListener('click', outside, true);
+  document.addEventListener('keydown', key);
+  anchor.setAttribute('aria-expanded', 'true');
+  _ctPop = { el, anchor, outside, key };
+  return el;
+}
+
+function ctOpenFilter(anchor) {
+  const f = CT.filters;
+  const phones = State.phones || [];
+  const labelRows = State.labels.length
+    ? State.labels.map(l => `<label class="ct-opt"><input type="checkbox" name="ctf-label" value="${l.id}" ${f.labels.includes(l.id) ? 'checked' : ''}>
+        <span class="ct-chip-dot" style="background:${safeColor(l.color)}"></span><span>${esc(l.name)}</span></label>`).join('')
+    : '<div class="ct-pop-empty">No labels yet</div>';
+  const radio = (name, val, label, cur) =>
+    `<label class="ct-seg-opt"><input type="radio" name="${name}" value="${val}" ${cur === val ? 'checked' : ''}><span>${label}</span></label>`;
+  const el = ctPopover(anchor, 'ct-filter', `
+    <div class="ct-pop-head"><strong>Filter contacts</strong><button type="button" class="ct-link" data-act="clear">Clear all</button></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Labels</div><div class="ct-pop-list">${labelRows}</div></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Internal / External</div>
+      <div class="ct-seg">${radio('ctf-type', '', 'All', f.type)}${radio('ctf-type', 'internal', 'Internal', f.type)}${radio('ctf-type', 'external', 'External', f.type)}</div></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Phone number</div>
+      <div class="ct-seg">${radio('ctf-phone', '', 'Any', f.hasPhone)}${radio('ctf-phone', 'yes', 'Has phone', f.hasPhone)}${radio('ctf-phone', 'no', 'No phone', f.hasPhone)}</div></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Chatted with our number</div>
+      <select id="ctf-our" class="ct-select"><option value="">Any number</option>${phones.map(p =>
+        `<option value="${p.id}" ${String(f.phoneId) === String(p.id) ? 'selected' : ''}>${esc(p.name || '')} · ${esc(ctFormatPhone(p.phone_number))}</option>`).join('')}</select></div>`);
+  if (!el) return;
+  const apply = () => {
+    f.labels = [...el.querySelectorAll('input[name="ctf-label"]:checked')].map(i => +i.value);
+    f.type = el.querySelector('input[name="ctf-type"]:checked')?.value || '';
+    f.hasPhone = el.querySelector('input[name="ctf-phone"]:checked')?.value || '';
+    f.phoneId = el.querySelector('#ctf-our').value;
+    ctUpdateFilterBadge();
+    ctReload();
+  };
+  el.addEventListener('change', apply);
+  el.querySelector('[data-act="clear"]').addEventListener('click', () => {
+    el.querySelectorAll('input[type="checkbox"]').forEach(i => { i.checked = false; });
+    el.querySelectorAll('input[type="radio"][value=""]').forEach(i => { i.checked = true; });
+    el.querySelector('#ctf-our').value = '';
+    apply();
+  });
+}
+
+function ctOpenActions(anchor, admin) {
+  const n = CT.selected.size;
+  const item = (act, icon, label, opts = {}) => `<button type="button" class="ct-menu-item${opts.danger ? ' is-danger' : ''}" data-act="${act}" role="menuitem" ${opts.disabled ? 'disabled' : ''} ${opts.title ? `title="${esc(opts.title)}"` : ''}>${icon}<span>${label}</span></button>`;
+  const adminOnly = admin ? {} : { disabled: true, title: 'Admins only' };
+  const el = ctPopover(anchor, 'ct-menu', `
+    ${item('sync', CT_ICON.sync, 'Sync from WhatsApp', adminOnly)}
+    ${item('export', CT_ICON.download, 'Export CSV', adminOnly)}
+    <div class="ct-menu-sep"></div>
+    ${item('label', CT_ICON.tag, `Add label to selected${n ? ` (${n})` : ''}`, n ? {} : { disabled: true, title: 'Select contacts first' })}
+    ${item('delete', CT_ICON.trash, `Delete selected${n ? ` (${n})` : ''}`, !admin ? adminOnly : (n ? { danger: true } : { disabled: true, danger: true, title: 'Select contacts first' }))}`, 'right');
+  if (!el) return;
+  el.setAttribute('role', 'menu');
+  el.addEventListener('click', async e => {
+    const b = e.target.closest('.ct-menu-item:not([disabled])');
+    if (!b) return;
+    const act = b.dataset.act;
+    if (act === 'label') { ctBulkLabel(anchor); return; }
+    ctClosePopover();
+    if (act === 'sync') ctSync();
+    else if (act === 'export') {
+      try { await Api.exports.contacts(); } catch (err) { toast(err.message, 'error'); }
+    } else if (act === 'delete') ctBulkDelete();
+  });
+}
+
+function ctBulkLabel(anchor) {
+  const ids = [...CT.selected];
+  ctClosePopover();
+  const applied = new Set();
+  openLabelPicker(anchor, {
+    applied,
+    onToggle: async (label, on) => {
+      if (!on) return;   // bulk: add only
+      const r = await Api.contacts.bulkLabel(ids, label.id);
+      CT.items.forEach(c => {
+        if (ids.includes(c.id) && !(c.labels || []).includes(label.id)) {
+          c.labels = [...(c.labels || []), label.id];
+          ctReplaceRow(c);
+        }
+      });
+      toast(`Label "${label.name}" added to ${r.added} contact${r.added === 1 ? '' : 's'}`, 'success');
+    },
+  });
+}
+
+async function ctBulkDelete() {
+  const ids = [...CT.selected];
+  if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} contact${ids.length === 1 ? '' : 's'}? Chats and messages are kept.`)) return;
+  try {
+    const r = await Api.contacts.bulkDelete(ids);
+    toast(`Deleted ${r.deleted} contact${r.deleted === 1 ? '' : 's'}`, 'success');
+    ctReload();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+let _ctSyncing = false;
+async function ctSync() {
+  if (_ctSyncing) return;
+  _ctSyncing = true;
+  toast('Syncing contacts from WhatsApp…');
+  try {
+    const r = await Api.contacts.sync();
+    const failed = Object.entries(r.phones || {}).filter(([k, v]) => k !== 'chats' && !v.ok).length;
+    toast(`Contacts synced: ${r.created} new, ${r.updated} updated${failed ? ` · ${failed} number${failed === 1 ? '' : 's'} offline (imported from chats)` : ''}`,
+      failed ? 'default' : 'success');
+    if (State.currentView === 'contacts') ctReload();
+  } catch (e) { toast(e.message || 'Sync failed', 'error'); }
+  finally { _ctSyncing = false; }
+}
+
+// ── Contact details drawer ──
+function closeContactDrawer() {
+  document.getElementById('ct-drawer-wrap')?.remove();
+  document.removeEventListener('keydown', _ctDrawerKey);
+}
+function _ctDrawerKey(e) { if (e.key === 'Escape' && !_labelPickerEl) closeContactDrawer(); }
+
+async function openContactDrawer(id) {
+  closeContactDrawer();
+  let c = CT.items.find(x => x.id === id);
+  const wrap = document.createElement('div');
+  wrap.id = 'ct-drawer-wrap';
+  wrap.className = 'ct-drawer-wrap';
+  wrap.innerHTML = `<div class="ct-drawer-scrim" data-close></div>
+    <aside class="ct-drawer" role="dialog" aria-modal="true" aria-labelledby="ct-dr-title"><div class="ct-loading"><div class="spinner"></div></div></aside>`;
+  document.body.appendChild(wrap);
+  document.addEventListener('keydown', _ctDrawerKey);
+  wrap.querySelector('[data-close]').addEventListener('click', closeContactDrawer);
+  try { c = { ...(c || {}), ...(await Api.contacts.get(id)) }; }
+  catch (e) { if (!c) { closeContactDrawer(); toast(e.message, 'error'); return; } }
+  if (!document.getElementById('ct-drawer-wrap')) return;
+  ctRenderDrawer(wrap.querySelector('.ct-drawer'), c);
+}
+
+function ctRenderDrawer(dr, c) {
+  const admin = isAdmin();
+  const props = Object.entries(c.custom_properties || {});
+  const fact = (k, v) => `<div class="ct-fact"><span>${k}</span><span>${v}</span></div>`;
+  const badges = [
+    c.is_my_contact ? '<span class="ct-tag">Saved contact</span>' : '',
+    c.is_business ? '<span class="ct-tag">Business</span>' : '',
+  ].join('');
+  dr.innerHTML = `
+    <div class="ct-dr-head">
+      ${ctAvatarHTML(c, 'lg')}
+      <div class="ct-dr-id">
+        <h3 id="ct-dr-title">${esc(ctDisplayName(c))}</h3>
+        <div class="ct-dr-sub">${ctPhoneHTML(c)} ${ctTypeHTML(c)}</div>
+      </div>
+      <button type="button" class="ct-icon-btn" data-close aria-label="Close">${CT_ICON.close}</button>
+    </div>
+    <div class="ct-dr-body">
+      <div class="ct-facts">
+        ${fact('WhatsApp pushname', c.pushname ? `~ ${esc(c.pushname)}` : '—')}
+        ${fact('Username', c.username ? esc(c.username) : '—')}
+        ${badges ? fact('WhatsApp', badges) : ''}
+        ${c.synced_at ? fact('Last synced', esc(parseServerDate(c.synced_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }))) : ''}
+      </div>
+      <div class="ct-dr-sec"><div class="ct-pop-title">Labels</div><div id="ct-dr-labels">${ctLabelsHTML(c, true)}</div></div>
+      <div class="ct-dr-sec ct-form">
+        <label>Name<input type="text" id="ctd-name" maxlength="255" value="${esc(c.name || '')}" placeholder="${esc(c.pushname || 'Contact name')}"></label>
+        <label>Email<input type="email" id="ctd-email" maxlength="255" value="${esc(c.email || '')}" placeholder="name@company.com"></label>
+        <label>Company<input type="text" id="ctd-company" maxlength="255" value="${esc(c.company || '')}"></label>
+        <label>Notes<textarea id="ctd-notes" rows="3" maxlength="5000" placeholder="Add a note about this contact">${esc(c.notes || '')}</textarea></label>
+        <div class="ct-props">
+          <div class="ct-pop-title">Custom properties</div>
+          <div id="ctd-props">${props.map(([k, v]) => ctPropRow(k, v)).join('')}</div>
+          <button type="button" class="ct-link" id="ctd-add-prop">${CT_ICON.plus}Add property</button>
+        </div>
+        ${admin ? `<label class="ct-inline"><input type="checkbox" id="ctd-masked" ${c.is_masked ? 'checked' : ''}> Mask this number for non-admins</label>` : ''}
+      </div>
+    </div>
+    <div class="ct-dr-foot">
+      ${admin ? `<button type="button" class="ct-btn ct-btn-danger-ghost" id="ctd-del">${CT_ICON.trash}Delete</button>` : ''}
+      <span style="flex:1"></span>
+      ${c.chat_id ? `<button type="button" class="ct-btn" id="ctd-chat">${CT_ICON.chat}Open chat</button>` : ''}
+      <button type="button" class="ct-btn ct-btn-primary" id="ctd-save">Save</button>
+    </div>`;
+  dr.querySelector('[data-close]').addEventListener('click', closeContactDrawer);
+  setTimeout(() => dr.querySelector('#ctd-name')?.focus(), 30);
+  const labelsBox = dr.querySelector('#ct-dr-labels');
+  labelsBox.addEventListener('click', e => {
+    const b = e.target.closest('.ct-add-label');
+    if (b) { e.stopPropagation(); ctPickLabels(b, c, cc => { labelsBox.innerHTML = ctLabelsHTML(cc, true); }); }
+  });
+  dr.querySelector('#ctd-add-prop').addEventListener('click', () => {
+    dr.querySelector('#ctd-props').insertAdjacentHTML('beforeend', ctPropRow('', ''));
+    dr.querySelector('#ctd-props .ct-prop:last-child input')?.focus();
+  });
+  dr.querySelector('#ctd-props').addEventListener('click', e => {
+    if (e.target.closest('.ct-prop-del')) e.target.closest('.ct-prop').remove();
+  });
+  dr.querySelector('#ctd-chat')?.addEventListener('click', () => {
+    const chatId = c.chat_id;
+    closeContactDrawer();
+    navigateTo('inbox');
+    Promise.resolve(_inboxReady).then(() => {
+      if (State.currentView !== 'inbox') return;
+      if (State.inbox.chats?.some(x => x.id === chatId)) openChat(chatId);
+      else toast('Chat not found in the current list', 'error');
+    });
+  });
+  dr.querySelector('#ctd-del')?.addEventListener('click', async () => {
+    if (!confirm(`Delete ${ctDisplayName(c)}? Chats and messages are kept.`)) return;
+    try {
+      await Api.contacts.del(c.id);
+      closeContactDrawer();
+      toast('Contact deleted', 'success');
+      ctReload();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  dr.querySelector('#ctd-save').addEventListener('click', async () => {
+    const custom = {};
+    dr.querySelectorAll('#ctd-props .ct-prop').forEach(row => {
+      const k = row.querySelector('.ct-prop-k').value.trim();
+      if (k) custom[k.slice(0, 100)] = row.querySelector('.ct-prop-v').value.slice(0, 1000);
+    });
+    const body = {
+      name: dr.querySelector('#ctd-name').value.trim(),
+      email: dr.querySelector('#ctd-email').value.trim(),
+      company: dr.querySelector('#ctd-company').value.trim(),
+      notes: dr.querySelector('#ctd-notes').value,
+      custom_properties: custom,
+    };
+    const masked = dr.querySelector('#ctd-masked');
+    if (masked) body.is_masked = masked.checked;
+    const btn = dr.querySelector('#ctd-save');
+    btn.disabled = true;
+    try {
+      const saved = await Api.contacts.update(c.id, body);
+      Object.assign(c, saved, { chat_id: c.chat_id, picture_url: c.picture_url || saved.picture_url });
+      ctReplaceRow(c);
+      toast('Contact saved', 'success');
+      closeContactDrawer();
+    } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+  });
+}
+
+function ctPropRow(k, v) {
+  return `<div class="ct-prop"><input class="ct-prop-k" type="text" maxlength="100" placeholder="Property" value="${esc(k)}">
+    <input class="ct-prop-v" type="text" maxlength="1000" placeholder="Value" value="${esc(v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : v)}">
+    <button type="button" class="ct-icon-btn ct-prop-del" aria-label="Remove property">${CT_ICON.close}</button></div>`;
 }
 
 function debounce(fn, ms) {
   let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
-let _contactsSeq = 0;
-async function loadContacts() {
-  const q = {};
-  if (State.contacts.search) q.search = State.contacts.search;
-  const seq = ++_contactsSeq;
-  try {
-    const list = await Api.contacts.list(q);
-    if (seq !== _contactsSeq) return;   // a newer search already started
-    State.contacts.list = list;
-    const el = document.getElementById('contacts-list');
-    if (!el) return;
-    if (!list.length) { el.innerHTML = `<div class="loading-center text-muted">No contacts</div>`; return; }
-    el.innerHTML = list.map(c => `
-      <div class="contact-card" data-cid="${c.id}">
-        <div class="contact-avatar">${initials(c.name||c.phone_number)}</div>
-        <div class="contact-info">
-          <div class="contact-name">${esc(c.name||'—')}</div>
-          <div class="contact-phone">${esc(c.phone_number)}</div>
-          ${c.company ? `<div class="contact-company">${esc(c.company)}</div>` : ''}
-        </div>
-        <div style="display:flex;gap:.35rem;margin-left:auto">
-          <button class="btn btn-ghost btn-sm contact-edit" data-cid="${c.id}">Edit</button>
-          <button class="btn btn-danger btn-sm contact-del icon-btn" data-cid="${c.id}" title="Delete contact"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button>
-        </div>
-      </div>`).join('');
-    el.querySelectorAll('.contact-edit').forEach(btn => {
-      btn.addEventListener('click', e => { e.stopPropagation(); showContactModal(list.find(c => c.id == btn.dataset.cid)); });
-    });
-    el.querySelectorAll('.contact-del').forEach(btn => {
-      btn.addEventListener('click', async e => {
-        e.stopPropagation();
-        if (!confirm('Delete contact?')) return;
-        try { await Api.contacts.del(btn.dataset.cid); toast('Deleted', 'success'); loadContacts(); }
-        catch(err) { toast(err.message, 'error'); }
-      });
-    });
-  } catch(e) {
-    if (seq !== _contactsSeq) return;
-    const el = document.getElementById('contacts-list');
-    if (el) el.innerHTML = `<div class="loading-center text-muted">Could not load contacts</div>`;
-    toast(e.message || 'Failed to load contacts', 'error');
-  }
-}
-
-function showContactModal(contact = null) {
-  const c = contact || {};
-  showModal(contact ? 'Edit Contact' : 'New Contact', `
-    <div class="form-group"><label>Name</label><input type="text" id="ct-name" value="${esc(c.name||'')}"></div>
-    <div class="form-group"><label>Phone Number *</label><input type="text" id="ct-phone" value="${esc(c.phone_number||'')}" ${contact?'readonly':''}></div>
-    <div class="form-group"><label>Email</label><input type="email" id="ct-email" value="${esc(c.email||'')}"></div>
-    <div class="form-group"><label>Company</label><input type="text" id="ct-company" value="${esc(c.company||'')}"></div>
+function showContactModal() {
+  showModal('Add contact', `
+    <div class="form-group"><label>Phone number *</label><input type="tel" id="ct-phone" placeholder="+91 97262 56851" autocomplete="off"></div>
+    <div class="form-group"><label>Name</label><input type="text" id="ct-name" maxlength="255"></div>
+    <div class="form-group"><label>Email</label><input type="email" id="ct-email" maxlength="255"></div>
+    <div class="form-group"><label>Company</label><input type="text" id="ct-company" maxlength="255"></div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="ct-save">Save</button>
+      <button class="btn btn-primary" id="ct-save">Add contact</button>
     </div>`);
+  setTimeout(() => document.getElementById('ct-phone')?.focus(), 30);
   document.getElementById('ct-save').addEventListener('click', async () => {
     const phone = document.getElementById('ct-phone').value.trim();
-    if (!phone) return toast('Phone required', 'error');
+    if (phone.replace(/\D/g, '').length < 7) return toast('Enter the phone number with country code', 'error');
     try {
-      const body = { phone_number: phone, name: document.getElementById('ct-name').value, email: document.getElementById('ct-email').value, company: document.getElementById('ct-company').value };
-      if (contact) await Api.contacts.update(contact.id, body);
-      else await Api.contacts.create(body);
-      closeModal(); toast(contact ? 'Updated' : 'Created', 'success'); loadContacts();
-    } catch(e) { toast(e.message, 'error'); }
+      await Api.contacts.create({
+        phone_number: phone,
+        name: document.getElementById('ct-name').value.trim(),
+        email: document.getElementById('ct-email').value.trim() || null,
+        company: document.getElementById('ct-company').value.trim() || null,
+      });
+      closeModal(); toast('Contact added', 'success');
+      if (State.currentView === 'contacts') ctReload();
+    } catch (e) { toast(e.message, 'error'); }
   });
 }
 
