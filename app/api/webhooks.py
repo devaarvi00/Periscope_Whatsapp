@@ -102,6 +102,15 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                 await inbox.update_chat(chat["id"], name=best_name)
                 chat["name"] = best_name
 
+        # Keep the contact book current from incoming 1:1 chats
+        if not from_me and not chat_wid.endswith("@g.us"):
+            try:
+                from app.services.contact_sync import upsert_contact_from_message
+                upsert_contact_from_message(db, chat_wid, msg_data.get("notifyName") or msg_data.get("pushName") or "")
+            except Exception as exc:
+                db.rollback()
+                logger.warning("Contact upsert from message failed for %s: %s", chat_wid, exc)
+
         body = msg_data.get("body") or msg_data.get("caption") or ""
         ts_raw = msg_data.get("timestamp")
         if isinstance(ts_raw, (int, float)):
