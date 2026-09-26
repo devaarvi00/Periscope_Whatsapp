@@ -22,6 +22,16 @@ window.SettingsPages = window.SettingsPages || {};
   const ico = (name, size = 16) => (typeof cxIcon === 'function' ? cxIcon(name, size) : '');
   const h = s => (typeof esc === 'function' ? esc(s) : String(s ?? ''));
   const say = (msg, type) => (typeof toast === 'function' ? toast(msg, type) : console.log(msg));
+  // Solid icons for these pages — Font Awesome Free 6.7.2 (CC BY 4.0)
+  const FA = {
+    cloudUp: ['0 0 640 512', 'M144 480C64.5 480 0 415.5 0 336c0-62.8 40.2-116.2 96.2-135.9c-.1-2.7-.2-5.4-.2-8.1c0-88.4 71.6-160 160-160c59.3 0 111 32.2 138.7 80.2C409.9 102 428.3 96 448 96c53 0 96 43 96 96c0 12.2-2.3 23.8-6.4 34.6C596 238.4 640 290.1 640 352c0 70.7-57.3 128-128 128l-368 0zm79-217c-9.4 9.4-9.4 24.6 0 33.9s24.6 9.4 33.9 0l39-39L296 392c0 13.3 10.7 24 24 24s24-10.7 24-24l0-134.1 39 39c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-80-80c-9.4-9.4-24.6-9.4-33.9 0l-80 80z'],
+    pen: ['0 0 512 512', 'M362.7 19.3L314.3 67.7 444.3 197.7l48.4-48.4c25-25 25-65.5 0-90.5L453.3 19.3c-25-25-65.5-25-90.5 0zm-71 71L58.6 323.5c-10.4 10.4-18 23.3-22.2 37.4L1 481.2C-1.5 489.7 .8 498.8 7 505s15.3 8.5 23.7 6.1l120.3-35.4c14.1-4.2 27-11.8 37.4-22.2L421.7 220.3 291.7 90.3z'],
+    usersSolid: ['0 0 640 512', 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM609.3 512l-137.8 0c5.4-9.4 8.6-20.3 8.6-32l0-8c0-60.7-27.1-115.2-69.8-151.8c2.4-.1 4.7-.2 7.1-.2l61.4 0C567.8 320 640 392.2 640 481.3c0 17-13.8 30.7-30.7 30.7zM432 256c-31 0-59-12.6-79.3-32.9C372.4 196.5 384 163.6 384 128c0-26.8-6.6-52.1-18.3-74.3C384.3 40.1 407.2 32 432 32c61.9 0 112 50.1 112 112s-50.1 112-112 112z'],
+    imageReg: ['0 0 512 512', 'M448 80c8.8 0 16 7.2 16 16l0 319.8-5-6.5-136-176c-4.5-5.9-11.6-9.3-19-9.3s-14.4 3.4-19 9.3L202 340.7l-30.5-42.7C167 291.7 159.8 288 152 288s-15 3.7-19.5 10.1l-80 112L48 416.3l0-.3L48 96c0-8.8 7.2-16 16-16l384 0zM64 32C28.7 32 0 60.7 0 96L0 416c0 35.3 28.7 64 64 64l384 0c35.3 0 64-28.7 64-64l0-320c0-35.3-28.7-64-64-64L64 32zm80 192a48 48 0 1 0 0-96 48 48 0 1 0 0 96z'],
+    fileReg: ['0 0 384 512', 'M64 464c-8.8 0-16-7.2-16-16L48 64c0-8.8 7.2-16 16-16l160 0 0 80c0 17.7 14.3 32 32 32l80 0 0 288c0 8.8-7.2 16-16 16L64 464zM64 0C28.7 0 0 28.7 0 64L0 448c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-293.5c0-17-6.7-33.3-18.7-45.3L274.7 18.7C262.7 6.7 246.5 0 229.5 0L64 0zm56 256c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0zm0 96c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0z'],
+  };
+  const fa = (name, size = 16) => FA[name]
+    ? `<svg class="so-fa" width="${size}" height="${size}" viewBox="${FA[name][0]}" fill="currentColor" aria-hidden="true"><path d="${FA[name][1]}"/></svg>` : '';
   const isAdmin = () => (typeof State !== 'undefined' && State.agent?.role === 'admin');
 
   // ── Local request helper (same error handling as api.js) ─────────── //
@@ -164,6 +174,10 @@ window.SettingsPages = window.SettingsPages || {};
   }
   function card(title, icon, body, extraHead = '') {
     return `<section class="so-card"><header class="so-card-h"><h2>${h(title)}</h2>${extraHead}<span class="so-ibox">${ico(icon, 15)}</span></header>${body}</section>`;
+  }
+  // Card whose header has a grey subtitle under the title (reference layout)
+  function cardSub(title, subtitle, iconHtml, body) {
+    return `<section class="so-card"><header class="so-card-h so-card-h2"><div class="so-card-ht"><h2>${h(title)}</h2><p>${h(subtitle)}</p></div><span class="so-ibox">${iconHtml}</span></header>${body}</section>`;
   }
   function toggle(id, on, disabled = false, label = '') {
     return `<label class="so-switch${disabled ? ' is-disabled' : ''}"><input type="checkbox" id="${id}" ${on ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="${h(label)}"><span></span></label>`;
@@ -384,17 +398,19 @@ window.SettingsPages = window.SettingsPages || {};
     try { perms = await get('/org/permissions'); window.OrgPermissions = perms; } catch (_) {}
     const canEdit = !!perms?.effective?.screens?.media_library;
     const st = { kind: 'media', search: '', seq: 0 };
-    el.innerHTML = `<div class="so-page">
-      ${pageHead(el, 'Media Library', 'Upload images, videos and documents once and reuse them across your team')}
-      <section class="so-card so-ml">
-        <div class="so-ml-bar">
-          <div class="so-seg" role="tablist">
-            <button class="so-seg-btn on" data-kind="media" role="tab">Media</button>
-            <button class="so-seg-btn" data-kind="doc" role="tab">Docs</button>
-          </div>
-          <div class="so-search">${ico('search', 14)}<input type="search" id="so-ml-q" placeholder="Search by file name" aria-label="Search by file name"></div>
-          ${canEdit ? `<button class="so-btn so-btn-primary" id="so-ml-up">${ico('plus', 14)} Upload</button><input type="file" id="so-ml-file" hidden multiple>` : ''}
+    el.innerHTML = `<div class="so-page so-page-wide">
+      ${pageHead(el, 'Media Library', 'Manage media for quick access across the workspace')}
+      <div class="so-ml-toolbar">
+        <div class="so-pills" role="tablist">
+          <button class="so-pill on" data-kind="media" role="tab" aria-selected="true">Media</button>
+          <button class="so-pill" data-kind="doc" role="tab" aria-selected="false">Docs</button>
         </div>
+        <div class="so-ml-right">
+          <div class="so-search so-search-sm">${ico('search', 13)}<input type="search" id="so-ml-q" placeholder="Search by file name" aria-label="Search by file name"></div>
+          ${canEdit ? `<button class="so-btn so-btn-primary so-btn-sm" id="so-ml-up">${fa('cloudUp', 14)} Upload</button><input type="file" id="so-ml-file" hidden multiple>` : ''}
+        </div>
+      </div>
+      <section class="so-card so-ml so-ml-box">
         <div class="so-ml-grid" id="so-ml-grid"></div>
       </section>
     </div>`;
@@ -409,16 +425,16 @@ window.SettingsPages = window.SettingsPages || {};
       } catch (err) { if (seq === st.seq) grid.innerHTML = `<div class="so-empty">${h(err.message)}</div>`; return; }
       if (seq !== st.seq) return;
       if (!items.length) {
-        grid.innerHTML = `<div class="so-empty so-ml-empty">${ico(st.kind === 'doc' ? 'doc' : 'image', 26)}<b>No ${st.kind === 'doc' ? 'documents' : 'media files'} found</b><span>${st.search ? 'Try a different file name' : (canEdit ? 'Upload files to get started' : 'Ask an admin to upload files')}</span></div>`;
+        grid.innerHTML = `<div class="so-ml-empty2">${fa(st.kind === 'doc' ? 'fileReg' : 'imageReg', 34)}<b>No ${st.kind === 'doc' ? 'documents' : 'media files'} found</b><span>${st.search ? 'Try a different file name' : (canEdit ? 'Upload files to get started' : 'Ask an admin to upload files')}</span></div>`;
         return;
       }
       grid.innerHTML = items.map(i => mediaTile(i, canEdit)).join('');
       hydratePreviews(grid);
     }
 
-    el.querySelectorAll('.so-seg-btn').forEach(b => b.addEventListener('click', () => {
+    el.querySelectorAll('.so-pill').forEach(b => b.addEventListener('click', () => {
       st.kind = b.dataset.kind;
-      el.querySelectorAll('.so-seg-btn').forEach(x => x.classList.toggle('on', x === b));
+      el.querySelectorAll('.so-pill').forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-selected', String(x === b)); });
       const f = el.querySelector('#so-ml-file'); if (f) f.accept = ACCEPT[st.kind];
       load();
     }));
@@ -507,19 +523,25 @@ window.SettingsPages = window.SettingsPages || {};
           <div class="so-desc">${t.description ? h(t.description) + ' · ' : ''}${t.participants.length} default participant${t.participants.length === 1 ? '' : 's'}${t.messages_admin_only ? ' · admins-only messages' : ''}${t.info_admin_only ? ' · admins-only info' : ''}</div></div>
         ${canEdit ? `<div class="so-ctl"><button class="so-icon-btn" data-edit="${t.id}" title="Edit" aria-label="Edit ${h(t.name)}">${ico('edit', 14)}</button><button class="so-icon-btn danger" data-del="${t.id}" title="Delete" aria-label="Delete ${h(t.name)}">${ico('trash', 14)}</button></div>` : ''}
       </div>`).join('')
-      : `<div class="so-empty so-tpl-empty">${ico('users', 24)}<b>No group templates yet</b><span>${canEdit ? 'Create a template with a description, default participants and admin-only settings.' : 'Ask an admin to create one.'}</span></div>`;
+      : `<div class="so-tpl-empty2">${fa('usersSolid', 40)}<b>No group templates yet</b><span>${canEdit ? 'Create a new template to get started' : 'Ask an admin to create one'}</span>${canEdit ? '<button class="so-btn so-tpl-new2" data-new="1">Create new Template</button>' : ''}</div>`;
 
     el.innerHTML = `<div class="so-page">
-      ${pageHead(el, 'Group Settings', 'Invite messages and reusable templates for WhatsApp groups')}
+      ${pageHead(el, 'Group Settings', 'Manage group invites and templates')}
       ${!canEdit ? readOnlyNote('Only admins can change group settings.') : ''}
-      ${card('Group Invites', 'link', `
-        ${row('Enable Custom Group Invite Message', 'Share invite links from a group’s Members tab with your own message instead of the bare link.', toggle('so-g-inv', g.invite_message_enabled, !canEdit, 'Custom Group Invite Message'))}
-        ${row('Invite Template', `<span class="so-clip" id="so-g-preview">${h(g.invite_template)}</span>`, `<button class="so-btn" id="so-g-edit" ${!canEdit ? 'disabled' : ''}>Edit Invite Template</button>`)}
-      `)}
-      ${card('Group Templates', 'users', `<div id="so-g-list">${tplList()}</div>`,
-        canEdit ? `<button class="so-btn so-btn-primary so-card-act" id="so-g-new">${ico('plus', 14)} Create new Template</button>` : '')}
+      ${cardSub('Group Invites', 'Personalize the group invite messages to participants', fa('usersSolid', 15), `
+        <div class="so-row so-row-stack">
+          <div class="so-row-t"><div class="so-label">Enable Custom Group Invite Message</div>
+            <div class="so-desc">When this option is enabled, a custom group invite message will be sent to invited participants.</div>
+            <button class="so-btn so-btn-sm so-edit-tpl" id="so-g-edit" ${!canEdit ? 'disabled' : ''}>${fa('pen', 11)} Edit Invite Template</button>
+          </div>
+          <div class="so-ctl">${toggle('so-g-inv', g.invite_message_enabled, !canEdit, 'Custom Group Invite Message')}</div>
+        </div>`)}
+      ${cardSub('Group Templates', 'Manage group templates for the workspace', fa('usersSolid', 15), `
+        <div class="so-tpl-body">
+          ${canEdit ? `<div class="so-tpl-actions"><button class="so-btn so-btn-primary so-btn-sm" id="so-g-new">Create new Template</button></div>` : ''}
+          <div id="so-g-list">${tplList()}</div>
+        </div>`)}
     </div>`;
-
     bindToggle(el, 'so-g-inv', v => patchConfig('groups', { invite_message_enabled: v }));
     el.querySelector('#so-g-edit')?.addEventListener('click', () => {
       const cur = window.OrgConfig?.groups?.invite_template ?? g.invite_template;
@@ -533,7 +555,6 @@ window.SettingsPages = window.SettingsPages || {};
         if (!v) return say('The invite template can’t be empty', 'error');
         try {
           await patchConfig('groups', { invite_template: v });
-          el.querySelector('#so-g-preview').textContent = v;
           closeModal(); say('Invite template saved', 'success');
         } catch (err) { say(err.message, 'error'); }
       });
@@ -566,6 +587,7 @@ window.SettingsPages = window.SettingsPages || {};
     };
     el.querySelector('#so-g-new')?.addEventListener('click', () => openForm(null));
     el.querySelector('#so-g-list').addEventListener('click', async e => {
+      if (e.target.closest('[data-new]')) return openForm(null);
       const ed = e.target.closest('[data-edit]'), dl = e.target.closest('[data-del]');
       if (ed) return openForm(templates.find(t => t.id == ed.dataset.edit));
       if (dl) {
