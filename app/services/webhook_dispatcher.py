@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -50,7 +51,13 @@ async def dispatch_event(event: str, data: dict[str, Any]) -> None:
 
         from app.services.url_safety import UnsafeURLError, assert_public_url
 
+        started = time.perf_counter()
+        deliveries: list[dict[str, Any]] = []  # → Logs → Webhooks logs (host only, no secrets)
         for endpoint in targets:
+            delivery: dict[str, Any] = {"endpoint_id": endpoint.id, "host": _host(endpoint.url),
+                                        "ok": False, "status_code": None, "attempts": 1}
+            deliveries.append(delivery)
+            t0 = time.perf_counter()
             # Re-validate at send time: DNS may have been re-pointed at an
             # internal address since the endpoint was saved (DNS rebinding).
             try:
@@ -58,6 +65,7 @@ async def dispatch_event(event: str, data: dict[str, Any]) -> None:
             except UnsafeURLError as exc:
                 endpoint.failure_count = (endpoint.failure_count or 0) + 1
                 logger.warning("Outbound webhook %s blocked: %s", endpoint.url, exc)
+                delivery["error"] = "Blocked: not a public address"
                 continue
             headers = {"Content-Type": "application/json", "X-Event": event}
             if endpoint.secret:
@@ -70,6 +78,8 @@ async def dispatch_event(event: str, data: dict[str, Any]) -> None:
                     endpoint.url, content=body, headers=headers,
                     follow_redirects=False,  # a redirect could bounce us to an internal host
                 )
+                delivery["status_code"] = resp.status_code
+                delivery["ok"] = bool(resp.is_success)
                 if not resp.is_success:
                     endpoint.failure_count = (endpoint.failure_count or 0) + 1
                     logger.warning(
@@ -79,8 +89,34 @@ async def dispatch_event(event: str, data: dict[str, Any]) -> None:
             except Exception as exc:
                 endpoint.failure_count = (endpoint.failure_count or 0) + 1
                 logger.warning("Outbound webhook %s failed: %s", endpoint.url, exc)
+                delivery["error"] = type(exc).__name__
+            finally:
+                delivery["duration_ms"] = int((time.perf_counter() - t0) * 1000)
         db.commit()
+        _log_dispatch(event, deliveries, int((time.perf_counter() - started) * 1000))
     except Exception as exc:
         logger.exception("Webhook dispatch error for %s: %s", event, exc)
     finally:
         db.close()
+
+
+def _host(url: str) -> str:
+    from urllib.parse import urlsplit
+    try:
+        return urlsplit(url).hostname or "?"
+    except ValueError:
+        return "?"
+
+
+def _log_dispatch(event: str, deliveries: list[dict[str, Any]], ms: int) -> None:
+    from app.services import operation_log as oplog
+    ok = sum(1 for d in deliveries if d["ok"])
+    codes = {d["status_code"] for d in deliveries if d.get("status_code") is not None}
+    oplog.record(
+        "webhook", event,
+        success=ok, failed=len(deliveries) - ok,
+        status_code=codes.pop() if len(codes) == 1 else None,
+        duration_ms=ms, performed_by="System",
+        details={"event": event, "endpoints": len(deliveries), "deliveries": deliveries,
+                 "retries": 0},
+    )

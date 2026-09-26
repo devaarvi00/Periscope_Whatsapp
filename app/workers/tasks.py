@@ -23,6 +23,9 @@ async def sync_phone_statuses() -> None:
         db.commit()
     finally:
         db.close()
+    # Piggyback: purge operation logs past the 7-day window (throttled to hourly)
+    from app.services.operation_log import cleanup
+    cleanup()
 
 
 async def check_sla_breaches() -> None:
@@ -114,9 +117,12 @@ async def check_no_reply_timeouts() -> None:
                 }
                 if not svc._matches_criteria(rule, context):
                     continue
-                taken = await svc._execute_actions(rule, context)
+                failures: list[str] = []
+                taken = await svc._execute_actions(rule, context, failures)
                 rule.runs_count = (rule.runs_count or 0) + 1
                 db.commit()
+                from app.services.automation_service import log_rule_run
+                log_rule_run(rule, "no_reply_timeout", context, taken, failures)
                 log_activity(
                     db, "no_reply_timeout_fired", entity_type="chat", entity_id=chat["id"],
                     description=f"Rule '{rule.name}' fired after {timeout_min}m without reply",
@@ -235,6 +241,7 @@ async def run_scheduled_messages() -> None:
                 item.status = "failed"
                 item.last_error = "Chat or phone missing"
                 db.commit()
+                _log_scheduled(item, chat_wid, ok=False, error="Chat or phone missing")
                 continue
 
             # Daily schedules restricted to specific weekdays: skip disallowed days
@@ -257,6 +264,7 @@ async def run_scheduled_messages() -> None:
                 item.last_error = str(exc)[:500]
                 logger.warning("Scheduled message %s send failed: %s", item.id, exc)
                 db.commit()
+                _log_scheduled(item, chat_wid, ok=False, error=str(exc))
                 continue
 
             # Step 2: Record the sent message in MongoDB
@@ -284,8 +292,27 @@ async def run_scheduled_messages() -> None:
                 item.send_at = nxt
             item.last_error = None
             db.commit()
+            _log_scheduled(item, chat_wid, ok=True)
     finally:
         db.close()
+
+
+def _log_scheduled(item, chat_wid: str | None, *, ok: bool, error: str | None = None) -> None:
+    """Logs → Scheduled logs: one row per scheduled-message send attempt."""
+    from app.services import operation_log as oplog
+    from app.services.operation_log import preview
+    oplog.record(
+        "scheduled", "Scheduled message" + (" (recurring)" if (item.repeat or "none") != "none" else ""),
+        success=1 if ok else 0, failed=0 if ok else 1,
+        performed_by_id=item.created_by, performed_by="Scheduler",
+        details={
+            "scheduled_message_id": item.id, "chat_id": item.chat_id, "chat": chat_wid,
+            "repeat": item.repeat, "sent_count": item.sent_count,
+            "next_send_at": item.send_at if item.status == "pending" else None,
+            "message_preview": preview(item.body),
+            "error": (error or "")[:300] or None,
+        },
+    )
 
 
 async def check_task_reminders() -> None:
