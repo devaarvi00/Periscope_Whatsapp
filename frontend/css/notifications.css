@@ -1,0 +1,69 @@
+/* ── Notification settings popover (topbar bell) ─────────────────────
+   Overrides the older .notif-popover rules in app.css; the id+class
+   selector wins regardless of load order. Theme comes from the CSS
+   variables, so dark mode needs no extra rules. */
+
+#notif-popover.notif-popover{
+  position:absolute;top:calc(100% + 8px);right:0;z-index:400;
+  width:280px;max-width:calc(100vw - 24px);
+  max-height:calc(100vh - 80px);overflow-y:auto;
+  background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:12px;
+  box-shadow:var(--shadow-lg);
+  padding:6px 0;
+}
+
+#notif-popover .np-section{padding:4px 0;}
+
+#notif-popover .np-heading{
+  padding:10px 16px 6px;
+  font-size:11px;font-weight:600;line-height:1.2;
+  letter-spacing:.08em;text-transform:uppercase;
+  color:var(--text-3);
+}
+
+#notif-popover .np-divider{height:1px;margin:4px 0;background:var(--border);}
+
+#notif-popover .np-row{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:9px 16px;
+  font-size:14px;line-height:1.3;color:var(--text);
+  cursor:pointer;user-select:none;
+  transition:background .12s;
+}
+#notif-popover .np-row:hover{background:var(--surface-2);}
+#notif-popover .np-label{flex:1;min-width:0;}
+
+/* Toggle switch: a real checkbox (role=switch) under a drawn track */
+#notif-popover .np-toggle{position:relative;flex-shrink:0;width:34px;height:20px;}
+#notif-popover .np-toggle input{
+  position:absolute;inset:0;width:100%;height:100%;margin:0;
+  opacity:0;cursor:pointer;z-index:1;
+}
+#notif-popover .np-track{
+  position:absolute;inset:0;border-radius:999px;
+  background:var(--surface-3);border:1px solid var(--border);
+  transition:background .15s,border-color .15s;
+}
+#notif-popover .np-track::before{
+  content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;
+  border-radius:50%;background:#fff;
+  box-shadow:0 1px 2px rgba(0,0,0,.25);
+  transition:transform .15s;
+}
+#notif-popover .np-toggle input:checked + .np-track{background:var(--accent);border-color:var(--accent);}
+#notif-popover .np-toggle input:checked + .np-track::before{transform:translateX(14px);}
+#notif-popover .np-toggle input:focus-visible + .np-track{outline:2px solid var(--accent);outline-offset:2px;}
+
+/* Type checkboxes */
+#notif-popover .np-checkbox{
+  flex-shrink:0;width:16px;height:16px;margin:0;
+  accent-color:var(--accent);cursor:pointer;
+}
+#notif-popover .np-checkbox:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+
+@media (prefers-reduced-motion: reduce){
+  #notif-popover .np-row,
+  #notif-popover .np-track,
+  #notif-popover .np-track::before{transition:none;}
+}

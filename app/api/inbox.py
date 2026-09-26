@@ -11,6 +11,10 @@ from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.phone import Phone
 from app.schemas.inbox import ChatUpdateRequest, SendMessageRequest
+from app.services.access import (
+    assert_phone_access, filter_accessible_chat_ids, get_accessible_chat,
+    mask_number, require_action, should_mask_numbers,
+)
 from app.services.activity_service import log_activity
 from app.services.automation_service import fire_trigger
 from app.services.mongo_chat_service import MongoInboxService, _serialize_chat, _serialize_message
@@ -30,12 +34,15 @@ async def list_chats(
     search: str | None = None,
     assigned_to: int | None = None,
     is_group: bool | None = None,
+    status: str | None = None,
     limit: int = 200,
     offset: int = 0,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
     from app.core.permissions import allowed_phone_ids
+    if phone_id is not None:
+        assert_phone_access(db, agent, phone_id)
     inbox = MongoInboxService()
     docs = await inbox.list_chats(
         phone_id=phone_id,
@@ -46,27 +53,80 @@ async def list_chats(
         search=search,
         assigned_to=assigned_to,
         is_group=is_group,
-        limit=limit,
-        offset=offset,
+        status=status,
+        limit=max(1, min(limit, 500)),
+        offset=max(0, offset),
     )
-    # Fetch last message from_me for each chat (for "awaiting reply" filter)
+    # last_message_from_me (for the "awaiting reply" filter) is maintained on
+    # the chat doc; only chats written before that field existed need a lookup.
+    mask = should_mask_numbers(db, agent)
     result = []
     for doc in docs:
         serialized = _serialize_chat(doc)
-        # Get last message sender for awaiting-reply filter
-        msgs = await inbox.get_messages(chat_id=doc["id"], limit=1)
-        serialized["last_message_from_me"] = msgs[0].get("from_me") if msgs else None
-        result.append(serialized)
+        if serialized.get("last_message_from_me") is None:
+            msgs = await inbox.get_messages(chat_id=doc["id"], limit=1)
+            serialized["last_message_from_me"] = msgs[0].get("from_me") if msgs else None
+        result.append(_mask_chat(serialized) if mask else serialized)
     return result
 
 
+# ── Org config hooks (Settings → Config / Permissions) ───────────────────── #
+
+def _mask_chat(chat: dict) -> dict:
+    """Hide personal numbers in a serialized chat ("Mask User Phone Numbers")."""
+    if chat.get("is_group"):
+        sender = chat.get("last_message_sender") or ""
+        if sender.isdigit():
+            chat["last_message_sender"] = mask_number(sender)
+        return chat
+    wid = chat.get("chat_wid") or ""
+    raw = wid.split("@")[0]
+    chat["chat_wid"] = mask_number(wid)
+    name = chat.get("name") or ""
+    if not name or name in (wid, raw, f"+{raw}") or "@" in name or name.lstrip("+").isdigit():
+        chat["name"] = mask_number(name.lstrip("+")) if name else ""
+    if (chat.get("last_message_sender") or "").lstrip("+").isdigit():
+        chat["last_message_sender"] = mask_number(chat["last_message_sender"].lstrip("+"))
+    return chat
+
+
+REVOKED_PLACEHOLDER = "🗑 This message was deleted"
+
+
+def _org_message_view(doc: dict, out: dict, *, show_deleted: bool, mask: bool,
+                      org_numbers: set[str]) -> dict:
+    """Add the org-config fields to a serialized message: stored translation,
+    revoked state (+ original text when "Show View Message Option On Deleted
+    Messages" is on), the quoted message id, and whether one of our other
+    numbers sent it (for "Display Active Phone Messages On The Right")."""
+    sender = doc.get("sender_number") or ""
+    out["from_org_phone"] = bool(out.get("from_me") or (sender and sender in org_numbers))
+    tr = doc.get("translation")
+    out["translation"] = tr if isinstance(tr, dict) and tr.get("text") else None
+    out["reply_to_wid"] = doc.get("reply_to_wid") or None
+    out["is_revoked"] = bool(doc.get("is_revoked"))
+    if out["is_revoked"]:
+        out["body"] = REVOKED_PLACEHOLDER
+        out["translation"] = None
+        out["revoked_body"] = (doc.get("revoked_body") or None) if show_deleted else None
+    if mask and sender:
+        out["sender_number"] = mask_number(sender)
+    return out
+
+
+def _org_numbers(db: Session) -> set[str]:
+    return {str(p[0]) for p in db.query(Phone.phone_number).all() if p[0]}
+
+
 @router.get("/chats/{chat_id}", response_model=dict)
-async def get_chat(chat_id: int):
-    inbox = MongoInboxService()
-    doc = await inbox.get_chat_by_id(chat_id)
-    if not doc:
-        raise HTTPException(404, "Chat not found")
-    return _serialize_chat(doc)
+async def get_chat(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    doc = await get_accessible_chat(db, agent, chat_id)
+    out = _serialize_chat(doc)
+    return _mask_chat(out) if should_mask_numbers(db, agent) else out
 
 
 @router.patch("/chats/{chat_id}")
@@ -78,18 +138,39 @@ async def update_chat(
     agent: Agent = Depends(get_current_agent),
 ):
     inbox = MongoInboxService()
-    prev = await inbox.get_chat_by_id(chat_id)
-    if not prev:
-        raise HTTPException(404, "Chat not found")
+    prev = await get_accessible_chat(db, agent, chat_id)
     prev_assigned = prev.get("assigned_to")
 
-    updates = req.model_dump(exclude_none=True)
+    # exclude_unset: only fields present in the body. `"assigned_to": null`
+    # therefore unassigns; other explicit nulls are ignored.
+    updates = req.model_dump(exclude_unset=True)
+    updates = {k: v for k, v in updates.items() if v is not None or k == "assigned_to"}
     if "ai_active" in updates:
         updates["ai_state"] = "ACTIVE" if updates["ai_active"] else "INACTIVE"
+    _check_chat_update_permissions(db, agent, updates, prev)
 
     await inbox.update_chat(chat_id, **updates)
 
-    if "assigned_to" in updates and updates["assigned_to"] != prev_assigned:
+    if "status" in updates and updates["status"] != (prev.get("status") or "open"):
+        log_activity(
+            db, "chat_resolved" if updates["status"] == "resolved" else "chat_reopened",
+            entity_type="chat", entity_id=chat_id, agent_id=agent.id,
+            description=f"Chat '{prev.get('name')}' marked {updates['status']}",
+        )
+
+    if "ai_flagging" in updates and updates["ai_flagging"] != (prev.get("ai_flagging") is not False):
+        log_activity(
+            db, "chat_ai_flagging", entity_type="chat", entity_id=chat_id, agent_id=agent.id,
+            description=f"AI flagging {'allowed' if updates['ai_flagging'] else 'turned off'} for '{prev.get('name')}'",
+        )
+
+    if "assigned_to" in updates and updates["assigned_to"] is None and prev_assigned is not None:
+        log_activity(
+            db, "chat_unassigned", entity_type="chat", entity_id=chat_id,
+            agent_id=agent.id,
+            description=f"Chat '{prev.get('name')}' unassigned",
+        )
+    elif "assigned_to" in updates and updates["assigned_to"] != prev_assigned:
         log_activity(
             db, "chat_assigned", entity_type="chat", entity_id=chat_id,
             agent_id=agent.id,
@@ -102,13 +183,161 @@ async def update_chat(
             "assigned_to": updates["assigned_to"],
             "is_group": prev.get("is_group"),
         })
+        await _notify_chat_assigned(prev, updates["assigned_to"], agent)
     return {"ok": True}
+
+
+def _check_chat_update_permissions(db: Session, agent: Agent, updates: dict, prev: dict | None) -> None:
+    """Settings → Permissions: archive/close and assign are org-controlled.
+    Only real changes are checked, so re-sending the current value is fine."""
+    prev = prev or {}
+    if ("is_archived" in updates and bool(updates["is_archived"]) != bool(prev.get("is_archived"))) or (
+        "status" in updates and updates["status"] != (prev.get("status") or "open")
+    ):
+        require_action(db, agent, "archive_chats")
+    if "assigned_to" in updates and updates["assigned_to"] != prev.get("assigned_to"):
+        require_action(db, agent, "assign")
+
+
+def _chat_display_name(chat: dict) -> str:
+    """Same rules as the frontend's displayName(): never leak raw WIDs."""
+    name = chat.get("name") or chat.get("chat_wid") or ""
+    if "@" not in name:
+        return name
+    ident, _, domain = name.partition("@")
+    if domain == "g.us":
+        return f"Group {ident[-6:]}"
+    if domain == "lid":
+        return "WhatsApp user"
+    return f"+{ident}" if ident.isdigit() and len(ident) >= 6 else ident
+
+
+async def _notify_chat_assigned(chat: dict, assignee_id: int | None, actor: Agent) -> None:
+    """Tell the new assignee (all their tabs) — never the agent who did it."""
+    if assignee_id is None or assignee_id == actor.id:
+        return
+    from app.core.ws_manager import ws_manager
+    await ws_manager.send_to_agent(assignee_id, "chat_assigned", {
+        "chat_id": chat["id"],
+        "chat_name": _chat_display_name(chat),
+        "by": actor.name,
+    })
+
+
+@router.get("/chats/{chat_id}/activity")
+async def chat_activity(
+    chat_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Activity-log entries for one chat (assignments, resolves, …), newest first."""
+    from app.models.activity_log import ActivityLog
+    await get_accessible_chat(db, agent, chat_id)
+    rows = (
+        db.query(ActivityLog)
+        .filter(ActivityLog.entity_type == "chat", ActivityLog.entity_id == chat_id)
+        .order_by(ActivityLog.id.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+    names = {a.id: a.name for a in db.query(Agent).all()}
+    return [{
+        "id": r.id,
+        "action": r.action,
+        "description": r.description or "",
+        "agent_name": names.get(r.agent_id, "") if r.agent_id else "",
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
+
+
+@router.get("/chats/{chat_id}/team")
+async def chat_team(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Active agents who can open this chat (admins, unrestricted agents and
+    agents granted its number), with live online state."""
+    from app.core.ws_manager import ws_manager
+    from app.models.agent_phone import AgentPhone
+    chat = await get_accessible_chat(db, agent, chat_id)
+    phone_id = chat.get("phone_id")
+    grants: dict[int, set[int]] = {}
+    for aid, pid in db.query(AgentPhone.agent_id, AgentPhone.phone_id).all():
+        grants.setdefault(aid, set()).add(pid)
+    online = ws_manager.online_agent_ids()
+    out = []
+    for a in db.query(Agent).filter(Agent.is_active.is_(True)).order_by(Agent.name).all():
+        role = getattr(a.role, "value", a.role)
+        if role != "admin" and a.id in grants and phone_id not in grants[a.id]:
+            continue
+        out.append({"id": a.id, "name": a.name, "role": role, "online": a.id in online})
+    return out
+
+
+@router.get("/chats/{chat_id}/picture")
+async def chat_picture(
+    chat_id: int,
+    refresh: bool = False,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Profile / group picture URL, looked up from WAHA at most once a day."""
+    from datetime import timedelta
+    chat = await get_accessible_chat(db, agent, chat_id)
+    checked = chat.get("picture_checked_at")
+    if not refresh and isinstance(checked, datetime) and datetime.utcnow() - checked < timedelta(hours=24):
+        return {"url": chat.get("picture_url") or None}
+    phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
+    if not phone or phone.waha_status != "WORKING":
+        return {"url": chat.get("picture_url") or None}
+    url = await WAHAService.from_phone(phone).get_chat_picture(chat["chat_wid"])
+    # Only WhatsApp's own CDN over https ever reaches an <img src>
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url or "")
+        ok = parts.scheme == "https" and (parts.hostname or "").endswith(".whatsapp.net")
+    except ValueError:
+        ok = False
+    url = url if ok else None
+    await MongoInboxService().update_chat(chat_id, picture_url=url or "", picture_checked_at=datetime.utcnow())
+    return {"url": url}
 
 
 @router.post("/chats/{chat_id}/read")
-async def mark_read(chat_id: int):
-    await MongoInboxService().mark_chat_read(chat_id)
-    return {"ok": True}
+async def mark_read(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Mark a chat read, per the agent's "Sync unread count" preference.
+
+    shared (default) – clear the team-wide unread count in Hyperscope only.
+    phone            – also send a WhatsApp read receipt (the phone's unread
+                       badge clears and the contact sees blue ticks).
+    personal         – leave the shared count and WhatsApp untouched; only this
+                       agent's own read marker (Mongo agent_chat_reads) is kept.
+    """
+    from app.api.auth import load_ui_prefs
+
+    chat = await get_accessible_chat(db, agent, chat_id)
+    mode = load_ui_prefs(agent).unread_sync or "shared"
+    inbox = MongoInboxService()
+    if mode == "personal":
+        await inbox.db.agent_chat_reads.update_one(
+            {"agent_id": agent.id, "chat_id": chat_id},
+            {"$set": {"read_at": datetime.utcnow()}},
+            upsert=True,
+        )
+        return {"ok": True, "mode": mode}
+    await inbox.mark_chat_read(chat_id)
+    if mode == "phone" and chat.get("chat_wid"):
+        phone = db.query(Phone).filter(Phone.id == chat.get("phone_id")).first()
+        if phone and phone.is_active:
+            # Best effort: send_seen swallows WAHA errors
+            await WAHAService.from_phone(phone).send_seen(chat["chat_wid"])
+    return {"ok": True, "mode": mode}
 
 
 @router.get("/chats/{chat_id}/messages", response_model=list[dict])
@@ -118,11 +347,11 @@ async def get_messages(
     before_id: int | None = None,
     before_ts: str | None = None,
     db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
 ):
     inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+    chat = await get_accessible_chat(db, agent, chat_id)
+    limit = max(1, min(limit, 200))
 
     msgs = await inbox.get_messages(
         chat_id=chat_id, limit=limit, before_id=before_id, before_ts=before_ts
@@ -140,7 +369,15 @@ async def get_messages(
             except Exception as exc:
                 logger.warning("Lazy-load messages failed for chat %d: %s", chat_id, exc)
 
-    return [_serialize_message(m) for m in msgs]
+    from app.models.org_config import get_org_config
+    cfg = get_org_config(db)["config"]
+    mask = should_mask_numbers(db, agent)
+    numbers = _org_numbers(db)
+    return [
+        _org_message_view(m, _serialize_message(m), show_deleted=bool(cfg.get("show_deleted_messages")),
+                          mask=mask, org_numbers=numbers)
+        for m in msgs
+    ]
 
 
 async def _store_waha_messages(
@@ -195,16 +432,27 @@ async def send_message(
     agent: Agent = Depends(get_current_agent),
 ):
     inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(req.chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+    chat = await get_accessible_chat(db, agent, req.chat_id)
 
-    phone = db.query(Phone).filter(Phone.id == (req.phone_id or chat["phone_id"])).first()
+    # Always send from the chat's own number when it exists; a client-supplied
+    # phone_id is only a fallback and must be one the agent may use.
+    phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
+    if not phone and req.phone_id is not None:
+        assert_phone_access(db, agent, req.phone_id)
+        phone = db.query(Phone).filter(Phone.id == req.phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
 
+    if req.media_url:
+        from app.services.url_safety import UnsafeURLError, assert_public_url
+        try:
+            await assert_public_url(req.media_url)
+        except UnsafeURLError as exc:
+            raise HTTPException(400, f"Invalid media_url: {exc}")
+
     from app.services.waha_service import SendResult
     import time
+    req.body = _with_sender_name(db, agent, req.body)
     if settings.environment == "development" and phone.waha_status != "WORKING":
         result = SendResult(message_id=f"mock_{int(time.time())}_{chat['id']}", raw={"status": "mock_sent"})
     else:
@@ -220,7 +468,8 @@ async def send_message(
             if settings.environment == "development":
                 result = SendResult(message_id=f"mock_{int(time.time())}_{chat['id']}", raw={"status": "mock_sent"})
             else:
-                raise HTTPException(500, f"Send failed: {exc}")
+                logger.exception("Send failed for chat %s: %s", chat["id"], exc)
+                raise HTTPException(502, "Failed to send message via WhatsApp")
 
     msg = await inbox.upsert_message({
         "chat_id": chat["id"],
@@ -262,13 +511,26 @@ async def send_message(
     return {"ok": True, "message_id": msg.get("id")}
 
 
+def _with_sender_name(db: Session, agent: Agent, body: str) -> str:
+    """Settings → Config → "Show Sender Names": prefix "*Agent*:\n" (WhatsApp
+    bold) to what the customer receives. Empty bodies (bare media) stay empty."""
+    from app.models.org_config import get_org_config
+    if not body or not get_org_config(db)["config"].get("show_sender_names"):
+        return body
+    name = (agent.name or "").strip().replace("*", "")
+    return f"*{name}*:\n{body}" if name else body
+
+
 @router.post("/chats/{chat_id}/sync-messages")
-async def sync_chat_messages(chat_id: int, limit: int = 50, db: Session = Depends(get_db)):
+async def sync_chat_messages(
+    chat_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     """Fetch recent messages from WAHA for a chat and save to MongoDB."""
     inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+    chat = await get_accessible_chat(db, agent, chat_id)
     phone = db.query(Phone).filter(Phone.id == chat["phone_id"]).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
@@ -299,15 +561,41 @@ async def bulk_update_chats(
 ):
     if not req.chat_ids:
         raise HTTPException(400, "No chats selected")
-    ids = req.chat_ids[:500]
+    ids = await filter_accessible_chat_ids(db, agent, req.chat_ids[:500])
+    if not ids:
+        raise HTTPException(404, "No accessible chats selected")
     inbox = MongoInboxService()
 
-    allowed = {"is_archived", "is_pinned", "ai_active", "is_flagged"}
+    allowed = {"is_archived", "is_pinned", "ai_active", "is_flagged", "status", "assigned_to"}
     updates = {k: v for k, v in (req.updates or {}).items() if k in allowed}
+    if "status" in updates and updates["status"] not in ("open", "resolved"):
+        raise HTTPException(400, "status must be 'open' or 'resolved'")
+    if "assigned_to" in updates and updates["assigned_to"] is not None:
+        try:
+            updates["assigned_to"] = int(updates["assigned_to"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "assigned_to must be an agent id or null")
     if "ai_active" in updates:
         updates["ai_state"] = "ACTIVE" if updates["ai_active"] else "INACTIVE"
+    if "is_archived" in updates or "status" in updates:
+        require_action(db, agent, "archive_chats")
+    if "assigned_to" in updates:
+        require_action(db, agent, "assign")
+    if req.add_label_id or req.remove_label_id:
+        require_action(db, agent, "update_labels")
+    # Snapshot previous assignees so only real changes notify
+    prev_chats: list[dict] = []
+    if "assigned_to" in updates:
+        prev_chats = await inbox.db.chats.find(
+            {"id": {"$in": ids}}, {"id": 1, "name": 1, "chat_wid": 1, "assigned_to": 1}
+        ).to_list(length=len(ids))
     if updates:
         await inbox.bulk_update_chats(ids, **updates)
+    if "assigned_to" in updates:
+        new_assignee = updates["assigned_to"]
+        for c in prev_chats:
+            if c.get("assigned_to") != new_assignee:
+                await _notify_chat_assigned(c, new_assignee, agent)
 
     if req.mark_read is True:
         await inbox.bulk_update_chats(ids, unread_count=0)
@@ -338,7 +626,11 @@ async def add_label(
     chat_id: int,
     label_id: int,
     background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
 ):
+    await get_accessible_chat(db, agent, chat_id)
+    require_action(db, agent, "update_labels")
     await MongoInboxService().add_label_to_chat(chat_id, label_id)
     background.add_task(fire_trigger, "label_added", {
         "chat_id": chat_id, "label_id": label_id, "source": "manual",
@@ -347,19 +639,31 @@ async def add_label(
 
 
 @router.delete("/chats/{chat_id}/labels/{label_id}")
-async def remove_label(chat_id: int, label_id: int):
+async def remove_label(
+    chat_id: int,
+    label_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    await get_accessible_chat(db, agent, chat_id)
+    require_action(db, agent, "update_labels")
     await MongoInboxService().remove_label_from_chat(chat_id, label_id)
     return {"ok": True}
 
 
 @router.post("/sync/{phone_id}")
-async def sync_chats(phone_id: int, db: Session = Depends(get_db)):
+async def sync_chats(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     """Pull all chats from WAHA and upsert into MongoDB for this phone."""
     from datetime import timezone as _tz
 
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
+    assert_phone_access(db, agent, phone.id)
 
     waha = WAHAService.from_phone(phone)
     chats = await waha.get_chats(limit=500)

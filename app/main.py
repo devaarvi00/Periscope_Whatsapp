@@ -16,6 +16,7 @@ from app.api.auth import router as auth_router
 from app.api.automation import router as automation_router
 from app.api.bulk_messaging import router as bulk_router
 from app.api.contacts import router as contacts_router
+from app.api.dashboard import router as dashboard_router
 from app.api.inbox import router as inbox_router
 from app.api.knowledge_base import router as kb_router
 from app.api.developer import router as developer_router
@@ -27,7 +28,10 @@ from app.api.public_api import router as public_api_router
 from app.api.tasks import router as tasks_router
 from app.api.labels import router as labels_router
 from app.api.logs import router as logs_router
+from app.api.media import router as media_router
 from app.api.notes import router as notes_router
+from app.api.org import router as org_router
+from app.api.org_config import router as org_config_router  # also installs screen guards
 from app.api.phones import router as phones_router
 from app.api.quick_replies import router as qr_router
 from app.api.search import router as search_router
@@ -39,6 +43,7 @@ from app.core.logging import configure_logging
 from app.core.ws_manager import ws_manager
 from app.db.init_db import init_db
 from app.db.session import get_db
+from app.services.analytics_service import analytics_startup
 
 _FRONTEND = Path(__file__).parent.parent / "frontend"
 logger = logging.getLogger(__name__)
@@ -74,9 +79,18 @@ async def _configure_waha_webhook() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging()
+    if not settings.is_production:
+        logger.warning(
+            "=" * 70 + "\n"
+            "ENVIRONMENT=%r (not 'production'). Development behaviours are active "
+            "(e.g. simulated sends, /docs enabled). Set ENVIRONMENT=production for "
+            "a real deployment.\n" + "=" * 70,
+            settings.environment,
+        )
     init_db()
     from app.db.mongo import init_mongo_indexes
     await init_mongo_indexes()
+    await analytics_startup()  # analytics indexes + agent presence tracking
     await http_client.startup()
     await _configure_waha_webhook()
 
@@ -114,10 +128,14 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Browsers reject credentialed CORS with a wildcard origin, and pairing them is
+# unsafe anyway; only send credentials when origins are explicitly listed.
+# (Auth uses a Bearer header, so the frontend does not need cookies.)
+_cors_wildcard = "*" in settings.allowed_origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_credentials=True,
+    allow_credentials=not _cors_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -144,6 +162,7 @@ app.include_router(notes_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(qr_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(bulk_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(analytics_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(dashboard_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(automation_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(ai_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(kb_router, prefix=PREFIX, dependencies=_auth)
@@ -155,29 +174,59 @@ app.include_router(groups_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(scheduled_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(tasks_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(properties_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(org_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(org_config_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(media_router, prefix=PREFIX, dependencies=_auth)
+
+
+WS_AUTH_TIMEOUT_SECONDS = 10
+WS_CLOSE_UNAUTHORIZED = 4001
+
+
+async def _receive_ws_auth_token(websocket: WebSocket) -> str | None:
+    """Wait for the first-message auth frame: {"type": "auth", "token": "<jwt>"}."""
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=WS_AUTH_TIMEOUT_SECONDS)
+        msg = json.loads(raw)
+    except (asyncio.TimeoutError, WebSocketDisconnect, ValueError, RuntimeError):
+        return None
+    if not isinstance(msg, dict) or msg.get("type") != "auth":
+        return None
+    token = msg.get("token")
+    return token if isinstance(token, str) and token else None
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = ""):
     """
     Authenticated WebSocket endpoint.
-    Client must pass ?token=<JWT> in the URL.
+
+    Preferred: connect without credentials in the URL, then send
+    {"type":"auth","token":"<JWT>"} as the first message within 10 s.
+    Legacy: ?token=<JWT> in the URL is still accepted (it leaks into proxy logs).
+    Failed auth closes the socket with code 4001.
     Heartbeat: server sends {"type":"ping"} every 25 s; client must reply {"type":"pong"}.
     """
     from app.core.security import decode_access_token
     from app.db.session import SessionLocal
     from app.models.agent import Agent
 
+    # Accept first so auth failures can be reported with a 4001 close code
+    # (closing before accept yields a bare HTTP 403 to the client).
+    await websocket.accept()
+
     # ── Authenticate ──────────────────────────────────────────────── #
+    if not token:
+        token = await _receive_ws_auth_token(websocket) or ""
     payload = decode_access_token(token) if token else None
     if not payload:
-        await websocket.close(code=4001, reason="Unauthorized")
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Unauthorized")
         return
 
     try:
         agent_id = int(payload.get("sub", 0))
     except (TypeError, ValueError):
-        await websocket.close(code=4001, reason="Invalid token")
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Invalid token")
         return
 
     db = SessionLocal()
@@ -187,10 +236,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
         db.close()
 
     if not agent:
-        await websocket.close(code=4001, reason="Agent not found")
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Agent not found")
         return
 
-    await ws_manager.connect(websocket, agent_id)
+    await ws_manager.connect(websocket, agent_id, accept=False)
 
     # ── Message loop with heartbeat ───────────────────────────────── #
     PING_INTERVAL = 25  # seconds
@@ -209,7 +258,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
 
             except asyncio.TimeoutError:
                 # No message received — send ping to check if client is alive
-                sent = await ws_manager._send(websocket, {"type": "ping"})
+                sent = await ws_manager.send(websocket, {"type": "ping"})
                 if not sent:
                     break
 
@@ -219,16 +268,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str = ""):
         ws_manager.disconnect(websocket, agent_id)
 
 
-@app.get("/health")
-async def health():
+def _check_mysql() -> None:
     db_gen = get_db()
     try:
         db = next(db_gen)
         db.execute(text("SELECT 1"))
-        return {"status": "ok", "app": settings.app_name}
-    except Exception:
-        from fastapi import HTTPException
-        raise HTTPException(503, "Database unavailable")
     finally:
         try:
             next(db_gen)
@@ -236,15 +280,38 @@ async def health():
             pass
 
 
+@app.get("/health")
+async def health():
+    from fastapi import HTTPException
+    from starlette.concurrency import run_in_threadpool
+
+    from app.db.mongo import get_mongo_db
+
+    try:
+        await run_in_threadpool(_check_mysql)
+    except Exception:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        await asyncio.wait_for(get_mongo_db().command("ping"), timeout=5)
+    except Exception:
+        raise HTTPException(503, "MongoDB unavailable")
+    return {"status": "ok", "app": settings.app_name}
+
+
 if _FRONTEND.is_dir():
     app.mount("/static", StaticFiles(directory=str(_FRONTEND)), name="static")
+
+
+# index.html must always be revalidated so browsers pick up new ?v= asset URLs
+# after a deploy; the versioned /static assets themselves can be cached.
+_INDEX_HEADERS = {"Cache-Control": "no-cache, must-revalidate"}
 
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
     index = _FRONTEND / "index.html"
     if index.exists():
-        return FileResponse(str(index))
+        return FileResponse(str(index), headers=_INDEX_HEADERS)
     return {"message": "Hyperscope WhatsApp CRM API", "docs": "/docs"}
 
 
@@ -252,6 +319,6 @@ async def serve_frontend():
 async def spa_fallback(path: str):
     index = _FRONTEND / "index.html"
     if index.exists() and not path.startswith("api/"):
-        return FileResponse(str(index))
+        return FileResponse(str(index), headers=_INDEX_HEADERS)
     from fastapi import HTTPException
     raise HTTPException(404, "Not found")

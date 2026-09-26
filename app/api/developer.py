@@ -1,8 +1,8 @@
 import hashlib
 import secrets as pysecrets
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_agent
@@ -10,7 +10,7 @@ from app.db.session import get_db
 from app.models.agent import Agent, AgentRole
 from app.models.api_key import ApiKey, WebhookEndpoint
 from app.services.activity_service import log_activity
-from app.services.webhook_dispatcher import WEBHOOK_EVENTS, dispatch_event
+from app.services.webhook_dispatcher import WEBHOOK_EVENTS
 
 router = APIRouter(prefix="/developer", tags=["developer"])
 
@@ -23,7 +23,7 @@ def _require_admin(agent: Agent) -> None:
 # ── API keys ──────────────────────────────────────────────────────────────────
 
 class ApiKeyCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=255)
 
 
 @router.get("/api-keys")
@@ -91,8 +91,8 @@ def revoke_api_key(
 # ── Outbound webhooks ─────────────────────────────────────────────────────────
 
 class WebhookCreate(BaseModel):
-    url: str
-    secret: str = ""
+    url: str = Field(min_length=1, max_length=1000)
+    secret: str = Field("", max_length=255)
     events: list[str] | None = None
 
 
@@ -125,13 +125,17 @@ def create_webhook(
     agent: Agent = Depends(get_current_agent),
 ):
     _require_admin(agent)
-    if not req.url.startswith(("http://", "https://")):
-        raise HTTPException(400, "URL must start with http:// or https://")
+    from app.services.url_safety import UnsafeURLError, check_public_url
+    try:
+        # Sync route → runs in the threadpool, so blocking DNS is fine here
+        url = check_public_url(req.url)
+    except UnsafeURLError as exc:
+        raise HTTPException(400, f"Invalid webhook URL: {exc}")
     invalid = [e for e in (req.events or []) if e not in WEBHOOK_EVENTS]
     if invalid:
         raise HTTPException(400, f"Unknown events: {invalid}")
     hook = WebhookEndpoint(
-        url=req.url, secret=req.secret, events=req.events, created_by=agent.id
+        url=url, secret=req.secret, events=req.events, created_by=agent.id
     )
     db.add(hook)
     db.commit()
@@ -146,18 +150,44 @@ def create_webhook(
 @router.post("/webhooks/{hook_id}/test")
 async def test_webhook(
     hook_id: int,
-    background: BackgroundTasks,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
+    """Send one signed test event to THIS endpoint only and report the result."""
+    import hmac
+    import json
+    from datetime import datetime
+
+    from app.core.http_client import get_http_client
+    from app.services.url_safety import UnsafeURLError, assert_public_url
+
     _require_admin(agent)
     hook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == hook_id).first()
     if not hook:
         raise HTTPException(404, "Webhook not found")
-    background.add_task(dispatch_event, "message.received", {
-        "test": True, "chat_id": 0, "body": "Test event from Hyperscope CRM",
+    body = json.dumps({
+        "event": "test",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "data": {"test": True, "body": "Test event from Hyperscope CRM"},
     })
-    return {"ok": True, "message": "Test event queued"}
+    headers = {"Content-Type": "application/json", "X-Event": "test"}
+    if hook.secret:
+        sig = hmac.new(hook.secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+        headers["X-Signature"] = f"sha256={sig}"
+    try:
+        await assert_public_url(hook.url)
+    except UnsafeURLError as exc:
+        return {"ok": False, "message": f"URL blocked: {exc}"}
+    try:
+        resp = await get_http_client().post(
+            hook.url, content=body, headers=headers, follow_redirects=False, timeout=10,
+        )
+    except Exception as exc:
+        return {"ok": False, "message": f"Request failed: {type(exc).__name__}"}
+    return {
+        "ok": resp.is_success, "status_code": resp.status_code,
+        "message": f"Endpoint answered HTTP {resp.status_code}",
+    }
 
 
 @router.delete("/webhooks/{hook_id}", status_code=204)

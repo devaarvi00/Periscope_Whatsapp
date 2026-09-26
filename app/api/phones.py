@@ -1,11 +1,14 @@
 from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import delete
 
 from app.core.config import settings
 from app.db.session import get_db
+from app.models.agent import Agent
 from app.models.phone import Phone
 from app.schemas.inbox import PhoneOut
+from app.services.access import assert_phone_access, is_admin, require_admin
 from app.services.waha_service import WAHAService
 from app.services.mongo_chat_service import MongoInboxService
 
@@ -24,11 +27,21 @@ def list_phones(db: Session = Depends(get_db), agent=Depends(_current_agent)):
     return q.all()
 
 
+def _get_phone(db: Session, phone_id: int, agent: Agent) -> Phone:
+    phone = db.query(Phone).filter(Phone.id == phone_id).first()
+    if not phone:
+        raise HTTPException(404, "Phone not found")
+    assert_phone_access(db, agent, phone.id)
+    return phone
 
 
 def _delete_phone_relations(db: Session, phone_id: int) -> None:
-    """Delete all MySQL rows that FK-reference a phone before deleting it."""
-    from sqlalchemy import text
+    """Delete all MySQL rows that FK-reference a phone before deleting it.
+
+    Runs inside the caller's transaction (no commit) so a failure rolls back
+    everything instead of leaving a half-deleted phone.
+    """
+    from sqlalchemy import inspect, text
     from app.models.agent_phone import AgentPhone as _AP
     from app.models.bulk_message_job import BulkMessageJob, BulkMessageLog
     from app.models.scheduled_message import ScheduledMessage
@@ -40,20 +53,82 @@ def _delete_phone_relations(db: Session, phone_id: int) -> None:
         db.execute(delete(BulkMessageJob).where(BulkMessageJob.phone_id == phone_id))
     db.execute(delete(_AP).where(_AP.phone_id == phone_id))
 
-    # Legacy MySQL tables: chats (and messages/chat_labels) still exist on disk even
-    # though data has been migrated to MongoDB. MySQL still enforces the FK constraint
-    # chats.phone_id → phones.id, so we must delete these rows before deleting the phone.
+    # Legacy MySQL tables (pre-MongoDB migration) may still exist on older
+    # installs with an FK chats.phone_id → phones.id. Only touch them if present.
+    insp = inspect(db.connection())
     pid = {"pid": phone_id}
-    db.execute(text("DELETE FROM messages WHERE phone_id = :pid"), pid)
-    db.execute(text("DELETE FROM chat_labels WHERE chat_id IN (SELECT id FROM chats WHERE phone_id = :pid)"), pid)
-    db.execute(text("DELETE FROM chats WHERE phone_id = :pid"), pid)
+    if insp.has_table("messages"):
+        db.execute(text("DELETE FROM messages WHERE phone_id = :pid"), pid)
+    if insp.has_table("chats"):
+        if insp.has_table("chat_labels"):
+            db.execute(text("DELETE FROM chat_labels WHERE chat_id IN (SELECT id FROM chats WHERE phone_id = :pid)"), pid)
+        db.execute(text("DELETE FROM chats WHERE phone_id = :pid"), pid)
+
+
+async def _absorb_conflicting_phone(db: Session, conflict: Phone, target_id: int) -> None:
+    """Move a stale phone record's Mongo data onto `target_id` and delete it.
+
+    MySQL rows are deleted and flushed first (inside the caller's transaction)
+    so FK problems surface before any MongoDB data is touched.
+    """
+    conflict_id = conflict.id
+    _delete_phone_relations(db, conflict_id)
+    db.flush()
+    db.delete(conflict)
+    db.flush()
+    inbox = MongoInboxService()
+    await inbox.db.chats.update_many({"phone_id": conflict_id}, {"$set": {"phone_id": target_id}})
+    await inbox.db.messages.update_many({"phone_id": conflict_id}, {"$set": {"phone_id": target_id}})
+
+
+def _number_from_me(me: dict | None) -> str:
+    """Digits of the linked WhatsApp account, e.g. {'id': '919510715498@c.us'} -> '919510715498'."""
+    wid = (me or {}).get("id") or ""
+    if isinstance(wid, dict):
+        wid = wid.get("_serialized") or wid.get("user") or ""
+    return "".join(ch for ch in str(wid).split("@")[0] if ch.isdigit())
+
+
+def unlink_phone_number(phone: Phone) -> bool:
+    """Session is logged out / waiting for a QR scan: stop showing the old number."""
+    if str(phone.phone_number or "").startswith("pending"):
+        return False
+    phone.phone_number = f"pending_{phone.session_name}"
+    return True
+
+
+async def link_phone_number(db: Session, phone: Phone, me: dict | None = None,
+                            allow_absorb: bool = True) -> bool:
+    """Store the number of the WhatsApp account actually linked to the session.
+
+    Called whenever the session is WORKING (right after a QR scan, on restarts),
+    so a re-scan with a different phone updates the record. Another phone row
+    already holding that number is merged into this one (admin/system only).
+    """
+    from app.api.webhooks import logger
+    if me is None:
+        me = await WAHAService.from_phone(phone).get_me()
+    number = _number_from_me(me)
+    if not number or number == phone.phone_number:
+        return False
+    conflict = db.query(Phone).filter(Phone.phone_number == number, Phone.id != phone.id).first()
+    if conflict:
+        if not allow_absorb:
+            return False
+        logger.info("Phone %s now owns number %s; merging stale phone record %s",
+                    phone.id, number, conflict.id)
+        await _absorb_conflicting_phone(db, conflict, phone.id)
+    phone.phone_number = number
+    return True
 
 
 @router.get("/{phone_id}/status")
-async def get_status(phone_id: int, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+async def get_status(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    phone = _get_phone(db, phone_id, agent)
     waha = WAHAService.from_phone(phone)
     try:
         status = await waha.get_session_status()
@@ -63,48 +138,36 @@ async def get_status(phone_id: int, db: Session = Depends(get_db)):
         status = "OFFLINE"
     phone.waha_status = status
 
-    # Auto-resolve stale "pending_*" placeholder when WAHA is connected
-    if status == "WORKING" and str(phone.phone_number or "").startswith("pending"):
-        try:
-            me = await waha.get_me()
-            number = me.get("id", "").split("@")[0] if me.get("id") else ""
-            if number:
-                conflict = db.query(Phone).filter(
-                    Phone.phone_number == number, Phone.id != phone.id
-                ).first()
-                if conflict:
-                    # Re-parent MongoDB chats/messages from conflict → this phone
-                    inbox = MongoInboxService()
-                    await inbox.db.chats.update_many(
-                        {"phone_id": conflict.id}, {"$set": {"phone_id": phone.id}}
-                    )
-                    await inbox.db.messages.update_many(
-                        {"phone_id": conflict.id}, {"$set": {"phone_id": phone.id}}
-                    )
-                    # Delete all FK rows before deleting the phone row
-                    _delete_phone_relations(db, conflict.id)
-                    db.flush()
-                    db.delete(conflict)
-                    db.flush()
-                phone.phone_number = number
-        except Exception as exc:
-            from app.api.webhooks import logger
-            logger.warning("Failed to resolve conflict phone during get_status: %s", exc)
-            db.rollback()
-            db.add(phone)  # re-attach phone to session after rollback
+    # Keep the stored number in step with the account actually linked to the
+    # session: set it once WORKING (after a QR scan), clear it when the session
+    # needs a new scan. Merging another phone record is admin-only.
+    try:
+        if status == "WORKING":
+            await link_phone_number(db, phone, allow_absorb=is_admin(agent))
+        elif status == "SCAN_QR_CODE":
+            unlink_phone_number(phone)
+    except Exception as exc:
+        from app.api.webhooks import logger
+        logger.warning("Failed to sync linked number for phone %s: %s", phone.session_name, exc)
+        db.rollback()
+        phone = db.query(Phone).filter(Phone.id == phone_id).first()
+        if phone:
+            phone.waha_status = status
 
     try:
         db.commit()
     except Exception:
         db.rollback()
-    return {"phone_id": phone_id, "status": status, "phone_number": phone.phone_number}
+    return {"phone_id": phone_id, "status": status, "phone_number": phone.phone_number if phone else None}
 
 
 @router.get("/{phone_id}/qr")
-async def get_qr(phone_id: int, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+async def get_qr(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    phone = _get_phone(db, phone_id, agent)
     waha = WAHAService.from_phone(phone)
     try:
         qr = await waha.get_qr()
@@ -116,10 +179,13 @@ async def get_qr(phone_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{phone_id}/start")
-async def start_session(phone_id: int, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+async def start_session(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    require_admin(agent, "Only admins can start WhatsApp sessions")
+    phone = _get_phone(db, phone_id, agent)
     waha = WAHAService.from_phone(phone)
     try:
         await waha.ensure_session_exists(settings.waha_webhook_url, settings.waha_webhook_secret)
@@ -134,10 +200,13 @@ async def start_session(phone_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{phone_id}/logout")
-async def logout_session(phone_id: int, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+async def logout_session(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    require_admin(agent, "Only admins can log out WhatsApp sessions")
+    phone = _get_phone(db, phone_id, agent)
     waha = WAHAService.from_phone(phone)
     try:
         ok = await waha.logout_session()
@@ -146,6 +215,7 @@ async def logout_session(phone_id: int, db: Session = Depends(get_db)):
         logger.warning("Failed to logout WAHA session %s: %s", phone.session_name, exc)
         ok = False
     phone.waha_status = "STOPPED"
+    unlink_phone_number(phone)   # the account is no longer linked
     db.commit()
     from app.core.ws_manager import ws_manager
     await ws_manager.broadcast("phone_status_changed", {"phone_id": phone.id, "status": "STOPPED"})
@@ -154,10 +224,13 @@ async def logout_session(phone_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{phone_id}/stop")
-async def stop_session(phone_id: int, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+async def stop_session(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    require_admin(agent, "Only admins can stop WhatsApp sessions")
+    phone = _get_phone(db, phone_id, agent)
     waha = WAHAService.from_phone(phone)
     try:
         ok = await waha.stop_session()
@@ -169,10 +242,13 @@ async def stop_session(phone_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{phone_id}/restart")
-async def restart_session(phone_id: int, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+async def restart_session(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    require_admin(agent, "Only admins can restart WhatsApp sessions")
+    phone = _get_phone(db, phone_id, agent)
     waha = WAHAService.from_phone(phone)
     try:
         ok = await waha.restart_session()
@@ -186,11 +262,14 @@ async def restart_session(phone_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{phone_id}/clear-data")
-async def clear_phone_data(phone_id: int, db: Session = Depends(get_db)):
+async def clear_phone_data(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
     """Delete all synced WhatsApp chats and messages for this phone from MongoDB."""
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+    require_admin(agent, "Only admins can clear phone data")
+    _get_phone(db, phone_id, agent)
 
     inbox = MongoInboxService()
     await inbox.delete_phone_data(phone_id)
@@ -204,7 +283,9 @@ async def clear_phone_data(phone_id: int, db: Session = Depends(get_db)):
 async def auto_connect(
     req: dict = Body(default={}),
     db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
 ):
+    require_admin(agent, "Only admins can connect WhatsApp numbers")
     session_name = settings.waha_session_name
     display_name = str(req.get("name") or "").strip() or "My WhatsApp"
     phone = db.query(Phone).filter(Phone.session_name == session_name).first()
@@ -246,82 +327,102 @@ async def auto_connect(
 
 
 @router.post("/{phone_id}/sync-number")
-async def sync_phone_number(phone_id: int, db: Session = Depends(get_db)):
+async def sync_phone_number(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
     """After QR scan: fetch real phone number from WAHA and update the record."""
     from app.api.webhooks import logger
 
+    require_admin(agent, "Only admins can re-sync phone numbers")
+    phone = _get_phone(db, phone_id, agent)
+    waha = WAHAService.from_phone(phone)
+    try:
+        status = await waha.get_session_status()
+        if status == "WORKING":
+            await link_phone_number(db, phone)
+        elif status == "SCAN_QR_CODE":
+            unlink_phone_number(phone)
+        phone.waha_status = status
+        db.commit()
+    except Exception as exc:
+        logger.warning("Failed to sync phone number for phone %s: %s", phone.session_name, exc)
+        db.rollback()
     phone = db.query(Phone).filter(Phone.id == phone_id).first()
     if not phone:
         raise HTTPException(404, "Phone not found")
-    waha = WAHAService.from_phone(phone)
-    try:
-        me = await waha.get_me()
-        number = me.get("id", "").split("@")[0] if me.get("id") else ""
-        if number:
-            conflict = db.query(Phone).filter(
-                Phone.phone_number == number, Phone.id != phone_id,
-            ).first()
-            if conflict:
-                logger.info(
-                    "Removing stale phone record %s (session=%s) — number %s now claimed by phone %s",
-                    conflict.id, conflict.session_name, number, phone_id,
-                )
-                inbox = MongoInboxService()
-                await inbox.db.chats.update_many(
-                    {"phone_id": conflict.id}, {"$set": {"phone_id": phone_id}}
-                )
-                await inbox.db.messages.update_many(
-                    {"phone_id": conflict.id}, {"$set": {"phone_id": phone_id}}
-                )
-                # Delete all FK rows before deleting the phone row
-                _delete_phone_relations(db, conflict.id)
-                db.flush()
-                db.delete(conflict)
-                db.flush()
-            phone.phone_number = number
-        status = await waha.get_session_status()
-        phone.waha_status = status
-    except Exception as exc:
-        logger.warning("Failed to sync phone number for phone %s: %s", phone.session_name, exc)
-        status = "OFFLINE"
-    db.commit()
-    db.refresh(phone)
     return {"phone_id": phone_id, "phone_number": phone.phone_number, "status": phone.waha_status}
 
 
+class PhoneUpdate(BaseModel):
+    name: str | None = None
+    waha_base_url: str | None = None
+    waha_api_key: str | None = None
+
+
 @router.patch("/{phone_id}", response_model=PhoneOut)
-def update_phone(phone_id: int, req: dict, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
-    allowed = {"name", "waha_base_url", "waha_api_key"}
-    for k, v in req.items():
-        if k in allowed and hasattr(phone, k):
-            setattr(phone, k, v or None)
+def update_phone(
+    phone_id: int,
+    req: PhoneUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    require_admin(agent, "Only admins can edit WhatsApp number settings")
+    phone = _get_phone(db, phone_id, agent)
+    changes = req.model_dump(exclude_unset=True)
+    if changes.get("waha_base_url"):
+        from app.services.url_safety import UnsafeURLError, validate_waha_base_url
+        try:
+            changes["waha_base_url"] = validate_waha_base_url(changes["waha_base_url"])
+        except UnsafeURLError as exc:
+            raise HTTPException(400, f"Invalid WAHA URL: {exc}")
+    for k, v in changes.items():
+        v = v.strip() if isinstance(v, str) else v
+        if k == "name":
+            if v:
+                phone.name = v
+            continue
+        if k == "waha_api_key" and v == "":
+            # The key is never returned to clients, so a blank form field
+            # means "keep the current key". Send null to clear it.
+            continue
+        setattr(phone, k, v or None)
     db.commit()
     db.refresh(phone)
     return phone
 
 
 @router.delete("/{phone_id}", status_code=204)
-async def delete_phone(phone_id: int, db: Session = Depends(get_db)):
-    phone = db.query(Phone).filter(Phone.id == phone_id).first()
-    if not phone:
-        raise HTTPException(404, "Phone not found")
+async def delete_phone(
+    phone_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(_current_agent),
+):
+    require_admin(agent, "Only admins can delete WhatsApp numbers")
+    phone = _get_phone(db, phone_id, agent)
+    waha = WAHAService.from_phone(phone)
 
-    # Stop + delete the WAHA session
+    # 1. MySQL rows first, flushed but not committed — FK errors abort here,
+    #    before anything irreversible (Mongo data / WAHA session) is touched.
     try:
-        waha = WAHAService.from_phone(phone)
+        _delete_phone_relations(db, phone_id)
+        db.flush()
+        db.delete(phone)
+        db.flush()
+    except Exception:
+        db.rollback()
+        from app.api.webhooks import logger
+        logger.exception("Failed to delete phone %s", phone_id)
+        raise HTTPException(409, "Could not delete this number; nothing was removed")
+
+    # 2. MongoDB chats + messages for this phone, then commit MySQL
+    inbox = MongoInboxService()
+    await inbox.delete_phone_data(phone_id)
+    db.commit()
+
+    # 3. Stop + delete the WAHA session (best-effort)
+    try:
         await waha.delete_waha_session()
     except Exception:
         pass
-
-    # Delete MongoDB chats + messages for this phone
-    inbox = MongoInboxService()
-    await inbox.delete_phone_data(phone_id)
-
-    # Clean up all MySQL rows that FK-reference this phone (scheduled, bulk, agent, legacy chats)
-    _delete_phone_relations(db, phone_id)
-    db.flush()
-    db.delete(phone)
-    db.commit()

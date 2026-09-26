@@ -99,6 +99,8 @@ desktop.ini
 # ── Uploads / Media ────────────────────────────────────────────────
 uploads/
 media/
+# Media library uploads (MEDIA_LIBRARY_DIR default)
+data/
 static/uploads/
 
 # ── Temporary files ────────────────────────────────────────────────

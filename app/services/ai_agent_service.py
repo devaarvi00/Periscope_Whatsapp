@@ -26,10 +26,12 @@ class AIAgentService:
             chat["ai_state"] = state
 
     def _within_operating_hours(self, cfg) -> bool:
+        """Operating hours are wall-clock times in the business timezone
+        (BUSINESS_TIMEZONE, default Asia/Kolkata), not the server's zone."""
         if not cfg.hours_start or not cfg.hours_end:
             return True
-        from datetime import datetime
-        now = datetime.now().strftime("%H:%M")
+        from app.services.business_time import business_now
+        now = business_now().strftime("%H:%M")
         if cfg.hours_start <= cfg.hours_end:
             return cfg.hours_start <= now <= cfg.hours_end
         return now >= cfg.hours_start or now <= cfg.hours_end
@@ -79,6 +81,16 @@ class AIAgentService:
 
             if cfg.response_delay_seconds:
                 import asyncio
+                # Release the pooled DB connection while we wait — holding it
+                # for up to 5 minutes per chat exhausts the pool. Ending the
+                # transaction returns the connection; the session checks out a
+                # new one on its next query. Objects stay attached and readable
+                # (expire_on_commit=False), unlike close() which detaches them
+                # from the caller's session.
+                try:
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
                 await asyncio.sleep(min(cfg.response_delay_seconds, 300))
                 # Re-fetch chat state after delay
                 from app.services.mongo_chat_service import MongoInboxService

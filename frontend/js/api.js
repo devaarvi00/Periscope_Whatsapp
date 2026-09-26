@@ -1,5 +1,6 @@
 /* ── Hyperscope API Client ──────────────────────────────────────── */
 const BASE = '/api/v1';
+const FORBIDDEN_MSG = "You don't have permission to do this — ask an admin.";
 
 const Api = (() => {
   let _token = localStorage.getItem('token') || null;
@@ -21,6 +22,11 @@ const Api = (() => {
       body: body != null ? JSON.stringify(body) : undefined,
     });
     if (r.status === 401 && _token) { clearToken(); window.location.reload(); return; }
+    if (r.status === 403) {
+      const err = new Error(FORBIDDEN_MSG);
+      err.status = 403;
+      throw err;
+    }
     if (!r.ok) {
       let msg = 'Request failed';
       try {
@@ -53,12 +59,41 @@ const Api = (() => {
     register: (data)            => post('/auth/register', data),
     agentPhones:    (id)        => get(`/auth/agents/${id}/phones`),
     setAgentPhones: (id, ids)   => req('PUT', `/auth/agents/${id}/phones`, ids),
+    changePassword: (current_password, new_password) =>
+      post('/auth/change-password', { current_password, new_password }),
+    notificationPrefs:     ()      => get('/auth/me/notification-prefs'),
+    saveNotificationPrefs: (prefs) => req('PUT', '/auth/me/notification-prefs', prefs),
+    uiPrefs:        ()          => get('/auth/me/preferences'),
+    saveUiPrefs:    (prefs)     => req('PUT', '/auth/me/preferences', prefs),
+    updateMe:       (b)         => patch('/auth/me', b),
+    team:           (inactive)  => get('/auth/agents', inactive ? { include_inactive: true } : undefined),
+    updateAgent:    (id, b)     => patch(`/auth/agents/${id}`, b),
+  };
+
+  // Organization (workspace identity for the sidebar switcher)
+  const org = {
+    get:    ()  => get('/org'),
+    update: (b) => patch('/org', b),
+    uploadLogo: (dataUrl) => req('PUT', '/org/logo', { data_url: dataUrl }),
+    deleteLogo: ()  => del('/org/logo'),
+    // Logo bytes need the auth header, so they come back as a blob (null = none)
+    logoBlob: async () => {
+      const r = await fetch(BASE + '/org/logo', { headers: headers() });
+      if (!r.ok) return null;
+      return r.blob();
+    },
+    // 404 (older server) → null, meaning "no restrictions"
+    permissions: async () => {
+      const r = await fetch(BASE + '/org/permissions', { headers: headers() });
+      if (r.status === 401 && _token) { clearToken(); window.location.reload(); return null; }
+      if (!r.ok) return null;
+      return r.json();
+    },
   };
 
   // Inbox
   const inbox = {
     chats:      (q)     => get('/inbox/chats', q),
-    chat:       (id)    => get(`/inbox/chats/${id}`),
     updateChat: (id, b) => patch(`/inbox/chats/${id}`, b),
     markRead:   (id)    => post(`/inbox/chats/${id}/read`),
     messages:   (id, q) => get(`/inbox/chats/${id}/messages`, q),
@@ -68,18 +103,19 @@ const Api = (() => {
     sync:          (pid)  => post(`/inbox/sync/${pid}`),
     syncMessages:  (cid, limit) => post(`/inbox/chats/${cid}/sync-messages${limit ? '?limit=' + limit : ''}`),
     bulkUpdate:    (b)    => post('/inbox/bulk-update', b),
+    getChat:       (id)   => get(`/inbox/chats/${id}`),
+    activity:      (id)   => get(`/inbox/chats/${id}/activity`),
+    picture:       (id)   => get(`/inbox/chats/${id}/picture`),
+    team:          (id)   => get(`/inbox/chats/${id}/team`),
   };
 
   // Tickets
   const tickets = {
     list:   (q)     => get('/tickets', q),
-    get:    (id)    => get(`/tickets/${id}`),
     create: (b)     => post('/tickets', b),
     update: (id, b) => patch(`/tickets/${id}`, b),
     del:    (id)    => del(`/tickets/${id}`),
-    labels:      (id)      => get(`/tickets/${id}/labels`),
     addLabel:    (id, lid) => post(`/tickets/${id}/labels/${lid}`),
-    removeLabel: (id, lid) => del(`/tickets/${id}/labels/${lid}`),
   };
 
   // Contacts
@@ -89,14 +125,17 @@ const Api = (() => {
     create: (b)     => post('/contacts', b),
     update: (id, b) => patch(`/contacts/${id}`, b),
     del:    (id)    => del(`/contacts/${id}`),
-    labels:      (id)      => get(`/contacts/${id}/labels`),
-    addLabel:    (id, lid) => post(`/contacts/${id}/labels/${lid}`),
-    removeLabel: (id, lid) => del(`/contacts/${id}/labels/${lid}`),
+    sync:        ()          => post('/contacts/sync'),
+    picture:     (id)        => get(`/contacts/${id}/picture`),
+    addLabel:    (id, lid)   => post(`/contacts/${id}/labels/${lid}`),
+    removeLabel: (id, lid)   => del(`/contacts/${id}/labels/${lid}`),
+    bulkLabel:   (ids, label_id) => post('/contacts/bulk-label', { ids, label_id }),
+    bulkDelete:  (ids)       => post('/contacts/bulk-delete', { ids }),
   };
 
   // Labels
   const labels = {
-    list:   ()      => get('/labels'),
+    list:   (type)  => get('/labels', type ? { type } : undefined),
     create: (b)     => post('/labels', b),
     update: (id, b) => patch(`/labels/${id}`, b),
     del:    (id)    => del(`/labels/${id}`),
@@ -113,6 +152,7 @@ const Api = (() => {
   const quickReplies = {
     list:   ()      => get('/quick-replies'),
     create: (b)     => post('/quick-replies', b),
+    update: (id, b) => patch(`/quick-replies/${id}`, b),
     del:    (id)    => del(`/quick-replies/${id}`),
   };
 
@@ -132,12 +172,18 @@ const Api = (() => {
     del:        (id)     => del(`/phones/${id}`),
   };
 
-  // Analytics
+  // Analytics — every page takes { from, to, tz, chat_id, phone_ids, agent_ids }
+  const _clean = q => Object.fromEntries(Object.entries(q || {}).filter(([, v]) => v != null && v !== ''));
   const analytics = {
-    dashboard: ()     => get('/analytics/dashboard'),
-    messages:  (d)    => get('/analytics/messages', { days: d }),
-    tickets:   ()     => get('/analytics/tickets'),
-    agents:    (d)    => get('/analytics/agents', { days: d }),
+    team:     (q) => get('/analytics/team', _clean(q)),
+    phones:   (q) => get('/analytics/phones', _clean(q)),
+    chats:    (q) => get('/analytics/chats', _clean(q)),
+    tickets:  (q) => get('/analytics/tickets', _clean(q)),
+    messages: (q) => get('/analytics/messages', _clean(q)),
+    members:  (q) => get('/analytics/members', _clean(q)),
+    chatOptions: (search) => get('/analytics/chat-options', { q: search || '' }),
+    // Dashboard home: chats/team/tickets/phones in one call (phone-scoped)
+    summary:   ()     => get('/dashboard/summary'),
   };
 
   // Automation
@@ -148,15 +194,6 @@ const Api = (() => {
     create:   (b)     => post('/automation/rules', b),
     update:   (id, b) => patch(`/automation/rules/${id}`, b),
     del:      (id)    => del(`/automation/rules/${id}`),
-  };
-
-  // Knowledge Base
-  const kb = {
-    list:    (q)     => get('/knowledge-base', q),
-    create:  (b)     => post('/knowledge-base', b),
-    update:  (id, b) => patch(`/knowledge-base/${id}`, b),
-    approve: (id)    => patch(`/knowledge-base/${id}/approve`),
-    del:     (id)    => del(`/knowledge-base/${id}`),
   };
 
   // Bulk
@@ -191,18 +228,48 @@ const Api = (() => {
     assistant:     (b)  => post('/ai/assistant', b),
   };
 
-  // Activity logs
+  // Activity logs + operation logs (Logs → Group / API / Webhooks / Rules / Scheduled)
   const logs = {
-    list:    (q) => get('/logs', q),
-    actions: ()  => get('/logs/actions'),
+    list:       (q)   => get('/logs', q),
+    actions:    ()    => get('/logs/actions'),
+    operations: (q)   => get('/logs/operations', q),
+    operation:  (uid) => get(`/logs/operations/${encodeURIComponent(uid)}`),
   };
 
   // Groups
   const groups = {
     list:            (q)  => get('/groups', q),
-    participants:    (id) => get(`/groups/${id}/participants`),
+    participants:    (id, refresh) => get(`/groups/${id}/participants`, refresh ? { refresh: true } : undefined),
+    info:            (id, refresh) => get(`/groups/${id}/info`, refresh ? { refresh: true } : undefined),
+    memberPicture:   (id, pid) => get(`/groups/${id}/members/picture`, { id: pid }),
+    addMembers:      (id, numbers) => post(`/groups/${id}/members/add`, { numbers }),
+    memberAction:    (id, action, participants) => post(`/groups/${id}/members/${action}`, { participants }),
+    inviteLink:      (id) => post(`/groups/${id}/invite-link`),
+    updateSettings:  (id, b) => patch(`/groups/${id}/settings`, b),
     analytics:       (id, days) => get(`/groups/${id}/analytics`, { days: days || 30 }),
     addParticipants: (b)  => post('/groups/add-participants', b),
+    analyticsRange:  (id, r) => get(`/groups/${id}/analytics`, { from: r.from, to: r.to }),
+  };
+
+  // Media library (files are fetched with auth, so they come back as blobs)
+  async function mediaBlob(id) {
+    const r = await fetch(`${BASE}/media/${id}/file`, { headers: headers() });
+    if (r.status === 401 && _token) { clearToken(); window.location.reload(); return; }
+    if (r.status === 403) throw new Error(FORBIDDEN_MSG);
+    if (!r.ok) throw new Error(r.status === 404 ? 'Media not available' : 'Could not load media');
+    return r.blob();
+  }
+  const media = {
+    list:     (q)  => get('/media', Object.fromEntries(Object.entries(q || {}).filter(([, v]) => v !== '' && v != null))),
+    blob:     mediaBlob,
+    download: async (id, filename) => {
+      const blob = await mediaBlob(id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename || 'file';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
   };
 
   // Scheduled messages
@@ -233,21 +300,11 @@ const Api = (() => {
     setTicket:    (id, values)   => req('PUT', `/properties/ticket/${id}`, { values }),
   };
 
-  // Developer platform
-  const developer = {
-    apiKeys:       ()   => get('/developer/api-keys'),
-    createApiKey:  (b)  => post('/developer/api-keys', b),
-    revokeApiKey:  (id) => del(`/developer/api-keys/${id}`),
-    webhooks:      ()   => get('/developer/webhooks'),
-    webhookEvents: ()   => get('/developer/webhook-events'),
-    createWebhook: (b)  => post('/developer/webhooks', b),
-    testWebhook:   (id) => post(`/developer/webhooks/${id}/test`),
-    delWebhook:    (id) => del(`/developer/webhooks/${id}`),
-  };
-
   // Exports: authenticated file downloads
   async function download(path, filename) {
     const r = await fetch(BASE + path, { headers: headers() });
+    if (r.status === 401 && _token) { clearToken(); window.location.reload(); return; }
+    if (r.status === 403) throw new Error(FORBIDDEN_MSG);
     if (!r.ok) throw new Error('Export failed');
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
@@ -256,12 +313,33 @@ const Api = (() => {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   }
+  // Each export takes optional { from, to } (ISO); a number is the legacy "last N days"
+  const _exportQs = (q, extra) => {
+    const p = typeof q === 'number' ? { days: q } : _clean(q);
+    const qs = new URLSearchParams({ ...p, ...(extra || {}) }).toString();
+    return qs ? '?' + qs : '';
+  };
   const exportsApi = {
-    chats:    ()     => download('/exports/chats.csv', 'chats.csv'),
-    messages: (days) => download(`/exports/messages.csv?days=${days || 30}`, 'messages.csv'),
-    tickets:  ()     => download('/exports/tickets.csv', 'tickets.csv'),
-    contacts: ()     => download('/exports/contacts.csv', 'contacts.csv'),
-    logs:     (days) => download(`/exports/logs.csv?days=${days || 30}`, 'audit_logs.csv'),
+    chats:       (q) => download('/exports/chats.csv' + _exportQs(q), 'chats.csv'),
+    messages:    (q) => download('/exports/messages.csv' + _exportQs(q ?? 30), 'messages.csv'),
+    tickets:     (q) => download('/exports/tickets.csv' + _exportQs(q), 'tickets.csv'),
+    contacts:    ()  => download('/exports/contacts.csv', 'contacts.csv'),
+    logs:        (q) => download('/exports/logs.csv' + _exportQs(q ?? 30), 'audit_logs.csv'),
+    notes:       (q) => download('/exports/notes.csv' + _exportQs(q), 'private_notes.csv'),
+    phones:      ()  => download('/exports/phones.csv', 'phones.csv'),
+    chatActions: (q) => download('/exports/chat_actions.csv' + _exportQs(q ?? 30), 'chat_actions.csv'),
+  };
+
+  // Developer API: API keys + outbound webhooks (admin only)
+  const developer = {
+    apiKeys:       ()      => get('/developer/api-keys'),
+    createApiKey:  (name)  => post('/developer/api-keys', { name }),
+    revokeApiKey:  (id)    => del(`/developer/api-keys/${id}`),
+    webhookEvents: ()      => get('/developer/webhook-events'),
+    webhooks:      ()      => get('/developer/webhooks'),
+    createWebhook: (b)     => post('/developer/webhooks', b),
+    testWebhook:   (id)    => post(`/developer/webhooks/${id}/test`),
+    deleteWebhook: (id)    => del(`/developer/webhooks/${id}`),
   };
 
   // Search
@@ -270,8 +348,8 @@ const Api = (() => {
   return {
     setToken, clearToken, getToken,
     auth, inbox, tickets, contacts, labels, notes, quickReplies,
-    phones, analytics, automation, kb, bulk, ai, search,
-    logs, groups, scheduled, developer, exports: exportsApi,
-    tasks, properties,
+    phones, analytics, automation, bulk, ai, search,
+    logs, groups, scheduled, exports: exportsApi,
+    tasks, properties, org, media, developer,
   };
 })();

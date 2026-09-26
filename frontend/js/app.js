@@ -18,12 +18,48 @@ const State = {
 // ── Utils ──────────────────────────────────────────────────────── //
 function esc(s) {
   if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
+
+// Only allow hex colors into style attributes (label colors are user-controlled)
+const SAFE_COLOR_RE = /^#[0-9a-fA-F]{3,8}$/;
+function safeColor(c, fallback = '#9ca3af') {
+  return esc(typeof c === 'string' && SAFE_COLOR_RE.test(c) ? c : fallback);
+}
+
+// Only allow inline image data URLs (WAHA QR codes) into img src
+function safeImgSrc(src) {
+  return typeof src === 'string' && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=\s]+$/.test(src) ? src : '';
+}
+
+// Server datetimes are naive UTC (no Z / offset) — parse them as UTC
+function parseServerDate(ts) {
+  if (ts == null || ts === '') return null;
+  if (ts instanceof Date) return ts;
+  if (typeof ts === 'number') return new Date(ts * 1000);
+  let s = String(ts);
+  if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) s = s.replace(' ', 'T') + 'Z';
+  return new Date(s);
+}
+
+// Local datetime-local input value → ISO UTC string (or null when empty)
+function localInputToIso(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+// CSV cell: neutralize spreadsheet formulas and quote properly
+function csvCell(v) {
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+function csvRow(cells) { return cells.map(csvCell).join(','); }
 
 function timeAgo(ts) {
   if (!ts) return '';
-  const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  const d = parseServerDate(ts);
   const diff = Date.now() - d.getTime();
   if (diff < 60000) return 'now';
   if (diff < 3600000) return Math.floor(diff/60000) + 'm';
@@ -33,7 +69,7 @@ function timeAgo(ts) {
 
 function fmt(ts) {
   if (!ts) return '';
-  const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  const d = parseServerDate(ts);
   return d.toLocaleTimeString('en', {hour:'2-digit', minute:'2-digit'});
 }
 
@@ -64,6 +100,11 @@ function chatSubtitle(chat) {
   if (domain === 'lid') return 'WhatsApp';           // anonymised id — not a dialable number
   if (/^\d{6,}$/.test(id)) return `+${id}`;
   return '';
+}
+
+// Admin-only controls (phone management, exports, automation rules) are hidden for other roles
+function isAdmin() {
+  return String(State.agent?.role || '').toLowerCase() === 'admin';
 }
 
 function avatarColor(name) {
@@ -102,7 +143,7 @@ function openLabelPicker(anchorEl, opts) {
     el.querySelector('.lp-list').innerHTML =
       matches.map(l => `
         <div class="lp-row" data-lid="${l.id}">
-          <span class="lp-dot" style="background:${l.color}"></span>
+          <span class="lp-dot" style="background:${safeColor(l.color)}"></span>
           <span style="flex:1">${esc(l.name)}</span>
           ${opts.applied.has(l.id) ? '<span style="color:var(--accent)">✓</span>' : ''}
         </div>`).join('') +
@@ -174,10 +215,6 @@ function pillClass(val) {
   return 'pill ' + (map[val] || '');
 }
 
-function labelChip(label) {
-  return `<span class="label-chip" style="background:${esc(label.color)}22;color:${esc(label.color)};border:1px solid ${esc(label.color)}55">${esc(label.name)}</span>`;
-}
-
 function formatTrigger(trigger) {
   const map = {
     message_received: '📩 Message Received',
@@ -211,27 +248,91 @@ function formatAction(action) {
 
 // ── Auth ───────────────────────────────────────────────────────── //
 async function checkAuth() {
-  if (!Api.getToken()) { showLogin(); return; }
+  if (!Api.getToken()) { hideBootLoader(); showLogin(); return; }
+  showBootLoader();
   try {
     State.agent = await Api.auth.me();
-    showApp();
-  } catch(_) { showLogin(); }
+  } catch(_) { hideBootLoader(); showLogin(); return; }
+  await bootIntoApp();
 }
+
+// ── Boot loader: covers session restore / post-login until the first view renders ──
+const BOOT_SLOW_MS = 15000;
+let _bootSeq = 0, _bootSlowTimer = null;
+
+function showBootLoader() {
+  const el = document.getElementById('boot-loader');
+  if (!el) return;
+  el.hidden = false;
+  document.getElementById('login-screen').style.display = 'none';
+  const slow = document.getElementById('boot-slow');
+  if (slow) slow.hidden = true;
+  clearTimeout(_bootSlowTimer);
+  // Past 15s keep the loader, but say so (Logout stays available)
+  _bootSlowTimer = setTimeout(() => { if (slow && !el.hidden) slow.hidden = false; }, BOOT_SLOW_MS);
+}
+
+function hideBootLoader() {
+  clearTimeout(_bootSlowTimer);
+  const el = document.getElementById('boot-loader');
+  if (el) el.hidden = true;
+}
+
+// Org logo (when the workspace has one) replaces the default H mark
+function renderBootLogo() {
+  const box = document.getElementById('boot-logo');
+  const url = State.org?.logo_url;
+  if (!box || typeof url !== 'string' || !/^(https:\/\/|\/(?!\/))/.test(url) || box.querySelector('img')) return;
+  const img = new Image();
+  img.alt = '';
+  img.onload = () => { box.replaceChildren(img); box.classList.add('has-img'); };
+  img.src = url;
+}
+
+async function bootIntoApp() {
+  const seq = ++_bootSeq;
+  showBootLoader();
+  // Org first (bounded) so the sidebar + loader show the workspace identity
+  await Promise.race([loadOrg(), new Promise(r => setTimeout(r, 4000))]);
+  if (seq !== _bootSeq || !State.agent) return;
+  renderBootLogo();
+  try { await showApp({ orgLoaded: true }); } catch (_) {}
+  if (seq === _bootSeq && State.agent) hideBootLoader();
+}
+
+document.getElementById('boot-logout')?.addEventListener('click', () => {
+  _bootSeq++;          // abandon the in-flight boot
+  hideBootLoader();
+  logoutFn();
+});
 
 function showLogin() {
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('app-shell').style.display = 'none';
+  // Reset the sign-in button (it stays in its spinner state after a login)
+  const btn = document.getElementById('login-btn');
+  if (btn) btn.disabled = false;
+  const arrow = document.getElementById('login-btn-arrow');
+  const spinner = document.getElementById('login-btn-spinner');
+  if (arrow) arrow.style.display = 'inline';
+  if (spinner) spinner.style.display = 'none';
 }
 
-function showApp() {
+// Returns a promise that settles once the first view has rendered
+function showApp(opts = {}) {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app-shell').style.display = 'flex';
   renderAgent();
-  const hashView = location.hash.replace('#','');
-  navigateTo(hashView || 'dashboard');
+  const hashRoute = decodeURIComponent(location.hash.replace('#', ''));
+  const firstView = navigateTo(_parseRoute(hashRoute) ? hashRoute : 'dashboard');
+  if (!opts.orgLoaded) loadOrg();
+  UiPrefs.load();
+  Perms.load();
+  refreshUnreadBadge();
   loadLabels();
   loadPhones();
   connectWS();
+  return Promise.resolve(firstView);
 }
 
 function renderAgent() {
@@ -241,13 +342,13 @@ function renderAgent() {
   document.getElementById('agent-role').textContent = a.role;
   const av = document.getElementById('agent-avatar');
   av.textContent = initials(a.name);
-  av.style.background = avatarColor(a.name);
+  av.style.background = agentColor(a);
   const be = document.getElementById('brand-agent-email');
   if (be) be.textContent = a.email || '';
   // Topbar
   const ta = document.getElementById('topbar-avatar');
   const tn = document.getElementById('topbar-name');
-  if (ta) { ta.textContent = initials(a.name); ta.style.background = avatarColor(a.name); }
+  if (ta) { ta.textContent = initials(a.name); ta.style.background = agentColor(a); }
   if (tn) tn.textContent = a.name.split(' ')[0];
 
   // Topbar dropdown agent info
@@ -255,12 +356,15 @@ function renderAgent() {
   const dae = document.getElementById('dropdown-agent-email');
   if (dan) dan.textContent = a.name;
   if (dae) dae.textContent = a.email || '';
-}
 
-// ── Topbar: refresh current view ─────────────────────────────────
-document.getElementById('topbar-refresh')?.addEventListener('click', () => {
-  navigateTo(State.currentView || 'dashboard');
-});
+  // Workspace menu user row
+  const mua = document.getElementById('ws-menu-user-avatar');
+  const mue = document.getElementById('ws-menu-user-email');
+  if (mua) { mua.textContent = initials(a.name); mua.style.background = agentColor(a); }
+  if (mue) mue.textContent = a.email || a.name;
+  const disp = document.getElementById('agent-display');
+  if (disp) disp.title = `${a.name} · ${a.role}`;
+}
 
 // ── Topbar: global search with dropdown results ──────────────────
 (() => {
@@ -301,12 +405,18 @@ document.getElementById('topbar-refresh')?.addEventListener('click', () => {
             const go = row.dataset.go;
             closeResults(); input.value = '';
             if (go === 'chat' && row.dataset.id) {
+              const cid = +row.dataset.id;
               navigateTo('inbox');
-              setTimeout(() => { const c = State.inbox.chats?.find(x => x.id == row.dataset.id); if (c) openChat(c); }, 600);
+              // renderInbox awaits loadChats(); wait for it before opening the chat
+              Promise.resolve(_inboxReady).then(() => {
+                if (State.currentView !== 'inbox') return;
+                if (State.inbox.chats?.some(x => x.id === cid)) openChat(cid);
+                else toast('Chat not found in the current list', 'error');
+              });
             } else if (go) navigateTo(go);
           });
         });
-      } catch(_) {}
+      } catch(e) { closeResults(); toast(e.message || 'Search failed', 'error'); }
     }, 300);
   });
 })();
@@ -343,9 +453,7 @@ document.getElementById('login-form').addEventListener('submit', async e => {
     console.log('[login] response', res);
     Api.setToken(res.access_token);
     State.agent = { id: res.agent_id, name: res.name, email: res.email, role: res.role };
-    console.log('[login] calling showApp');
-    showApp();
-    console.log('[login] showApp done');
+    await bootIntoApp();
   } catch(err) {
     console.error('[login] error', err);
     errMsg.textContent    = err.message || 'Invalid email or password';
@@ -356,10 +464,45 @@ document.getElementById('login-form').addEventListener('submit', async e => {
   }
 });
 
-const logoutFn = () => {
-  if (State.ws) State.ws.close();
-  Api.clearToken(); State.agent = null; showLogin();
-};
+function logoutFn() {
+  disconnectWS();
+  _stopDashWahaPoller();
+  _stopDashQrPoll();
+  _stopAllPhoneQrFlows();
+  clearTimeout(_chatDebounce);
+  closeLabelPicker();
+  closeWsMenu();
+  closeModal();
+  ctClosePopover();
+  closeContactDrawer();
+  Object.assign(CT, { search: '', filters: { labels: [], type: '', hasPhone: '', phoneId: '' } });
+  UiPrefs.flush();
+  Api.clearToken();
+  Perms.reset();
+  OrgLogo.clear();
+  ST.sub = 'preferences';
+  // Reset in-memory state so the next login starts clean
+  Object.assign(State, {
+    agent: null,
+    currentView: 'inbox',
+    inbox: { chats: [], selectedChatId: null, messages: [], filter: 'all', search: '' },
+    tickets: { list: [], filter: 'all' },
+    contacts: { list: [], search: '' },
+    labels: [],
+    phones: [],
+    ws: null,
+    uiPrefs: null,
+  });
+  _chatAutoSynced = false;
+  ['tasks-panel', 'ai-panel', 'notif-popover', 'topbar-dropdown'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+  const main = document.getElementById('main-content');
+  if (main) main.innerHTML = '';
+  history.replaceState(null, '', location.pathname + location.search);
+  showLogin();
+}
 document.getElementById('logout-btn')?.addEventListener('click', logoutFn);
 document.getElementById('topbar-logout-btn')?.addEventListener('click', logoutFn);
 
@@ -376,6 +519,244 @@ if (taAgent && taDropdown) {
   });
 }
 
+// ── Sidebar: workspace menu, theme, collapse ──────────────────────
+function _store(key, val) {
+  try { val == null ? localStorage.removeItem(key) : localStorage.setItem(key, val); } catch (_) {}
+}
+
+function wsInitial(name) {
+  return (String(name || '').trim()[0] || 'h').toLowerCase();
+}
+
+function renderOrg() {
+  const org = State.org || { name: 'Hyperscope', uid: '' };
+  // Workspace avatar: the uploaded logo (Settings → General) or the name's initial
+  for (const id of ['ws-avatar', 'ws-menu-avatar', 'ws-menu-current-avatar']) {
+    paintOrgAvatar(document.getElementById(id), org.name);
+  }
+  paintOrgAvatar(document.querySelector('.dsh-ws-avatar'), org.name);
+  for (const id of ['ws-name', 'ws-menu-name', 'ws-menu-current-name']) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = org.name;
+  }
+  const uid = document.getElementById('ws-menu-uid');
+  if (uid) { uid.textContent = org.uid || ''; uid.style.display = org.uid ? '' : 'none'; }
+}
+
+async function loadOrg() {
+  try { State.org = await Api.org.get(); }
+  catch (_) { State.org = State.org || null; }  // keep the default label if the call fails
+  renderOrg();
+  if (State.org?.has_logo || OrgLogo.url) { await OrgLogo.refresh(); renderOrg(); }
+}
+
+const wsSwitch = document.getElementById('ws-switch');
+const wsMenu = document.getElementById('ws-menu');
+
+function closeWsMenu(focusButton) {
+  if (!wsMenu || wsMenu.hidden) return;
+  wsMenu.hidden = true;
+  wsSwitch?.setAttribute('aria-expanded', 'false');
+  if (focusButton) wsSwitch?.focus();
+}
+
+function openWsMenu() {
+  if (!wsMenu || !wsSwitch) return;
+  // Fixed positioning so the menu isn't clipped by the sidebar (esp. when collapsed)
+  const r = wsSwitch.getBoundingClientRect();
+  const collapsed = document.documentElement.getAttribute('data-sidebar') === 'collapsed'
+    || window.matchMedia('(max-width:760px)').matches;
+  wsMenu.style.top = (collapsed ? r.top : r.bottom + 4) + 'px';
+  wsMenu.style.left = (collapsed ? r.right + 8 : Math.max(8, r.left)) + 'px';
+  wsMenu.hidden = false;
+  wsSwitch.setAttribute('aria-expanded', 'true');
+  // Keep the menu on screen on short viewports
+  const mr = wsMenu.getBoundingClientRect();
+  if (mr.bottom > window.innerHeight - 8) {
+    wsMenu.style.top = Math.max(8, window.innerHeight - 8 - mr.height) + 'px';
+  }
+  wsMenu.querySelector('.ws-menu-item')?.focus();
+}
+
+wsSwitch?.addEventListener('click', e => {
+  e.stopPropagation();
+  wsMenu.hidden ? openWsMenu() : closeWsMenu();
+});
+document.addEventListener('click', e => {
+  if (wsMenu && !wsMenu.hidden && !wsMenu.contains(e.target)) closeWsMenu();
+});
+window.addEventListener('resize', () => closeWsMenu());
+wsMenu?.addEventListener('keydown', e => {
+  const items = [...wsMenu.querySelectorAll('.ws-menu-item')];
+  const i = items.indexOf(document.activeElement);
+  if (e.key === 'Escape') { e.preventDefault(); closeWsMenu(true); }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length]?.focus(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length]?.focus(); }
+  else if (e.key === 'Tab') closeWsMenu();
+});
+
+document.getElementById('ws-menu-uid')?.addEventListener('click', async e => {
+  e.stopPropagation();
+  const uid = State.org?.uid;
+  if (!uid) return;
+  try { await navigator.clipboard.writeText(uid); toast('Workspace ID copied', 'success'); }
+  catch (_) { toast(uid); }
+});
+
+wsMenu?.addEventListener('click', e => {
+  const btn = e.target.closest('[data-ws-action]');
+  if (!btn) return;
+  const action = btn.dataset.wsAction;
+  closeWsMenu();
+  ({
+    'org-settings': () => navigateTo('settings/general'),
+    invite:         openInviteTeam,
+    help:           showHelpModal,
+    current:        () => {},
+    create:         showCreateWorkspaceModal,
+    password:       showChangePasswordModal,
+    logout:         logoutFn,
+  }[action] || (() => {}))();
+});
+
+function openInviteTeam() {
+  if (!isAdmin()) return toast('Only admins can invite team members', 'error');
+  navigateTo('settings/team');
+  _stInviteModal(stReload);
+}
+
+function showHelpModal() {
+  const org = State.org || {};
+  const safeUrl = /^https?:\/\//i.test(org.support_url || '') ? org.support_url : '';
+  const contact = [
+    org.support_email ? `<a class="btn btn-secondary btn-sm" href="mailto:${esc(org.support_email)}">✉️ ${esc(org.support_email)}</a>` : '',
+    safeUrl ? `<a class="btn btn-secondary btn-sm" href="${esc(safeUrl)}" target="_blank" rel="noopener noreferrer">Open help centre ↗</a>` : '',
+  ].filter(Boolean).join(' ');
+  showModal('Help & Support', `
+    <div class="form-group">
+      <label>Contact support</label>
+      ${contact
+        ? `<div style="display:flex;gap:.5rem;flex-wrap:wrap">${contact}</div>`
+        : `<p class="text-muted" style="font-size:13px">No support contact is set yet.${isAdmin() ? ' Add one in Settings → General.' : ' Ask your admin to add one.'}</p>`}
+    </div>
+    <div class="form-group">
+      <label>Keyboard shortcuts</label>
+      <div style="font-size:13px;line-height:1.9">
+        <div><kbd>Ctrl</kbd> + <kbd>K</kbd> &nbsp;Ask AI</div>
+        <div><kbd>Esc</kbd> &nbsp;Close menus and dialogs</div>
+      </div>
+    </div>
+    <div class="form-group" style="margin-bottom:.5rem">
+      <label>Workspace ID</label>
+      <div class="text-muted" style="font-family:ui-monospace,monospace;font-size:12.5px;word-break:break-all">${esc(org.uid || '—')}</div>
+      <small class="text-muted">Include this when you contact support.</small>
+    </div>
+    <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Done</button></div>
+  `);
+}
+
+function showCreateWorkspaceModal() {
+  showModal('Create workspace', `
+    <p style="font-size:13.5px;line-height:1.6;margin-bottom:.75rem">
+      This installation runs a single workspace. Each Hyperscope server hosts one workspace with its own
+      WhatsApp numbers, team and data.
+    </p>
+    <p class="text-muted" style="font-size:13px;line-height:1.6;margin-bottom:1rem">
+      To run another workspace, deploy a separate Hyperscope instance${State.org?.support_email ? ` or contact <a href="mailto:${esc(State.org.support_email)}">${esc(State.org.support_email)}</a>` : ''}.
+    </p>
+    <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Got it</button></div>
+  `);
+}
+
+function showChangePasswordModal() {
+  showModal('Update password', `
+    <div class="form-group">
+      <label for="pw-current">Current password</label>
+      <input type="password" id="pw-current" autocomplete="current-password" maxlength="256">
+    </div>
+    <div class="form-group">
+      <label for="pw-new">New password</label>
+      <input type="password" id="pw-new" autocomplete="new-password" minlength="8" maxlength="72">
+      <small class="text-muted">8–72 characters</small>
+    </div>
+    <div class="form-group">
+      <label for="pw-confirm">Confirm new password</label>
+      <input type="password" id="pw-confirm" autocomplete="new-password" maxlength="72">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="pw-save">Update password</button>
+    </div>
+  `);
+  document.getElementById('pw-current')?.focus();
+  document.getElementById('pw-save')?.addEventListener('click', async ev => {
+    const cur = document.getElementById('pw-current').value;
+    const nw = document.getElementById('pw-new').value;
+    const cf = document.getElementById('pw-confirm').value;
+    if (!cur) return toast('Enter your current password', 'error');
+    if (nw.length < 8 || nw.length > 72) return toast('New password must be 8–72 characters', 'error');
+    if (new TextEncoder().encode(nw).length > 72) return toast('New password is too long', 'error');
+    if (nw !== cf) return toast('New passwords do not match', 'error');
+    if (nw === cur) return toast('New password must be different', 'error');
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      await Api.auth.changePassword(cur, nw);
+      closeModal();
+      toast('Password updated', 'success');
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false;
+    }
+  });
+}
+
+// Theme (light/dark) — stored per browser
+function applyTheme(theme) {
+  const dark = theme === 'dark';
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const label = document.getElementById('theme-label');
+  const icon = document.getElementById('theme-icon');
+  const btn = document.getElementById('theme-toggle');
+  if (label) label.textContent = dark ? 'Dark' : 'Light';
+  if (btn) btn.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+  if (icon) {
+    // Font Awesome Free sun / moon (CC BY 4.0)
+    icon.setAttribute('viewBox', dark ? '0 0 512 512' : '0 0 384 512');
+    icon.innerHTML = dark
+      ? '<path d="M361.5 1.2c5 2.1 8.6 6.6 9.6 11.9L391 121l107.9 19.8c5.3 1 9.8 4.6 11.9 9.6s1.5 10.7-1.6 15.2L446.9 256l62.3 90.3c3.1 4.5 3.7 10.2 1.6 15.2s-6.6 8.6-11.9 9.6L391 391 371.1 498.9c-1 5.3-4.6 9.8-9.6 11.9s-10.7 1.5-15.2-1.6L256 446.9l-90.3 62.3c-4.5 3.1-10.2 3.7-15.2 1.6s-8.6-6.6-9.6-11.9L121 391 13.1 371.1c-5.3-1-9.8-4.6-11.9-9.6s-1.5-10.7 1.6-15.2L65.1 256 2.8 165.7c-3.1-4.5-3.7-10.2-1.6-15.2s6.6-8.6 11.9-9.6L121 121 140.9 13.1c1-5.3 4.6-9.8 9.6-11.9s10.7-1.5 15.2 1.6L256 65.1 346.3 2.8c4.5-3.1 10.2-3.7 15.2-1.6zM160 256a96 96 0 1 1 192 0 96 96 0 1 1 -192 0zm224 0a128 128 0 1 0 -256 0 128 128 0 1 0 256 0z"/>'
+      : '<path d="M223.5 32C100 32 0 132.3 0 256S100 480 223.5 480c60.6 0 115.5-24.2 155.8-63.4c5-4.9 6.3-12.5 3.1-18.7s-10.1-9.7-17-8.5c-9.8 1.7-19.8 2.6-30.1 2.6c-96.9 0-175.5-78.8-175.5-176c0-65.8 36-123.1 89.3-153.3c6.1-3.5 9.2-10.5 7.7-17.3s-7.3-11.9-14.3-12.5c-6.3-.5-12.6-.8-19-.8z"/>';
+  }
+}
+applyTheme(document.documentElement.getAttribute('data-theme'));
+document.getElementById('theme-toggle')?.addEventListener('click', () => {
+  const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  _store('theme', next);
+  if (State.agent) UiPrefs.save({ theme: next });
+});
+
+// Collapse to an icon rail — stored per browser
+function applySidebarCollapsed(collapsed) {
+  const root = document.documentElement;
+  collapsed ? root.setAttribute('data-sidebar', 'collapsed') : root.removeAttribute('data-sidebar');
+  const btn = document.getElementById('sidebar-collapse');
+  if (btn) {
+    btn.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+    btn.setAttribute('aria-expanded', String(!collapsed));
+    const lbl = btn.querySelector('.nav-label');
+    if (lbl) lbl.textContent = collapsed ? 'Expand' : 'Collapse';
+  }
+}
+applySidebarCollapsed(document.documentElement.getAttribute('data-sidebar') === 'collapsed');
+document.getElementById('sidebar-collapse')?.addEventListener('click', () => {
+  const collapsed = document.documentElement.getAttribute('data-sidebar') !== 'collapsed';
+  closeWsMenu();
+  applySidebarCollapsed(collapsed);
+  _store('sidebar', collapsed ? 'collapsed' : null);
+  if (State.agent) UiPrefs.save({ sidebar_expanded: !collapsed });
+});
+
 // ── Navigation ─────────────────────────────────────────────────── //
 const VIEW_LABELS = {
   dashboard: 'Dashboard', inbox: 'Chats', tickets: 'Tickets',
@@ -384,19 +765,50 @@ const VIEW_LABELS = {
   automation: 'Automation Rules',
   bulk: 'Bulk Messages', settings: 'Settings',
   communities: 'Groups', logs: 'Logs', scheduled: 'Scheduled Messages',
+  media: 'Media',
 };
 
-function navigateTo(view) {
+// Routes are "view" or "view/sub" (analytics, settings and logs have sub-pages, e.g. #analytics/team, #logs/group)
+function _parseRoute(route) {
+  const [view, sub] = String(route || '').split('/');
+  if (!VIEW_LABELS[view]) return null;
+  if (view === 'analytics') return { view, sub: AN_PAGES[sub] ? sub : null };
+  if (view === 'settings') return { view, sub: stIsPage(sub) ? sub : null };
+  if (view === 'logs') return { view, sub: LG_PAGES[sub] ? sub : null };
+  return { view, sub: null };
+}
+
+function navigateTo(route) {
+  const r = _parseRoute(route) || { view: 'dashboard', sub: null };
+  const view = r.view;
+  const full = r.sub ? `${view}/${r.sub}` : view;
+  if (location.hash !== '#' + full) history.pushState(null, '', '#' + full);
   _stopDashWahaPoller();
+  _stopDashQrPoll();
+  _stopAllPhoneQrFlows();
+  // Switching analytics / settings sub-pages keeps the shell (sub-nav) in place
+  const keepShell = (view === 'analytics' && State.currentView === 'analytics' && document.getElementById('an-shell'))
+    || (view === 'settings' && State.currentView === 'settings' && document.getElementById('st-shell'))
+    || (view === 'logs' && State.currentView === 'logs' && document.getElementById('lg-shell'));
+  if (view !== 'logs') { _lgCloseDrawer(); _lgClosePop(); }
+  if (view !== 'analytics' && State.currentView === 'analytics') _anDestroyCharts();
   State.currentView = view;
-  document.querySelectorAll('.nav-item').forEach(el => {
+  State.currentRoute = full;
+  document.querySelectorAll('.nav-item[data-view]').forEach(el => {
     el.classList.toggle('active', el.dataset.view === view);
   });
   const bc = document.getElementById('app-breadcrumb');
-  if (bc) bc.innerHTML = `<strong>${VIEW_LABELS[view] || view}</strong>`;
+  if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS[view] || view)}</strong>`;
   const main = document.getElementById('main-content');
-  main.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
-  ({
+  if (!keepShell) main.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  if (!Perms.view(view)) {
+    main.innerHTML = `<div class="loading-center text-muted">You don’t have access to ${esc(VIEW_LABELS[view])}. Ask an admin if you need it.</div>`;
+    return;
+  }
+  if (view === 'analytics') return renderAnalytics(r.sub);
+  if (view === 'settings') return renderSettings(r.sub);
+  if (view === 'logs') return renderLogs(r.sub);
+  return ({
     dashboard:        renderDashboard,
     inbox:            renderInbox,
     tickets:          renderTickets,
@@ -411,11 +823,19 @@ function navigateTo(view) {
     communities:      renderCommunities,
     logs:             renderLogs,
     scheduled:        renderScheduled,
+    media:            renderMedia,
   }[view] || (() => { main.innerHTML = `<div class="loading-center">View not found</div>`; }))();
 }
 
-document.querySelectorAll('.nav-item').forEach(el => {
+document.querySelectorAll('.nav-item[data-view]').forEach(el => {
   el.addEventListener('click', e => { e.preventDefault(); navigateTo(el.dataset.view); });
+});
+
+// Back/forward between views (hash is set by navigateTo)
+window.addEventListener('popstate', () => {
+  if (!State.agent) return;
+  const v = decodeURIComponent(location.hash.replace('#', ''));
+  if (_parseRoute(v) && v !== (State.currentRoute || State.currentView)) navigateTo(v);
 });
 
 // ── WebSocket ──────────────────────────────────────────────────── //
@@ -425,7 +845,22 @@ const WS = {
   maxDelay: 30000,
   pongTimeout: null,
   alive: false,
+  retryTimer: null,
 };
+
+// Close the socket (connecting or open) and cancel any pending reconnect
+function disconnectWS() {
+  clearTimeout(WS.retryTimer);
+  WS.retryTimer = null;
+  if (WS.socket) {
+    WS.socket.onopen = WS.socket.onmessage = WS.socket.onerror = WS.socket.onclose = null;
+    try { WS.socket.close(); } catch(_) {}
+    WS.socket = null;
+  }
+  State.ws = null;
+  WS.alive = false;
+  WS.retryDelay = 1000;
+}
 
 function wsSetStatus(status, label) {
   const el = document.getElementById('ws-status');
@@ -439,22 +874,27 @@ function wsSetStatus(status, label) {
 function connectWS() {
   if (!State.agent || !Api.getToken()) return;
 
-  // Close any existing socket cleanly
+  // Close any existing socket cleanly (keeps the current backoff delay)
+  clearTimeout(WS.retryTimer);
+  WS.retryTimer = null;
   if (WS.socket) {
-    WS.socket.onclose = null;
-    WS.socket.close();
+    WS.socket.onopen = WS.socket.onmessage = WS.socket.onerror = WS.socket.onclose = null;
+    try { WS.socket.close(); } catch(_) {}
     WS.socket = null;
   }
 
   wsSetStatus('reconnecting', 'Connecting…');
 
+  // The JWT is sent as the first message, never in the URL (keeps it out of logs)
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws?token=${encodeURIComponent(Api.getToken())}`;
-  const ws = new WebSocket(url);
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
   WS.socket = ws;
   WS.alive = false;
 
   ws.onopen = () => {
+    const token = Api.getToken();
+    if (!token) { ws.close(); return; }
+    ws.send(JSON.stringify({ type: 'auth', token }));
     WS.retryDelay = 1000;   // reset backoff on success
     WS.alive = true;
     wsSetStatus('connected', 'Live');
@@ -488,16 +928,27 @@ function connectWS() {
     wsSetStatus('disconnected', 'Error');
   };
 
-  ws.onclose = () => {
+  ws.onclose = e => {
+    if (WS.socket !== ws) return;   // superseded by a newer socket
     WS.socket = null;
     State.ws = null;
     WS.alive = false;
+
+    // 4001 = token rejected/expired by the server → sign out, don't retry forever
+    if (e && e.code === 4001) {
+      wsSetStatus('disconnected', 'Signed out');
+      toast('Your session has expired — please sign in again', 'error');
+      logoutFn();
+      return;
+    }
+    if (!State.agent || !Api.getToken()) return;
+
     wsSetStatus('reconnecting', 'Reconnecting…');
 
     // Exponential backoff
     const delay = Math.min(WS.retryDelay, WS.maxDelay);
     WS.retryDelay = Math.min(WS.retryDelay * 2, WS.maxDelay);
-    setTimeout(connectWS, delay);
+    WS.retryTimer = setTimeout(connectWS, delay);
   };
 }
 
@@ -514,62 +965,120 @@ function handleWSEvent(data) {
     if (State.currentView === 'inbox') {
       const chatEntry = State.inbox.chats?.find(c => c.id == d.chat_id);
       if (chatEntry) {
+        const isOpen = State.inbox.selectedChatId == d.chat_id;
         chatEntry.last_message = d.body || '';
-        chatEntry.last_message_time = d.timestamp;
-        if (!d.from_me && State.inbox.selectedChatId != d.chat_id) {
-          chatEntry.unread_count = (chatEntry.unread_count || 0) + 1;
+        chatEntry.last_message_at = d.timestamp;   // unix seconds — parseServerDate handles numbers
+        chatEntry.last_message_type = d.message_type || 'text';
+        chatEntry.last_message_sender = d.sender_name || d.sender_number || '';
+        chatEntry.last_message_from_me = !!d.from_me;
+        if (!d.from_me && !isOpen) {
+          chatEntry.unread_count = d.unread_count || (chatEntry.unread_count || 0) + 1;
         }
-        // Bubble this chat to the top
-        State.inbox.chats = [chatEntry, ...State.inbox.chats.filter(c => c.id !== d.chat_id)];
-        renderChatList(State.inbox.chats);
-        const total = State.inbox.chats.reduce((s, c) => s + (c.unread_count || 0), 0);
-        const badge = document.getElementById('unread-badge');
-        if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+        // Chat is on screen: keep it read on the server too
+        if (!d.from_me && isOpen) Api.inbox.markRead(d.chat_id).catch(() => {});
+        if (_cxPaused) {
+          // Paused: refresh the row where it is, remember it for resume
+          cxRerenderRow(chatEntry);
+          _cxPending.set(chatEntry.id, true);
+          cxRenderPauseBtn();
+        } else {
+          // Bubble this chat to the top
+          State.inbox.chats = [chatEntry, ...State.inbox.chats.filter(c => c.id !== d.chat_id)];
+          renderChatList(State.inbox.chats, _chatHasMore);
+        }
+        _updateUnreadBadge(State.inbox.chats);
+      } else if (_cxPaused) {
+        _cxPending.set(+d.chat_id, false);
+        cxRenderPauseBtn();
       } else {
         // New chat not yet in state — full refresh
         refreshChatList();
       }
+    } else if (!d.from_me) {
+      _updateUnreadBadge();   // keep the sidebar count live on other pages
     }
 
-    // Show toast/notify when user is on another view
-    if (State.currentView !== 'inbox' && !d.from_me) {
-      const preview = (d.body || '').substring(0, 60);
-      toast(`💬 New message: ${preview}`, 'default');
-    }
+    // Show toast/notify for inbound messages (toast only when user is on another view)
     if (!d.from_me && typeof notifyUser === 'function') {
-      notifyUser('new_messages', displayName(d.sender_name || d.chat_wid || 'New message'), d.body || 'Media message');
+      notifyUser('new_messages', displayName(d.sender_name || d.chat_name || d.chat_wid || 'New message'), d.body || 'Media message', {
+        toast: State.currentView !== 'inbox',
+        toastText: `💬 New message: ${(d.body || 'Media message').substring(0, 60)}`,
+        tag: `chat-${d.chat_id}`,
+      });
     }
     return;
   }
 
-  if (event === 'note_mention') {
-    toast(`📝 ${esc(d.by)} mentioned you in ${esc(displayName(d.chat_name))}`, 'default');
-    if (typeof notifyUser === 'function') {
-      notifyUser('new_note', `${d.by} mentioned you`, d.content || '');
-    }
+  // ── Notifications (each respects the agent's prefs via notifyUser) ──
+  if (event === 'note_mention' || event === 'note_added') {
+    const chat = displayName(d.chat_name);
+    const verb = event === 'note_mention' ? 'mentioned you' : 'added a private note';
+    notifyUser('new_note', `${d.by} ${verb}`, d.content || '', {
+      toastText: `📝 ${d.by} ${verb} in ${chat}`,
+      tag: `note-${d.note_id}`,
+    });
     return;
   }
 
   if (event === 'ticket_assigned') {
-    toast(`🎫 ${esc(d.by)} assigned you ticket #${d.ticket_id}: ${esc(d.title)}`, 'default');
-    if (typeof notifyUser === 'function') notifyUser('ticket_assign', 'Ticket assigned to you', d.title || '');
+    notifyUser('ticket_assign', 'Ticket assigned to you', d.title || '', {
+      toastText: `🎫 ${d.by} assigned you ticket #${d.ticket_id}: ${d.title}`,
+      tag: `ticket-${d.ticket_id}`,
+    });
     return;
   }
 
   if (event === 'task_assigned') {
-    toast(`✅ ${esc(d.by)} assigned you a task: ${esc(d.title)}`, 'default');
-    if (typeof notifyUser === 'function') notifyUser('task_assign', 'Task assigned to you', d.title || '');
+    notifyUser('task_assign', 'Task assigned to you', d.title || '', {
+      toastText: `✅ ${d.by} assigned you a task: ${d.title}`,
+      tag: `task-${d.task_id}`,
+    });
     return;
   }
 
   if (event === 'task_reminder') {
-    toast(`⏰ Task reminder: ${esc(d.title)}`, 'default');
-    if (typeof notifyUser === 'function') notifyUser('task_assign', '⏰ Task reminder', d.title || '');
+    notifyUser('task_assign', '⏰ Task reminder', d.title || '', {
+      toastText: `⏰ Task reminder: ${d.title}`,
+      tag: `task-reminder-${d.task_id}`,
+    });
+    return;
+  }
+
+  if (event === 'chat_assigned') {
+    const chat = displayName(d.chat_name || `Chat #${d.chat_id}`);
+    notifyUser('chat_assign', 'Chat assigned to you', chat, {
+      toastText: `💬 ${d.by || 'Someone'} assigned you ${chat}`,
+      tag: `chat-assign-${d.chat_id}`,
+    });
+    return;
+  }
+
+  if (event === 'ticket_overdue') {
+    notifyUser('ticket_overdue', 'Ticket overdue', d.title || '', {
+      toastText: `⚠️ Ticket #${d.ticket_id} is overdue: ${d.title}`,
+      tag: `ticket-overdue-${d.ticket_id}`,
+    });
+    return;
+  }
+
+  if (event === 'task_overdue') {
+    notifyUser('task_overdue', 'Task overdue', d.title || '', {
+      toastText: `⚠️ Task overdue: ${d.title}`,
+      tag: `task-overdue-${d.task_id}`,
+    });
     return;
   }
 
   if (event === 'chat_updated') {
-    if (State.currentView === 'inbox') refreshChatList();
+    if (State.currentView !== 'inbox') return;
+    // Field-level update (e.g. AI auto-flag) → patch the row in place
+    const chatEntry = State.inbox.chats?.find(c => c.id == d.chat_id);
+    const fields = Object.keys(d || {}).filter(k => k !== 'chat_id');
+    if (chatEntry && fields.length) {
+      fields.forEach(k => { chatEntry[k] = d[k]; });
+      cxRerenderRow(chatEntry);
+      if (State.inbox.selectedChatId == d.chat_id) renderThreadHeaderState(chatEntry);
+    } else refreshChatList();
     return;
   }
 
@@ -585,6 +1094,10 @@ function handleWSEvent(data) {
     const ph = State.phones.find(p => p.id === d.phone_id);
     if (ph) ph.waha_status = d.status;
     updatePhoneBadge();
+    if (State.currentView === 'dashboard') _dashSetPhoneStatus(d.phone_id, d.status);
+    // Open chat on that number: re-evaluate the composer's disconnected banner
+    const openChatEntry = State.currentView === 'inbox' && State.inbox.chats?.find(c => c.id == State.inbox.selectedChatId);
+    if (openChatEntry && openChatEntry.phone_id === d.phone_id) cxUpdateComposerState(openChatEntry);
     // If phone became WORKING and we're on inbox, reload chats
     if (d.status === 'WORKING' && State.currentView === 'inbox') {
       _chatAutoSynced = false;
@@ -628,33 +1141,28 @@ function updatePhoneBadge() {
   const badge = document.getElementById('topbar-phone-count');
   const num = document.getElementById('topbar-phone-num');
   const total = document.getElementById('topbar-phone-total');
-  const dot = badge ? badge.querySelector('.phone-dot') : null;
-  if (badge && num) {
-    const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
-    num.textContent = working;
-    if (total) total.textContent = State.phones.length;
-    badge.style.display = State.phones.length ? 'flex' : 'none';
-    if (dot) {
-      const totalCount = State.phones.length;
-      if (working === 0) {
-        dot.style.background = '#ef4444';
-        badge.style.background = '#fef2f2';
-        badge.style.borderColor = '#fecaca';
-        badge.style.color = '#991b1b';
-      } else if (working < totalCount) {
-        dot.style.background = '#f59e0b';
-        badge.style.background = '#fffbeb';
-        badge.style.borderColor = '#fde68a';
-        badge.style.color = '#92400e';
-      } else {
-        dot.style.background = '#10b981';
-        badge.style.background = '#f0fdf4';
-        badge.style.borderColor = '#bbf7d0';
-        badge.style.color = '#166534';
-      }
-    }
-  }
+  if (!badge || !num) return;
+  const totalCount = State.phones.length;
+  const working = State.phones.filter(p => p.waha_status === 'WORKING').length;
+  num.textContent = working;
+  if (total) total.textContent = totalCount;
+  badge.style.display = State.agent ? 'flex' : 'none';
+  // Colour lives in CSS (dashboard.css) so the dark theme applies
+  badge.classList.toggle('state-none', working === 0);
+  badge.classList.toggle('state-partial', working > 0 && working < totalCount);
+  badge.classList.toggle('state-ok', totalCount > 0 && working === totalCount);
+  badge.title = `${working} of ${totalCount} phone${totalCount === 1 ? '' : 's'} connected — manage in Settings`;
 }
+
+// ── Topbar actions (home, refresh, help, phones badge) ────────── //
+document.getElementById('topbar-home')?.addEventListener('click', () => navigateTo('dashboard'));
+document.getElementById('topbar-refresh')?.addEventListener('click', () => {
+  loadPhones();
+  navigateTo(State.currentRoute || State.currentView || 'dashboard');
+});
+document.getElementById('topbar-help')?.addEventListener('click', () => showHelpModal());
+document.getElementById('topbar-phone-count')?.addEventListener('click', () => navigateTo('settings/phones'));
+
 async function loadPhones() {
   try {
     State.phones = await Api.phones.list();
@@ -663,103 +1171,498 @@ async function loadPhones() {
 }
 
 // ── INBOX VIEW ─────────────────────────────────────────────────── //
+
+// Inline outline icons for the chats UI (24×24, stroke = currentColor)
+const CX_ICONS = {
+  phone:     '<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/>',
+  folder:    '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  chevDown:  '<polyline points="6 9 12 15 18 9"/>',
+  chevUp:    '<polyline points="18 15 12 9 6 15"/>',
+  chevLeft:  '<polyline points="15 18 9 12 15 6"/>',
+  chevRight: '<polyline points="9 18 15 12 9 6"/>',
+  search:    '<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+  filter:    '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>',
+  sync:      '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
+  users:     '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+  user:      '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  userPlus:  '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/>',
+  flag:      '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/>',
+  send:      '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+  clip:      '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  smile:     '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>',
+  translate: '<path d="M5 8l6 6M4 14l6-6 2-3M2 5h12M7 2h1M22 22l-5-10-5 10M14 18h6"/>',
+  sparkle:   '<path d="M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z"/><path d="M19 3v4M17 5h4"/>',
+  wand:      '<path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M15 9h.01M17.8 6.2L19 5M3 21l9-9M12.2 6.2L11 5"/>',
+  zap:       '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+  clock:     '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  edit:      '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>',
+  panel:     '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/>',
+  info:      '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>',
+  sliders:   '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  bot:       '<rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><line x1="8" y1="14" x2="8.01" y2="14"/><line x1="16" y1="14" x2="16.01" y2="14"/>',
+  ticket:    '<path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3a2 2 0 0 0 0-4z"/><path d="M13 5v2M13 11v2M13 17v2"/>',
+  task:      '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  image:     '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+  video:     '<polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
+  doc:       '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
+  mic:       '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>',
+  megaphone: '<path d="M3 11v2a1 1 0 0 0 1 1h2l6 4V6L6 10H4a1 1 0 0 0-1 1z"/><path d="M16 8.5a5 5 0 0 1 0 7M19 5.5a9 9 0 0 1 0 13"/>',
+  chart:     '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>',
+  history:   '<path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/>',
+  note:      '<path d="M15.5 3H5a2 2 0 0 0-2 2v14c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2V8.5L15.5 3z"/><path d="M15 3v6h6"/>',
+  location:  '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
+  download:  '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+  check:     '<polyline points="20 6 9 17 4 12"/>',
+  x:         '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  more:      '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
+  heart:     '<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>',
+  msg:       '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  logIn:     '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>',
+  logOut:    '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+  tag:       '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>',
+  trash:     '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
+  play:      '<polygon points="6 4 20 12 6 20 6 4"/>',
+  calendar:  '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+  list:      '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/>',
+  props:     '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="7" y1="8" x2="7.01" y2="8"/><line x1="11" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="7.01" y2="12"/><line x1="11" y1="12" x2="17" y2="12"/><line x1="7" y1="16" x2="7.01" y2="16"/><line x1="11" y1="16" x2="17" y2="16"/>',
+  pause:     '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
+  copy:      '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  link:      '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  userMinus: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="22" y1="11" x2="16" y2="11"/>',
+  shield:    '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  alert:     '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
+  plus:      '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+  chevUpDown:'<polyline points="7 9 12 4 17 9"/><polyline points="7 15 12 20 17 15"/>',
+};
+function cxIcon(name, size = 16) {
+  return `<svg class="cx-ico" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${CX_ICONS[name] || ''}</svg>`;
+}
+// Small round WhatsApp-green logo used on the sending-number chip
+const CX_WA_LOGO = `<svg class="cx-wa-logo" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="11" fill="#25D366"/><path fill="#fff" d="M16.9 14.2c-.3-.1-1.6-.8-1.8-.9-.3-.1-.4-.1-.6.1-.2.3-.7.9-.8 1-.2.2-.3.2-.6.1-.3-.1-1.1-.4-2.1-1.3-.8-.7-1.3-1.5-1.5-1.8-.2-.3 0-.4.1-.6l.4-.5c.1-.2.2-.3.3-.5.1-.2 0-.4 0-.5l-.8-1.9c-.2-.5-.4-.4-.6-.4h-.5c-.2 0-.5.1-.7.3-.3.3-1 1-1 2.3s1 2.7 1.2 2.9c.1.2 2 3.1 4.9 4.3 2.4.9 2.9.8 3.4.7.6-.1 1.6-.7 1.9-1.3.2-.6.2-1.2.2-1.3-.1-.2-.3-.3-.6-.4z"/></svg>`;
+
+// Chat-list date: time when today, else "22-Sep-26"
+function cxFmtListDate(ts) {
+  const d = parseServerDate(ts);
+  if (!d || isNaN(d.getTime())) return '';
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' });
+  return `${String(d.getDate()).padStart(2, '0')}-${d.toLocaleString('en', { month: 'short' })}-${String(d.getFullYear()).slice(-2)}`;
+}
+function cxDayLabel(d) {
+  return `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+}
+// International display: "+91 95107 15498", "+44 7721 135624", "+61 492 972 562",
+// "+1 415 555 0123"; other countries "+<cc> <rest in 3s>" when the code is known.
+const CX_CC_GROUPS = {
+  '1': [3, 3, 4], '7': [3, 3, 2, 2], '20': [3, 3, 4], '27': [2, 3, 4], '31': [1, 4, 4], '33': [1, 2, 2, 2, 2],
+  '34': [3, 3, 3], '39': [3, 3, 4], '44': [4, 6], '49': [3, 4, 4], '52': [2, 4, 4], '55': [2, 5, 4],
+  '60': [2, 3, 4], '61': [3, 3, 3], '62': [3, 4, 4], '63': [3, 3, 4], '64': [2, 3, 4], '65': [4, 4],
+  '66': [2, 3, 4], '81': [2, 4, 4], '86': [3, 4, 4], '90': [3, 3, 4], '91': [5, 5], '92': [3, 7],
+  '94': [2, 3, 4], '234': [3, 3, 4], '254': [3, 6], '880': [4, 6], '966': [2, 3, 4], '971': [2, 3, 4],
+  '974': [4, 4], '977': [3, 7],
+};
+function cxFmtPhone(num) {
+  const d = String(num || '').replace(/\D/g, '');
+  if (!d) return '';
+  for (const len of [3, 2, 1]) {
+    const cc = d.slice(0, len), groups = CX_CC_GROUPS[cc];
+    if (!groups) continue;
+    let rest = d.slice(len);
+    // Only lengths that fit the country's plan (LIDs / group ids stay raw)
+    const want = groups.reduce((a, b) => a + b, 0);
+    if (d.length > 15 || rest.length < want - (cc === '1' ? 0 : 2) || rest.length > want + (cc === '1' ? 0 : 1)) break;
+    const parts = [];
+    for (const g of groups) { if (!rest) break; parts.push(rest.slice(0, g)); rest = rest.slice(g); }
+    if (rest) parts[parts.length - 1] += rest;
+    return `+${cc} ${parts.join(' ')}`;
+  }
+  return '+' + d;
+}
+function cxPhoneOf(chat) { return State.phones.find(p => p.id === chat?.phone_id); }
+function cxPhoneLabel(phone) { return phone ? (cxFmtPhone(phone.phone_number) || phone.name || '') : ''; }
+// Only WhatsApp's own CDN (https) may reach an <img src>
+function cxSafePicture(u) { return typeof u === 'string' && /^https:\/\/[a-z0-9.-]+\.whatsapp\.net\//i.test(u) ? u : ''; }
+
+function cxAvatar(chat, size, extraCls = '') {
+  const name = displayName(chat);
+  const pic = cxSafePicture(chat.picture_url);
+  const inner = chat.is_group ? cxIcon('users', Math.round(size * .46))
+    : /^[+\d]/.test(name) || !name ? cxIcon('user', Math.round(size * .46)) : esc(initials(name));
+  return `<div class="cx-avatar${chat.is_group ? ' is-group' : ''} ${extraCls}" data-avatar-cid="${chat.id}" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .36)}px;background:${avatarColor(name)}">${inner}${pic ? `<img src="${esc(pic)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ''}</div>`;
+}
+
+// Profile pictures: fetched lazily (server caches the WAHA lookup for 24h)
+const _cxPicQueue = [];
+const _cxPicSeen = new Set();
+let _cxPicBusy = 0;
+function cxQueuePictures(chats) {
+  chats.slice(0, 60).forEach(c => {
+    if (c.picture_url || c.picture_checked || _cxPicSeen.has(c.id)) return;
+    _cxPicSeen.add(c.id);
+    _cxPicQueue.push(c.id);
+  });
+  _cxPumpPictures();
+}
+function _cxPumpPictures() {
+  while (_cxPicBusy < 3 && _cxPicQueue.length) {
+    const id = _cxPicQueue.shift();
+    _cxPicBusy++;
+    Api.inbox.picture(id)
+      .then(r => { if (r && r.url) cxSetPicture(id, r.url); })
+      .catch(() => {})
+      .finally(() => { _cxPicBusy--; _cxPumpPictures(); });
+  }
+}
+function cxSetPicture(chatId, url) {
+  const safe = cxSafePicture(url);
+  if (!safe) return;
+  const chat = State.inbox.chats?.find(c => c.id == chatId);
+  if (chat) chat.picture_url = safe;
+  document.querySelectorAll(`[data-avatar-cid="${+chatId}"]`).forEach(av => {
+    if (av.querySelector('img')) return;
+    const img = document.createElement('img');
+    img.alt = ''; img.referrerPolicy = 'no-referrer';
+    img.onerror = () => img.remove();
+    img.src = safe;
+    av.appendChild(img);
+  });
+}
+
+// Agents (for assignee avatars) — loaded once per inbox visit
+let _cxAgentMap = {};
+async function cxLoadAgents() {
+  try {
+    const list = await Api.auth.agents();
+    _cxAgentMap = Object.fromEntries((list || []).map(a => [a.id, a]));
+  } catch (_) {}
+  return Object.values(_cxAgentMap);
+}
+function cxAssigneeAvatar(agentId, size = 20, opts = {}) {
+  const a = agentId != null ? _cxAgentMap[agentId] : null;
+  if (agentId == null) {
+    return `<span class="cx-assignee none" style="width:${size}px;height:${size}px" title="Unassigned">${cxIcon('user', Math.round(size * .6))}</span>`;
+  }
+  const name = a?.name || `Agent #${agentId}`;
+  const dot = opts.dot ? `<i class="cx-odot${_cxOnline.has(+agentId) ? ' on' : ''}"></i>` : '';
+  const tip = opts.title || `Assigned to ${name}${opts.dot ? (_cxOnline.has(+agentId) ? ' · online' : ' · offline') : ''}`;
+  return `<span class="cx-assignee" data-agent-av="${+agentId}" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .42)}px;background:${avatarColor(name)}" title="${esc(tip)}">${esc(initials(name))}${dot}</span>`;
+}
+
+// Agents who can open a chat (its number's team) + live online state, per phone
+let _cxOnline = new Set();
+const _cxTeam = new Map();   // phone id → { at, promise }
+function cxTeam(chat) {
+  const hit = _cxTeam.get(chat.phone_id);
+  if (hit && Date.now() - hit.at < 60e3) return hit.promise;
+  const promise = Api.inbox.team(chat.id).then(list => {
+    (list || []).forEach(a => { if (a.online) _cxOnline.add(a.id); else _cxOnline.delete(a.id); });
+    return list || [];
+  }).catch(e => { _cxTeam.delete(chat.phone_id); throw e; });
+  _cxTeam.set(chat.phone_id, { at: Date.now(), promise });
+  return promise;
+}
+// Repaint online dots once presence is known
+function cxRefreshOnlineDots() {
+  document.querySelectorAll('.cx-assignee[data-agent-av] .cx-odot').forEach(d => {
+    d.classList.toggle('on', _cxOnline.has(+d.parentElement.dataset.agentAv));
+  });
+}
+
+// Generic anchored popover (one at a time)
+let _cxPopEl = null;
+function cxClosePop() { if (_cxPopEl) { _cxPopEl.remove(); _cxPopEl = null; } }
+document.addEventListener('click', e => { if (_cxPopEl && !_cxPopEl.contains(e.target)) cxClosePop(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') cxClosePop(); });
+function cxPopover(anchor, html, opts = {}) {
+  cxClosePop();
+  const r = anchor.getBoundingClientRect();
+  const el = document.createElement('div');
+  el.className = 'cx-pop ' + (opts.cls || '');
+  el.innerHTML = html;
+  document.body.appendChild(el);
+  const w = el.offsetWidth, h = el.offsetHeight;
+  let left = opts.alignRight ? r.right - w : r.left;
+  left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+  let top = opts.above ? r.top - h - 6 : r.bottom + 6;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
+  if (top < 8) top = Math.min(window.innerHeight - h - 8, r.bottom + 6);
+  el.style.left = left + 'px';
+  el.style.top = top + 'px';
+  _cxPopEl = el;
+  return el;
+}
+
+// 'all' already excludes archived chats (the API defaults to is_archived=false),
+// so it is the "Inbox"; the legacy 'inbox' value still resolves to it.
+const CX_FOLDERS = [
+  { f: 'all', label: 'Inbox' },
+  { f: 'mine', label: 'Assigned to me' },
+  { f: 'unread', label: 'Unread' },
+  { f: 'flagged', label: 'Flagged' },
+  { f: 'awaiting', label: 'Awaiting reply' },
+];
+function cxFolderLabel() {
+  if (State.inbox.labelFilter) {
+    const l = State.labels.find(x => x.id == State.inbox.labelFilter);
+    return l ? l.name : 'Label';
+  }
+  return (CX_FOLDERS.find(x => x.f === State.inbox.filter) || CX_FOLDERS[0]).label;
+}
+function cxFolderSelected(f) {
+  const cur = State.inbox.filter === 'inbox' ? 'all' : State.inbox.filter;
+  return !State.inbox.labelFilter && cur === f;
+}
+function cxFiltersActive() {
+  return !!(State.inbox.typeFilter || State.inbox.statusFilter || State.inbox.showArchived);
+}
+function cxUpdateListHeader() {
+  const fl = document.getElementById('cx-folder-label');
+  if (fl) fl.textContent = cxFolderLabel();
+  const fb = document.getElementById('cx-folder-btn');
+  if (fb) fb.classList.toggle('is-label', !!State.inbox.labelFilter);
+  document.getElementById('cx-filter-btn')?.classList.toggle('on', cxFiltersActive());
+  const pb = document.getElementById('cx-phone-btn');
+  if (pb) {
+    const ph = State.phones.find(p => p.id == State.inbox.phoneFilter);
+    pb.classList.toggle('on', !!ph);
+    pb.title = ph ? `Showing ${cxPhoneLabel(ph)} only` : 'All phones';
+  }
+}
+
+function cxEmptyThread() {
+  return `<div class="empty-state" style="flex:1">
+    <div class="empty-state-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    </div>
+    <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
+    <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
+  </div>`;
+}
+
+function cxDetailPref() {
+  try { const v = localStorage.getItem('cx-detail-open'); if (v != null) return v === '1'; } catch (_) {}
+  return window.innerWidth >= 1280;
+}
+function cxSetDetailPref(open) {
+  try { localStorage.setItem('cx-detail-open', open ? '1' : '0'); } catch (_) {}
+  if (State.agent && UiPrefs.get().detail_panel_open !== !!open) UiPrefs.save({ detail_panel_open: !!open });
+}
+
 async function renderInbox() {
   const main = document.getElementById('main-content');
   main.innerHTML = `
-    <div class="inbox-layout h-full" id="inbox-layout">
-      <div class="chat-list-panel" id="chat-list-panel">
-        <div class="chat-list-header">
-          <div class="search-bar" style="flex:1">
-            <input type="search" id="chat-search" placeholder="Search chats...">
-          </div>
-          <button class="btn btn-primary btn-sm" id="sync-btn" title="Sync">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:13px;height:13px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+    <div class="inbox-layout cx-layout h-full" id="inbox-layout">
+      <div class="chat-list-panel cx-list-panel" id="chat-list-panel">
+        <div class="cx-list-head">
+          <button type="button" class="cx-hbtn" id="cx-phone-btn" title="All phones" aria-label="Phone filter">${cxIcon('phone')}</button>
+          <button type="button" class="cx-folder-btn" id="cx-folder-btn" aria-haspopup="menu">
+            ${cxIcon('folder', 16)}<span id="cx-folder-label">${esc(cxFolderLabel())}</span>${cxIcon('chevDown', 14)}
           </button>
+          <span class="cx-grow"></span>
+          <button type="button" class="cx-hbtn" id="cx-pause-btn" aria-pressed="false"></button>
+          <button type="button" class="cx-hbtn" id="cx-search-toggle" title="Search chats" aria-label="Search chats">${cxIcon('search')}</button>
+          <button type="button" class="cx-hbtn" id="cx-filter-btn" title="Filters" aria-label="Filters">${cxIcon('filter')}</button>
         </div>
-        <div class="chat-list-filters" id="chat-filters">
-          <span class="filter-chip active" data-f="all">All chats</span>
-          <span class="filter-chip" data-f="inbox">Inbox</span>
-          <span class="filter-chip" data-f="mine">Assigned to me</span>
-          <span class="filter-chip" data-f="unread">Unread</span>
-          <span class="filter-chip" data-f="flagged">Flagged</span>
-          <span class="filter-chip" data-f="awaiting">Awaiting reply</span>
-          <span class="filter-chip" id="label-filter-chip">🏷 Label ▾</span>
+        <div class="cx-search-row" id="cx-search-row" ${State.inbox.search ? '' : 'hidden'}>
+          ${cxIcon('search', 14)}
+          <input type="search" id="chat-search" placeholder="Search chats…" value="${esc(State.inbox.search || '')}" autocomplete="off">
         </div>
-        <div class="chat-list" id="chat-list">
+        <div class="chat-list cx-chat-list" id="chat-list">
           <div class="loading-center"><div class="spinner"></div></div>
         </div>
       </div>
-      <div class="thread-panel" id="thread-panel">
-        <div class="empty-state" style="flex:1">
-          <div class="empty-state-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          </div>
-          <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
-          <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
-        </div>
-      </div>
-      <div class="contact-detail-panel" id="detail-panel" style="display:none">
-        <div class="detail-panel-header">
-          <span>Details</span>
-          <button class="detail-panel-close" id="close-detail-btn" title="Close panel">×</button>
-        </div>
-        <div class="detail-panel-body" id="detail-panel-body"></div>
-      </div>
+      <div class="thread-panel cx-thread-panel" id="thread-panel">${cxEmptyThread()}</div>
+      <div class="contact-detail-panel cx-detail" id="detail-panel" style="display:none"></div>
     </div>`;
 
-  await loadChats();
+  _inboxReady = (async () => { await cxLoadAgents(); await loadChats(); })();
 
-  document.getElementById('chat-search').addEventListener('input', e => {
+  const searchInput = document.getElementById('chat-search');
+  searchInput.addEventListener('input', e => {
     State.inbox.search = e.target.value;
     debounceLoadChats();
   });
-
-  document.querySelectorAll('.filter-chip').forEach(c => {
-    c.addEventListener('click', () => {
-      document.querySelectorAll('.filter-chip').forEach(x => x.classList.remove('active'));
-      c.classList.add('active');
-      State.inbox.filter = c.dataset.f;
-      loadChats();
-    });
+  document.getElementById('cx-search-toggle').addEventListener('click', () => {
+    const row = document.getElementById('cx-search-row');
+    row.hidden = !row.hidden;
+    if (!row.hidden) searchInput.focus();
+    else if (State.inbox.search) { State.inbox.search = ''; searchInput.value = ''; loadChats(); }
   });
 
-  document.getElementById('sync-btn').addEventListener('click', async () => {
-    const phone = State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
-    if (!phone) return toast('No WhatsApp connected', 'error');
-    const btn = document.getElementById('sync-btn');
-    if (btn) btn.disabled = true;
-    try {
-      await Api.inbox.sync(phone.id);
-      _chatAutoSynced = false;
-      toast('Synced from WhatsApp', 'success');
-      await loadChats();
-    } catch(e) { toast(e.message || 'Sync failed — is WhatsApp connected?', 'error'); }
-    finally { if (btn) btn.disabled = false; }
-  });
-
-  // Label filter: show only chats carrying a chosen label
-  const lfChip = document.getElementById('label-filter-chip');
-  if (lfChip) lfChip.addEventListener('click', e => {
+  // Phone filter: All phones / one connected number
+  document.getElementById('cx-phone-btn').addEventListener('click', e => {
     e.stopPropagation();
-    openLabelPicker(lfChip, {
-      applied: new Set(State.inbox.labelFilter ? [State.inbox.labelFilter] : []),
-      onToggle: async (label, nowApplied) => {
-        State.inbox.labelFilter = nowApplied ? label.id : null;
-        lfChip.textContent = nowApplied ? `🏷 ${label.name} ×` : '🏷 Label ▾';
-        lfChip.classList.toggle('active', nowApplied);
-        closeLabelPicker();
-        loadChats();
-      },
+    const cur = State.inbox.phoneFilter || null;
+    const pop = cxPopover(e.currentTarget, `
+      <div class="cx-pop-title">Phone</div>
+      <button class="cx-pop-item${!cur ? ' sel' : ''}" data-ph="">${cxIcon('phone', 14)}<span>All phones</span>${!cur ? cxIcon('check', 14) : ''}</button>
+      ${State.phones.map(p => `
+        <button class="cx-pop-item${cur == p.id ? ' sel' : ''}" data-ph="${p.id}">
+          <span class="cx-dot ${p.waha_status === 'WORKING' ? 'ok' : ''}"></span>
+          <span>${esc(cxPhoneLabel(p))}${p.name && p.name !== p.phone_number ? `<small>${esc(p.name)}</small>` : ''}</span>
+          ${cur == p.id ? cxIcon('check', 14) : ''}
+        </button>`).join('')}`);
+    pop.querySelectorAll('[data-ph]').forEach(b => b.addEventListener('click', () => {
+      State.inbox.phoneFilter = b.dataset.ph ? +b.dataset.ph : null;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
+    }));
+  });
+
+  // Folder dropdown: the existing chat filters + by-label
+  document.getElementById('cx-folder-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    const pop = cxPopover(btn, `
+      ${CX_FOLDERS.map(x => {
+        const sel = cxFolderSelected(x.f);
+        return `<button class="cx-pop-item${sel ? ' sel' : ''}" data-folder="${x.f}">${cxIcon('folder', 14)}<span>${x.label}</span>${sel ? cxIcon('check', 14) : ''}</button>`;
+      }).join('')}
+      <div class="cx-pop-sep"></div>
+      <button class="cx-pop-item" data-bylabel="1">${cxIcon('tag', 14)}<span>By label…</span>${cxIcon('chevRight', 14)}</button>
+      ${State.inbox.labelFilter ? `<button class="cx-pop-item" data-clearlabel="1">${cxIcon('x', 14)}<span>Clear label filter</span></button>` : ''}`);
+    pop.querySelectorAll('[data-folder]').forEach(b => b.addEventListener('click', () => {
+      State.inbox.filter = b.dataset.folder;
+      State.inbox.labelFilter = null;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
+    }));
+    pop.querySelector('[data-bylabel]').addEventListener('click', ev => {
+      ev.stopPropagation();
+      cxClosePop();
+      openLabelPicker(btn, {
+        applied: new Set(State.inbox.labelFilter ? [State.inbox.labelFilter] : []),
+        onToggle: async (label, nowApplied) => {
+          State.inbox.labelFilter = nowApplied ? label.id : null;
+          closeLabelPicker(); cxUpdateListHeader(); loadChats();
+        },
+      });
+    });
+    pop.querySelector('[data-clearlabel]')?.addEventListener('click', () => {
+      State.inbox.labelFilter = null;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
     });
   });
 
-  document.getElementById('close-detail-btn').addEventListener('click', () => {
-    document.getElementById('detail-panel').style.display = 'none';
-    document.getElementById('inbox-layout').classList.remove('detail-open');
+  // Filter options: chat type, status, archived
+  document.getElementById('cx-filter-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const i = State.inbox;
+    const opt = (group, val, label, cur) =>
+      `<button class="cx-seg-btn${(cur || '') === val ? ' on' : ''}" data-g="${group}" data-v="${val}">${label}</button>`;
+    const pop = cxPopover(e.currentTarget, `
+      <div class="cx-pop-title">Chat type</div>
+      <div class="cx-seg">${opt('type', '', 'All', i.typeFilter)}${opt('type', 'direct', 'Direct', i.typeFilter)}${opt('type', 'group', 'Groups', i.typeFilter)}</div>
+      <div class="cx-pop-title">Status</div>
+      <div class="cx-seg">${opt('status', '', 'Any', i.statusFilter)}${opt('status', 'open', 'Open', i.statusFilter)}${opt('status', 'resolved', 'Resolved', i.statusFilter)}</div>
+      <label class="cx-pop-check"><input type="checkbox" id="cx-f-archived" ${i.showArchived ? 'checked' : ''}> Show archived chats only</label>
+      ${cxFiltersActive() ? `<button class="cx-pop-item" data-reset="1">${cxIcon('x', 14)}<span>Reset filters</span></button>` : ''}
+      <div class="cx-pop-sep"></div>
+      <button class="cx-pop-item" id="sync-btn">${cxIcon('sync', 14)}<span>Sync chats from WhatsApp</span></button>`,
+      { alignRight: true, cls: 'cx-pop-wide' });
+    pop.querySelector('#sync-btn').addEventListener('click', ev => { ev.stopPropagation(); cxSyncChats(ev.currentTarget); });
+    pop.querySelectorAll('.cx-seg-btn').forEach(b => b.addEventListener('click', () => {
+      if (b.dataset.g === 'type') i.typeFilter = b.dataset.v || null;
+      else i.statusFilter = b.dataset.v || null;
+      pop.querySelectorAll(`.cx-seg-btn[data-g="${b.dataset.g}"]`).forEach(x => x.classList.toggle('on', x === b));
+      cxUpdateListHeader(); loadChats();
+    }));
+    pop.querySelector('#cx-f-archived').addEventListener('change', ev => {
+      i.showArchived = ev.target.checked;
+      cxUpdateListHeader(); loadChats();
+    });
+    pop.querySelector('[data-reset]')?.addEventListener('click', () => {
+      i.typeFilter = i.statusFilter = null; i.showArchived = false;
+      cxClosePop(); cxUpdateListHeader(); loadChats();
+    });
+  });
+
+  document.getElementById('cx-pause-btn').addEventListener('click', () => cxSetPaused(!_cxPaused));
+  cxRenderPauseBtn();
+
+  // Chat rows (delegated): "+ Label" / label chips open the picker, else open chat
+  document.getElementById('chat-list').addEventListener('click', e => {
+    const chip = e.target.closest('[data-addlabel]');
+    if (chip) {
+      e.stopPropagation();
+      const chat = State.inbox.chats?.find(x => x.id == chip.dataset.addlabel);
+      if (chat) cxOpenChatLabelPicker(chip, chat);
+      return;
+    }
+    const row = e.target.closest('.chat-item[data-cid]');
+    if (row) openChat(+row.dataset.cid);
+  });
+
+  cxUpdateListHeader();
+  await _inboxReady;
+}
+
+async function cxSyncChats(btn) {
+  const phone = State.phones.find(p => p.id == State.inbox.phoneFilter && p.waha_status === 'WORKING')
+    || State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
+  if (!phone) return toast('No WhatsApp connected', 'error');
+  if (btn) { btn.disabled = true; btn.classList.add('spinning'); }
+  try {
+    await Api.inbox.sync(phone.id);
+    _chatAutoSynced = false;
+    toast('Synced from WhatsApp', 'success');
+    cxClosePop();
+    await loadChats();
+  } catch(e) { toast(e.message || 'Sync failed — is WhatsApp connected?', 'error'); }
+  finally { if (btn && btn.isConnected) { btn.disabled = false; btn.classList.remove('spinning'); } }
+}
+
+// ── Pause live re-ordering ─────────────────────────────────────── //
+// While paused, new activity still updates each row in place (preview,
+// unread count) but nothing moves; resuming bubbles those chats up.
+let _cxPaused = false;
+const _cxPending = new Map();     // chat id → true (known) / false (not in the list yet)
+function cxRenderPauseBtn() {
+  const b = document.getElementById('cx-pause-btn');
+  if (!b) return;
+  const n = _cxPending.size;
+  b.classList.toggle('on', _cxPaused);
+  b.setAttribute('aria-pressed', String(_cxPaused));
+  b.title = _cxPaused
+    ? (n ? `Paused — ${n} chat${n === 1 ? '' : 's'} with new activity. Resume to update the list` : 'Paused — resume live updates')
+    : 'Pause live updates (stop the list from re-ordering)';
+  b.setAttribute('aria-label', b.title);
+  b.innerHTML = _cxPaused
+    ? `${cxIcon('play', 15)}${n ? `<span class="cx-pause-count">${n > 99 ? '99+' : n}</span>` : ''}`
+    : cxIcon('pause', 15);
+}
+function cxSetPaused(on) {
+  _cxPaused = !!on;
+  if (!_cxPaused && _cxPending.size) {
+    const unknown = [..._cxPending.values()].some(v => !v);
+    const ids = new Set(_cxPending.keys());
+    _cxPending.clear();
+    if (unknown) loadChats();
+    else {
+      const moved = State.inbox.chats.filter(c => ids.has(c.id))
+        .sort((a, b) => (parseServerDate(b.last_message_at) || 0) - (parseServerDate(a.last_message_at) || 0));
+      State.inbox.chats = moved.concat(State.inbox.chats.filter(c => !ids.has(c.id)));
+      renderChatList(State.inbox.chats, _chatHasMore);
+    }
+  }
+  cxRenderPauseBtn();
+}
+
+function cxOpenChatLabelPicker(anchor, chat) {
+  openLabelPicker(anchor, {
+    applied: new Set(chat.labels || []),
+    onToggle: async (label, nowApplied) => {
+      if (nowApplied) await Api.inbox.addLabel(chat.id, label.id);
+      else await Api.inbox.removeLabel(chat.id, label.id);
+      chat.labels = nowApplied
+        ? [...new Set([...(chat.labels || []), label.id])]
+        : (chat.labels || []).filter(id => id !== label.id);
+      renderChatList(State.inbox.chats, _chatHasMore);
+      if (State.inbox.selectedChatId == chat.id) cxRefreshDetailHead(chat);
+    },
   });
 }
 
 let _chatDebounce = null;
+let _inboxReady = null;   // promise of the initial loadChats() in renderInbox
 let _chatAutoSynced = false;
 let _dashWahaTimer = null;
 let _dashWahaUpdating = false;
@@ -770,13 +1673,21 @@ function debounceLoadChats() {
 }
 
 let _chatLoadOffset = 0;
+let _chatListSeq = 0;        // bumps on every loadChats(); stale responses compare against it
+let _chatHasMore = false;
+let _chatLoadingMore = false;
 const CHAT_PAGE = 200;
 
 async function loadChats() {
+  const seq = ++_chatListSeq;
   _chatLoadOffset = 0;
+  _chatLoadingMore = false;
+  // A full reload re-orders everything anyway
+  if (_cxPending.size) { _cxPending.clear(); cxRenderPauseBtn(); }
 
   // Refresh phone state from server so status is always current
   try { State.phones = await Api.phones.list(); } catch(_) {}
+  if (seq !== _chatListSeq) return;
 
   const phoneConnected = State.phones.some(p => p.waha_status === 'WORKING');
   const phone = State.phones.find(p => p.waha_status === 'WORKING') || State.phones[0];
@@ -788,12 +1699,12 @@ async function loadChats() {
     State.inbox.selectedChatId = null;
     const chatList = document.getElementById('chat-list');
     if (chatList) chatList.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:1rem;padding:2rem;text-align:center">
-      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1.4"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--text-3)" stroke-width="1.4"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
       <div>
         <p style="font-weight:600;color:var(--text-2);margin:0 0 .35rem">WhatsApp disconnected</p>
         <span style="font-size:12px;color:var(--text-3)">Connect your WhatsApp to see conversations</span>
       </div>
-      <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect WhatsApp</button>
+      <button class="btn btn-primary btn-sm" onclick="switchView('settings/phones')">Connect WhatsApp</button>
     </div>`;
     const threadPanel = document.getElementById('thread-panel');
     if (threadPanel) {
@@ -804,25 +1715,18 @@ async function loadChats() {
         </svg>
         <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0 0 .25rem">WhatsApp Disconnected</p>
         <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to start viewing conversations and sending messages.</span>
-        <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
+        <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings/phones')">Connect WhatsApp</button>
       </div>`;
     }
+    cxCloseDetail(false);
     _updateUnreadBadge([]);
     return;
   }
 
   // Restore thread panel empty state if it was showing the disconnected message
   const threadPanel = document.getElementById('thread-panel');
-  if (threadPanel && !State.inbox.selectedChatId) {
-    if (threadPanel.querySelector('.whatsapp-disconnected-thread') || threadPanel.innerHTML.includes('WhatsApp Disconnected')) {
-      threadPanel.innerHTML = `<div class="empty-state" style="flex:1">
-        <div class="empty-state-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.15"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        </div>
-        <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.6">Select a conversation</p>
-        <p style="font-size:13px;color:var(--text-3)">Choose a chat from the list to start messaging</p>
-      </div>`;
-    }
+  if (threadPanel && !State.inbox.selectedChatId && threadPanel.querySelector('.whatsapp-disconnected-thread')) {
+    threadPanel.innerHTML = cxEmptyThread();
   }
 
   const q = _buildChatQuery();
@@ -831,10 +1735,11 @@ async function loadChats() {
 
   try {
     let chats = await Api.inbox.chats(q);
+    if (seq !== _chatListSeq) return;
     if (!Array.isArray(chats)) chats = [];
 
     // Auto-sync from WAHA when inbox is empty and phone is connected
-    if (chats.length === 0 && !_chatAutoSynced) {
+    if (chats.length === 0 && !_chatAutoSynced && !Object.keys(q).some(k => !['limit', 'offset'].includes(k))) {
       _chatAutoSynced = true;
       const chatList = document.getElementById('chat-list');
       if (chatList) chatList.innerHTML = `<div class="loading-center" style="flex-direction:column;gap:.5rem">
@@ -846,13 +1751,17 @@ async function loadChats() {
         chats = await Api.inbox.chats(q);
         if (!Array.isArray(chats)) chats = [];
       } catch(_) {}
+      if (seq !== _chatListSeq) return;
     }
 
+    const rawCount = chats.length;
     chats = _filterChats(chats);
     State.inbox.chats = chats;
-    renderChatList(chats, chats.length === CHAT_PAGE);
+    _chatHasMore = rawCount === CHAT_PAGE;
+    renderChatList(chats, _chatHasMore);
     _updateUnreadBadge(chats);
   } catch(err) {
+    if (seq !== _chatListSeq) return;
     const chatList = document.getElementById('chat-list');
     if (chatList) chatList.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:.5rem">
       <span>Failed to load chats</span>
@@ -864,14 +1773,19 @@ async function loadChats() {
 function refreshChatList() { loadChats(); }
 
 function _buildChatQuery() {
-  const f = State.inbox.filter;
+  const i = State.inbox;
+  const f = i.filter;
   const q = {};
   if (f === 'flagged') q.is_flagged = true;
-  if (f === 'archived') q.is_archived = true;
-  if (f === 'inbox') q.is_archived = false;
+  if (f === 'archived' || i.showArchived) q.is_archived = true;
+  else if (f === 'inbox') q.is_archived = false;
   if (f === 'mine' && State.agent) q.assigned_to = State.agent.id;
-  if (State.inbox.labelFilter) q.label_id = State.inbox.labelFilter;
-  if (State.inbox.search) q.search = State.inbox.search;
+  if (i.labelFilter) q.label_id = i.labelFilter;
+  if (i.search) q.search = i.search;
+  if (i.phoneFilter) q.phone_id = i.phoneFilter;
+  if (i.typeFilter === 'group') q.is_group = true;
+  else if (i.typeFilter === 'direct') q.is_group = false;
+  if (i.statusFilter) q.status = i.statusFilter;
   return q;
 }
 
@@ -883,497 +1797,1402 @@ function _filterChats(chats) {
   return chats;
 }
 
-function _updateUnreadBadge(chats) {
-  const total = chats.reduce((s, c) => s + (c.unread_count || 0), 0);
-  const badge = document.getElementById('unread-badge');
-  if (badge) { badge.textContent = total; badge.style.display = total ? 'inline-flex' : 'none'; }
+// Sidebar "Chats" badge = number of unread chats across the agent's numbers.
+// Comes from the server so it's right on every page, not just the loaded list page.
+let _unreadBadgeTimer = null;
+function refreshUnreadBadge(delay = 0) {
+  clearTimeout(_unreadBadgeTimer);
+  _unreadBadgeTimer = setTimeout(async () => {
+    if (!State.agent) return;
+    try {
+      const s = await Api.analytics.summary();
+      const n = s?.chats?.unread || 0;
+      const badge = document.getElementById('unread-badge');
+      if (badge) { badge.textContent = n > 99 ? '99+' : n; badge.style.display = n ? 'inline-flex' : 'none'; }
+    } catch (_) { /* keep the last value */ }
+  }, delay);
 }
+function _updateUnreadBadge() { refreshUnreadBadge(1500); }
 
 async function loadMoreChats() {
+  if (_chatLoadingMore || !_chatHasMore) return;
+  _chatLoadingMore = true;
+  const seq = _chatListSeq;
   const btn = document.getElementById('load-more-chats-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
-  _chatLoadOffset += CHAT_PAGE;
+  const offset = _chatLoadOffset + CHAT_PAGE;
   const q = _buildChatQuery();
   q.limit = CHAT_PAGE;
-  q.offset = _chatLoadOffset;
+  q.offset = offset;
   try {
     let more = await Api.inbox.chats(q);
+    if (seq !== _chatListSeq) return;
     if (!Array.isArray(more)) more = [];
-    more = _filterChats(more);
+    _chatLoadOffset = offset;
+    _chatHasMore = more.length === CHAT_PAGE;
+    // Live updates may have bubbled chats up — never list one twice
+    const seen = new Set(State.inbox.chats.map(c => c.id));
+    more = _filterChats(more).filter(c => !seen.has(c.id));
     State.inbox.chats = State.inbox.chats.concat(more);
-    // Re-render full list with "load more" button if we got a full page
-    renderChatList(State.inbox.chats, more.length === CHAT_PAGE);
+    renderChatList(State.inbox.chats, _chatHasMore);
     _updateUnreadBadge(State.inbox.chats);
   } catch(e) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Load more'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Load more conversations'; }
+  } finally {
+    if (seq === _chatListSeq) _chatLoadingMore = false;
   }
 }
 
+const CX_MEDIA_LABEL_RE = /^(📷 Photo|🎬 Video|🎤 Voice message|📄 Document|🖼 Sticker|🎞 GIF|📍 Location|👤 Contact|📎 Media)$/u;
+function cxTypeIcon(type, body) {
+  const t = String(type || '').toLowerCase();
+  if (['image', 'photo', 'sticker', 'gif'].includes(t)) return 'image';
+  if (t === 'video') return 'video';
+  if (['audio', 'ptt', 'voice'].includes(t)) return 'mic';
+  if (['document', 'pdf', 'file'].includes(t)) return 'doc';
+  if (t === 'location') return 'location';
+  if (t === 'contact' || t === 'vcard') return 'user';
+  if (t === 'poll_creation') return 'chart';
+  if (/^(📢|📣)/u.test(body || '')) return 'megaphone';
+  return '';
+}
+
+function cxChatRow(c) {
+  const name = displayName(c);
+  const unread = c.unread_count || 0;
+  const active = c.id == State.inbox.selectedChatId ? ' active' : '';
+  const labels = (c.labels || []).map(id => State.labels.find(l => l.id == id)).filter(Boolean);
+  const labelHtml = labels.length
+    ? `<span class="cx-lchips" data-addlabel="${c.id}" title="Edit labels">${labels.slice(0, 2).map(l =>
+        `<span class="cx-lchip" style="--lc:${safeColor(l.color)}">${esc(l.name)}</span>`).join('')}${labels.length > 2 ? `<span class="cx-lchip more">+${labels.length - 2}</span>` : ''}</span>`
+    : `<span class="cx-add-label" data-addlabel="${c.id}">+ Label</span>`;
+
+  let preview = c.last_message || '';
+  const icon = cxTypeIcon(c.last_message_type, preview);
+  if (icon) preview = preview.replace(/^(📷|🎬|🎤|📄|🖼|🎞|📍|👤|📎|📊|📢|📣)\s*/u, '');
+  let sender = '';
+  if (c.is_group && preview) {
+    if (c.last_message_from_me) sender = 'You';
+    else if (c.last_message_sender) sender = displayName(c.last_message_sender);
+  }
+  const phone = cxPhoneOf(c);
+  return `<div class="chat-item cx-row${active}" data-cid="${c.id}">
+    ${cxAvatar(c, 40)}
+    <div class="cx-row-main">
+      <div class="cx-r1">
+        <span class="cx-name">${esc(name)}</span>
+        ${labelHtml}
+      </div>
+      <div class="cx-r2">
+        <span class="cx-preview">${sender ? `<b>${esc(sender)}:</b> ` : ''}${icon ? cxIcon(icon, 13) : ''}<span>${esc(preview.substring(0, 120))}</span></span>
+        <span class="cx-r2-right">
+          ${unread ? `<span class="cx-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+          ${c.is_flagged ? `<span class="cx-flag" title="Flagged">${cxIcon('flag', 13)}</span>` : ''}
+          ${cxAssigneeAvatar(c.assigned_to, 20)}
+        </span>
+      </div>
+      <div class="cx-r3">
+        <span class="cx-phone">${phone ? `${cxIcon('phone', 11)}${esc(cxPhoneLabel(phone))}` : ''}</span>
+        ${c.ai_active ? '<span class="ai-badge">AI</span>' : ''}
+        <span class="cx-date">${esc(cxFmtListDate(c.last_message_at))}</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+let _cxListObserver = null;
 function renderChatList(chats, hasMore) {
   const el = document.getElementById('chat-list');
   if (!el) return;
+  if (_cxListObserver) { _cxListObserver.disconnect(); _cxListObserver = null; }
   if (!chats.length) {
     el.innerHTML = `<div class="loading-center text-muted">No conversations</div>`; return;
   }
-  el.innerHTML = chats.map(c => {
-    const active = c.id == State.inbox.selectedChatId ? ' active' : '';
-    const color = avatarColor(displayName(c));
-    const isGroup = c.is_group;
-    const unread = c.unread_count || 0;
+  el.innerHTML = chats.map(cxChatRow).join('') + (hasMore
+    ? `<div class="cx-more" id="cx-chat-more"><button id="load-more-chats-btn" class="btn btn-secondary btn-sm">Load more conversations</button></div>`
+    : '');
 
-    // Phone tag: find phone name from State.phones using c.phone_id
-    let phoneTagHtml = '';
-    if (isGroup) {
-      phoneTagHtml = `<span class="chat-phone-tag">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
-        Group
-      </span>`;
-    } else if (c.phone_id && State.phones.length) {
-      const phone = State.phones.find(p => p.id === c.phone_id);
-      if (phone) {
-        phoneTagHtml = `<span class="chat-phone-tag">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
-          ${esc(phone.name || phone.phone_number)}
-        </span>`;
-      }
-    }
-
-    // Label chips
-    let labelsHtml = '';
-    if (c.labels && c.labels.length) {
-      labelsHtml = `<div class="chat-item-labels">${c.labels.slice(0,4).map(lbl => {
-        const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
-        const color2 = labelObj ? labelObj.color : '#9ca3af';
-        const name = labelObj ? labelObj.name : (lbl || '');
-        return `<span class="chat-label-mini" style="background:${color2}22;color:${color2};border:1px solid ${color2}44">${esc(name)}</span>`;
-      }).join('')}</div>`;
-    }
-
-    return `<div class="chat-item${active}" data-cid="${c.id}">
-      <div class="chat-avatar${isGroup?' group':''}" style="background:${color}">${initials(displayName(c))}</div>
-      <div class="chat-meta">
-        <div class="chat-meta-top">
-          <span class="chat-name">${esc(displayName(c))}</span>
-          <span class="chat-time">${timeAgo(c.last_message_at)}</span>
-        </div>
-        <div class="chat-meta-bottom">
-          <span class="chat-preview">${esc((c.last_message||'').substring(0,55))}</span>
-          <div class="chat-badges-right">
-            ${c.is_flagged ? `<svg viewBox="0 0 24 24" fill="#f59e0b" style="width:11px;height:11px;flex-shrink:0"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15" stroke="#f59e0b" stroke-width="2"/></svg>` : ''}
-            ${c.ai_active ? `<span class="ai-badge">AI</span>` : ''}
-            ${unread ? `<span class="unread-dot">${unread > 99 ? '99+' : unread}</span>` : ''}
-          </div>
-        </div>
-        ${phoneTagHtml ? `<div style="display:flex;align-items:center;gap:.25rem;margin-top:2px">${phoneTagHtml}${!labelsHtml ? `<span class="add-label-chip" data-addlabel="${c.id}">+ Label</span>` : ''}</div>` : (!labelsHtml ? `<div style="margin-top:2px"><span class="add-label-chip" data-addlabel="${c.id}">+ Label</span></div>` : '')}
-        ${labelsHtml}
-      </div>
-    </div>`;
-  }).join('');
-
-  // "+ Label" chips: inline label picker with create-on-the-fly
-  el.querySelectorAll('.add-label-chip').forEach(chip => {
-    chip.addEventListener('click', e => {
-      e.stopPropagation();
-      const chat = State.inbox.chats?.find(x => x.id == chip.dataset.addlabel);
-      if (!chat) return;
-      openLabelPicker(chip, {
-        applied: new Set(chat.labels || []),
-        onToggle: async (label, nowApplied) => {
-          if (nowApplied) await Api.inbox.addLabel(chat.id, label.id);
-          else await Api.inbox.removeLabel(chat.id, label.id);
-          chat.labels = nowApplied
-            ? [...(chat.labels || []), label.id]
-            : (chat.labels || []).filter(id => id !== label.id);
-        },
-      });
-    });
-  });
-
-  el.querySelectorAll('.chat-item').forEach(el => {
-    el.addEventListener('click', () => openChat(+el.dataset.cid));
-  });
-
-  // "Load more chats" button when there's a full page (more may exist)
+  // Infinite scroll: fetch the next page when the footer scrolls into view
   if (hasMore) {
-    const morBtn = document.createElement('div');
-    morBtn.style.cssText = 'text-align:center;padding:.75rem 1rem';
-    morBtn.innerHTML = `<button id="load-more-chats-btn" class="btn btn-secondary btn-sm" style="width:100%;font-size:12px">Load more conversations</button>`;
-    el.appendChild(morBtn);
     document.getElementById('load-more-chats-btn').addEventListener('click', loadMoreChats);
+    if ('IntersectionObserver' in window) {
+      _cxListObserver = new IntersectionObserver(entries => {
+        if (entries[0].isIntersecting) loadMoreChats();
+      }, { root: el, rootMargin: '300px' });
+      _cxListObserver.observe(document.getElementById('cx-chat-more'));
+    }
   }
+  cxQueuePictures(chats);
+}
+
+// Update one row in place (live updates) without re-rendering the list
+function cxRerenderRow(chat) {
+  const row = document.querySelector(`#chat-list .chat-item[data-cid="${chat.id}"]`);
+  if (row) row.outerHTML = cxChatRow(chat);
 }
 
 async function openChat(chatId) {
+  chatId = +chatId;
+  let chat = State.inbox.chats.find(c => c.id === chatId);
+  if (!chat) {
+    // Opened from elsewhere (media page, search) and not in the current list page
+    try { chat = await Api.inbox.getChat(chatId); } catch (_) { toast('Chat not found', 'error'); return; }
+    if (State.currentView !== 'inbox' || !chat?.id) return;
+    State.inbox.chats = [chat, ...State.inbox.chats.filter(c => c.id !== chat.id)];
+    renderChatList(State.inbox.chats, _chatHasMore);
+  }
   State.inbox.selectedChatId = chatId;
   document.querySelectorAll('.chat-item').forEach(el => {
     el.classList.toggle('active', +el.dataset.cid === chatId);
   });
-  const chat = State.inbox.chats.find(c => c.id === chatId);
-  if (!chat) return;
+  document.getElementById('inbox-layout')?.classList.add('cx-thread-open');
   // Immediately mark as read in state so unread badge clears without a re-fetch
   if (chat.unread_count) {
     chat.unread_count = 0;
     _updateUnreadBadge(State.inbox.chats);
-    document.querySelectorAll(`.chat-item[data-cid="${chatId}"] .unread-dot`).forEach(d => d.remove());
+    document.querySelectorAll(`.chat-item[data-cid="${chatId}"] .cx-unread`).forEach(d => d.remove());
   }
-  const wasDetailOpen = document.getElementById('detail-panel')?.style.display !== 'none';
   renderThread(chat);
-  if (wasDetailOpen) renderContactDetail(chat);
+  const detail = document.getElementById('detail-panel');
+  if (detail && (detail.style.display !== 'none' || cxDetailPref())) renderContactDetail(chat);
   Api.inbox.markRead(chatId).catch(()=>{});
+  Api.inbox.picture(chatId).then(r => { if (r && r.url) cxSetPicture(chatId, r.url); }).catch(() => {});
   await loadMessages(chatId);
 }
 
-// ── Contact Detail Panel ────────────────────────────────────────── //
-async function renderContactDetail(chat) {
+// Open a chat from another view and, if loaded, scroll to one message
+async function cxOpenChatAt(chatId, messageId) {
+  if (State.currentView !== 'inbox') {
+    navigateTo('inbox');
+    await Promise.resolve(_inboxReady);
+  }
+  if (State.currentView !== 'inbox') return;
+  if (!State.phones.some(p => p.waha_status === 'WORKING')) return toast('WhatsApp disconnected — connect it to open chats', 'error');
+  await openChat(chatId);
+  if (!messageId || State.inbox.selectedChatId != chatId) return;
+  const el = document.querySelector(`#messages-area .msg[data-mid="${+messageId}"]`);
+  if (el) {
+    el.scrollIntoView({ block: 'center' });
+    el.classList.add('cx-flash');
+    setTimeout(() => el.classList.remove('cx-flash'), 2200);
+  }
+}
+
+// ── Assignment ─────────────────────────────────────────────────── //
+function cxOpenAssignPop(anchor, chat, opts = {}) {
+  const agents = Object.values(_cxAgentMap);
+  const pop = cxPopover(anchor, `
+    <div class="cx-pop-title">Assign to</div>
+    <button class="cx-pop-item${chat.assigned_to == null ? ' sel' : ''}" data-aid="">${cxAssigneeAvatar(null, 20)}<span>Unassigned</span>${chat.assigned_to == null ? cxIcon('check', 14) : ''}</button>
+    ${agents.map(a => `
+      <button class="cx-pop-item${chat.assigned_to == a.id ? ' sel' : ''}" data-aid="${a.id}">
+        ${cxAssigneeAvatar(a.id, 20)}<span>${esc(a.name)}${State.agent && a.id === State.agent.id ? ' <small>(you)</small>' : ''}</span>${chat.assigned_to == a.id ? cxIcon('check', 14) : ''}
+      </button>`).join('')}`, { alignRight: !!opts.alignRight, cls: 'cx-pop-scroll' });
+  pop.querySelectorAll('[data-aid]').forEach(b => b.addEventListener('click', async () => {
+    cxClosePop();
+    await cxAssign(chat, b.dataset.aid ? +b.dataset.aid : null);
+  }));
+}
+async function cxAssign(chat, agentId) {
+  try {
+    await Api.inbox.updateChat(chat.id, { assigned_to: agentId });
+    chat.assigned_to = agentId;
+    toast(agentId ? `Assigned to ${_cxAgentMap[agentId]?.name || 'agent'}` : 'Unassigned', 'success');
+    cxRerenderRow(chat);
+    if (State.inbox.selectedChatId == chat.id) {
+      const hb = document.getElementById('cx-assign-btn');
+      if (hb) hb.innerHTML = cxAssigneeAvatar(chat.assigned_to, 28, { dot: true });
+      const dh = document.getElementById('cx-dp-assign');
+      if (dh) dh.innerHTML = cxAssigneeAvatar(chat.assigned_to, 26, { dot: true });
+      const sel = document.getElementById('detail-assign-select');
+      if (sel) sel.value = agentId == null ? '' : String(agentId);
+      const sa = document.getElementById('cx-set-assign');
+      if (sa) sa.innerHTML = cxSettingsAssignHtml(chat);
+    }
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+// ── Contact Detail Panel (tabbed) ──────────────────────────────── //
+const CX_TABS = [
+  { id: 'details',    icon: 'list',    label: 'Details' },
+  { id: 'properties', icon: 'props',   label: 'Properties' },
+  { id: 'ai',         icon: 'sparkle', label: 'AI' },
+  { id: 'tickets',    icon: 'ticket',  label: 'Tickets & Tasks' },
+  { id: 'members',    icon: 'users',   label: 'Members', group: true },
+  { id: 'media',      icon: 'image',   label: 'Media' },
+  { id: 'analytics',  icon: 'chart',   label: 'Analytics', group: true },
+  { id: 'history',    icon: 'clock',   label: 'History' },
+  { id: 'notes',      icon: 'note',    label: 'Notes' },
+  { id: 'settings',   icon: 'sliders', label: 'Settings' },
+];
+let _cxDetailTab = 'details';
+let _cxDetailSeq = 0;
+const _cxParticipants = new Map();   // chat id → participants promise
+
+function cxParticipants(chat, refresh) {
+  if (refresh || !_cxParticipants.has(chat.id)) {
+    const p = Api.groups.participants(chat.id, refresh).catch(e => { _cxParticipants.delete(chat.id); throw e; });
+    _cxParticipants.set(chat.id, p);
+  }
+  return _cxParticipants.get(chat.id);
+}
+// Group subject / description / settings + whether our number is a member
+// or admin (server caches WAHA for ~5 min; this keeps one request per chat)
+const _cxGroupInfo = new Map();
+function cxGroupInfo(chat, refresh) {
+  if (refresh || !_cxGroupInfo.has(chat.id)) {
+    const p = Api.groups.info(chat.id, refresh).catch(e => { _cxGroupInfo.delete(chat.id); throw e; });
+    _cxGroupInfo.set(chat.id, p);
+  }
+  return _cxGroupInfo.get(chat.id);
+}
+function cxForgetGroup(chatId) { _cxParticipants.delete(chatId); _cxGroupInfo.delete(chatId); }
+
+function cxCloseDetail(savePref = true) {
   const panel = document.getElementById('detail-panel');
-  const body = document.getElementById('detail-panel-body');
+  if (panel) panel.style.display = 'none';
+  document.getElementById('inbox-layout')?.classList.remove('detail-open');
+  document.getElementById('btn-details-toggle')?.classList.remove('on');
+  if (savePref) cxSetDetailPref(false);
+}
+
+function cxDetailLabelsHtml(chat) {
+  const labels = (chat.labels || []).map(id => State.labels.find(l => l.id == id)).filter(Boolean);
+  return labels.length
+    ? labels.map(l => `<span class="cx-lchip" style="--lc:${safeColor(l.color)}">${esc(l.name)}</span>`).join('') + `<button class="cx-add-label" data-dp-label="1" title="Edit labels">+</button>`
+    : `<button class="cx-add-label" data-dp-label="1">+ Label</button>`;
+}
+function cxRefreshDetailHead(chat) {
+  const el = document.getElementById('cx-dp-labels');
+  if (el) {
+    el.innerHTML = cxDetailLabelsHtml(chat);
+    el.querySelector('[data-dp-label]')?.addEventListener('click', e => { e.stopPropagation(); cxOpenChatLabelPicker(e.currentTarget, chat); });
+  }
+}
+
+async function renderContactDetail(chat, tab) {
+  const panel = document.getElementById('detail-panel');
   const layout = document.getElementById('inbox-layout');
-  if (!panel || !body || !layout) return;
+  if (!panel || !layout) return;
+  if (tab) _cxDetailTab = tab;
+  const tabs = CX_TABS.filter(t => !t.group || chat.is_group);
+  if (!tabs.some(t => t.id === _cxDetailTab)) _cxDetailTab = 'details';
 
   panel.style.display = 'flex';
   layout.classList.add('detail-open');
+  document.getElementById('btn-details-toggle')?.classList.add('on');
+  cxSetDetailPref(true);
 
-  const color = avatarColor(chat.name || chat.chat_wid);
-  const chatLabels = chat.labels || [];
-
-  // Build label chips
-  const labelsMarkup = chatLabels.map(lbl => {
-    const labelObj = State.labels.find(l => l.id === lbl || l.name === lbl);
-    const lColor = labelObj ? labelObj.color : '#9ca3af';
-    const lName = labelObj ? labelObj.name : String(lbl);
-    return `<span class="detail-label-chip" style="background:${lColor}22;color:${lColor};border:1px solid ${lColor}44" data-label="${esc(lbl)}">
-      ${esc(lName)}<span class="chip-remove" data-remove-label="${esc(lbl)}">×</span>
-    </span>`;
-  }).join('');
-
-  // Build agent options
-  let agentOpts = `<option value="">— Unassigned —</option>`;
-  try {
-    const agents = await Api.auth.agents();
-    agentOpts += agents.map(a =>
-      `<option value="${a.id}" ${chat.assigned_to == a.id ? 'selected' : ''}>${esc(a.name)}</option>`
-    ).join('');
-  } catch(_) {}
-
-  // Available labels for "add" list
-  const availableLabels = State.labels.filter(l => !chatLabels.includes(l.id) && !chatLabels.includes(l.name));
-  const addLabelOpts = availableLabels.map(l =>
-    `<option value="${l.id}">${esc(l.name)}</option>`
-  ).join('');
-
-  body.innerHTML = `
-    <div class="detail-contact-top">
-      <div class="detail-avatar" style="background:${color}">${initials(displayName(chat))}</div>
-      <div class="detail-contact-name">${esc(displayName(chat))}</div>
-      <div class="detail-contact-wid">${esc(chatSubtitle(chat))}</div>
+  panel.innerHTML = `
+    <div class="cx-dp-head">
+      ${cxAvatar(chat, 56)}
+      <div class="cx-dp-title">
+        <div class="cx-dp-name" title="${esc(displayName(chat))}">${esc(displayName(chat))}</div>
+        <div class="cx-dp-labels" id="cx-dp-labels"></div>
+      </div>
+      <div class="cx-dp-actions">
+        <button class="cx-assign-btn sm" id="cx-dp-assign" title="Assign" aria-label="Assign chat">${cxAssigneeAvatar(chat.assigned_to, 26, { dot: true })}</button>
+        <button class="cx-ibtn" id="cx-dp-edit" title="Edit properties" aria-label="Edit properties">${cxIcon('edit')}</button>
+        <button class="cx-ibtn" id="cx-dp-sync" title="Sync messages from WhatsApp" aria-label="Sync">${cxIcon('sync')}</button>
+        <button class="cx-ibtn" id="close-detail-btn" title="Collapse panel" aria-label="Collapse panel">${cxIcon('panel')}</button>
+      </div>
     </div>
+    <div class="cx-dp-tabs" role="tablist">
+      ${tabs.map(t => `<button class="cx-dp-tab${t.id === _cxDetailTab ? ' on' : ''}" data-tab="${t.id}" role="tab" aria-selected="${t.id === _cxDetailTab}" aria-label="${esc(t.label)}" title="${esc(t.label)}">${cxIcon(t.icon, 16)}${t.id === _cxDetailTab ? `<span>${esc(t.label)}</span>` : ''}</button>`).join('')}
+    </div>
+    <div class="detail-panel-body cx-dp-body" id="detail-panel-body"></div>`;
 
+  cxRefreshDetailHead(chat);
+  panel.querySelectorAll('.cx-dp-tab').forEach(b => b.addEventListener('click', () => renderContactDetail(chat, b.dataset.tab)));
+  // Keep the active tab visible when the row overflows (narrow panels)
+  const tabRow = panel.querySelector('.cx-dp-tabs'), onTab = panel.querySelector('.cx-dp-tab.on');
+  if (tabRow && onTab && tabRow.scrollWidth > tabRow.clientWidth) {
+    const l = onTab.offsetLeft - tabRow.offsetLeft, r = l + onTab.offsetWidth;
+    if (r > tabRow.clientWidth) tabRow.scrollLeft = r - tabRow.clientWidth + 8;
+  }
+  cxTeam(chat).then(cxRefreshOnlineDots).catch(() => {});
+  document.getElementById('close-detail-btn').addEventListener('click', () => cxCloseDetail());
+  document.getElementById('cx-dp-assign').addEventListener('click', e => { e.stopPropagation(); cxOpenAssignPop(e.currentTarget, chat, { alignRight: true }); });
+  document.getElementById('cx-dp-edit').addEventListener('click', () => renderContactDetail(chat, 'properties'));
+  document.getElementById('cx-dp-sync').addEventListener('click', async e => {
+    const b = e.currentTarget;
+    b.classList.add('spinning');
+    await cxSyncThread(chat);
+    b.classList.remove('spinning');
+    if (State.inbox.selectedChatId == chat.id && ['members', 'settings'].includes(_cxDetailTab)) renderContactDetail(chat);
+  });
+
+  const body = document.getElementById('detail-panel-body');
+  const seq = ++_cxDetailSeq;
+  const stale = () => seq !== _cxDetailSeq || State.inbox.selectedChatId != chat.id || !body.isConnected;
+  const renderers = {
+    details: cxTabDetails, properties: cxTabProperties, ai: cxTabAI, tickets: cxTabTickets,
+    members: cxTabMembers, media: cxTabMedia, analytics: cxTabAnalytics, history: cxTabHistory, notes: cxTabNotes,
+    settings: cxTabSettings,
+  };
+  try { await renderers[_cxDetailTab](chat, body, stale); }
+  catch (e) { if (!stale()) body.innerHTML = `<div class="cx-dp-empty">Could not load — ${esc(e.message || 'error')}</div>`; }
+}
+
+function cxDpLoading() { return '<div class="cx-dp-empty"><div class="spinner" style="width:16px;height:16px"></div></div>'; }
+
+async function cxTabDetails(chat, body) {
+  const phone = cxPhoneOf(chat);
+  const agentOpts = `<option value="">— Unassigned —</option>` + Object.values(_cxAgentMap).map(a =>
+    `<option value="${a.id}" ${chat.assigned_to == a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
+  const resolved = (chat.status || 'open') === 'resolved';
+  body.innerHTML = `
     <div class="detail-section">
       <div class="detail-section-label">Assigned To</div>
-      <select class="detail-assign-select" id="detail-assign-select">
-        ${agentOpts}
-      </select>
+      <select class="detail-assign-select" id="detail-assign-select">${agentOpts}</select>
     </div>
-
     <div class="detail-section">
-      <div class="detail-section-label">Labels</div>
-      <div class="detail-labels-row" id="detail-labels-row">
-        ${labelsMarkup || '<span style="font-size:12px;color:var(--text-3);font-style:italic">No labels yet</span>'}
-      </div>
-      ${availableLabels.length ? `
-      <div style="display:flex;gap:.4rem;align-items:center;margin-top:.4rem">
-        <select id="detail-add-label-select" style="font-size:11.5px;padding:2px 5px;border:1px solid var(--border);border-radius:4px;flex:1;height:26px;background:#fff">
-          <option value="">+ Add label…</option>
-          ${addLabelOpts}
-        </select>
-      </div>` : `<div style="font-size:11.5px;color:var(--text-3);margin-top:.35rem">
-        <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent);text-decoration:none">Create labels</a> in Settings
-      </div>`}
+      <div class="detail-section-label">${chat.is_group ? 'Group' : 'Contact'}</div>
+      <div class="cx-kv"><span>${chat.is_group ? 'Type' : 'Number'}</span><span>${esc(chat.is_group ? 'Group chat' : (chatSubtitle(chat) || '—'))}</span></div>
+      <div class="cx-kv"><span>Via</span><span>${phone ? `${CX_WA_LOGO} ${esc(cxPhoneLabel(phone))}` : '—'}</span></div>
+      ${phone?.name && phone.name !== phone.phone_number ? `<div class="cx-kv"><span>Phone name</span><span>${esc(phone.name)}</span></div>` : ''}
     </div>
-
-    <div class="detail-section">
-      <div class="detail-section-label">Properties</div>
-      <div id="detail-properties"><span style="font-size:12px;color:var(--text-3)">Loading…</span></div>
-    </div>
-
-    <div class="detail-section">
-      <div class="detail-section-label">Phone</div>
-      <div style="font-size:12.5px;color:var(--text-2)">
-        ${chat.is_group ? 'Group chat' : (chatSubtitle(chat) || '—')}
-      </div>
-      ${(() => {
-        if (chat.phone_id && State.phones.length) {
-          const phone = State.phones.find(p => p.id === chat.phone_id);
-          if (phone) return `<div style="font-size:11.5px;color:var(--text-3);margin-top:2px">via ${esc(phone.name||phone.phone_number)}</div>`;
-        }
-        return '';
-      })()}
-    </div>
-
     <div class="detail-section">
       <div class="detail-section-label">Status</div>
       <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
-        <span class="${pillClass(chat.status||'open')}" style="font-size:11px">${chat.status||'open'}</span>
+        <span class="${pillClass(chat.status || 'open')}" style="font-size:11px">${esc(chat.status || 'open')}</span>
         ${chat.ai_active ? '<span class="ai-badge" style="font-size:10px">AI Active</span>' : ''}
-        ${chat.is_flagged ? '<span style="font-size:10px;font-weight:600;background:#fffbeb;color:#d97706;border:1px solid #fde68a;border-radius:10px;padding:1px 7px">Flagged</span>' : ''}
+        ${chat.is_flagged ? `<span class="cx-flag-pill">${cxIcon('flag', 11)} Flagged</span>` : ''}
       </div>
-      <button class="detail-close-chat-btn" id="detail-close-chat-btn" style="margin-top:.6rem">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-        Mark as Resolved
-      </button>
+      <div class="cx-dp-btnrow">
+        <button class="detail-close-chat-btn" id="detail-close-chat-btn">${cxIcon(resolved ? 'sync' : 'check', 13)} ${resolved ? 'Reopen' : 'Mark as Resolved'}</button>
+        <button class="detail-close-chat-btn" id="detail-flag-btn">${cxIcon('flag', 13)} ${chat.is_flagged ? 'Unflag' : 'Flag'}</button>
+      </div>
     </div>
-
     <div class="detail-section">
       <div class="detail-section-label">Conversation</div>
-      <div style="font-size:12px;color:var(--text-2);display:flex;flex-direction:column;gap:.3rem">
-        <div style="display:flex;justify-content:space-between">
-          <span style="color:var(--text-3)">Created</span>
-          <span>${chat.created_at ? new Date(chat.created_at).toLocaleDateString('en', {month:'short',day:'numeric',year:'numeric'}) : '—'}</span>
-        </div>
-        <div style="display:flex;justify-content:space-between">
-          <span style="color:var(--text-3)">Last message</span>
-          <span>${chat.last_message_at ? timeAgo(chat.last_message_at) + ' ago' : '—'}</span>
-        </div>
-        <div style="display:flex;justify-content:space-between">
-          <span style="color:var(--text-3)">Unread</span>
-          <span>${chat.unread_count || 0} messages</span>
-        </div>
-      </div>
+      <div class="cx-kv"><span>Created</span><span>${chat.created_at ? parseServerDate(chat.created_at).toLocaleDateString('en', { month: 'short', day: 'numeric', year: 'numeric' }) : '—'}</span></div>
+      <div class="cx-kv"><span>Last message</span><span>${chat.last_message_at ? esc(timeAgo(chat.last_message_at)) + (timeAgo(chat.last_message_at) === 'now' ? '' : ' ago') : '—'}</span></div>
+      <div class="cx-kv"><span>Unread</span><span>${chat.unread_count || 0} messages</span></div>
     </div>`;
 
-  // Assign agent handler
-  document.getElementById('detail-assign-select').addEventListener('change', async e => {
-    const val = e.target.value ? parseInt(e.target.value) : null;
-    try {
-      await Api.inbox.updateChat(chat.id, { assigned_to: val });
-      chat.assigned_to = val;
-      toast(val ? 'Chat assigned' : 'Unassigned', 'success');
-      renderChatList(State.inbox.chats);
-    } catch(err) { toast(err.message, 'error'); }
+  document.getElementById('detail-assign-select').addEventListener('change', e => {
+    cxAssign(chat, e.target.value ? parseInt(e.target.value) : null);
   });
-
-  // Custom properties: render definitions with current values, save on change
-  (async () => {
-    const wrap = document.getElementById('detail-properties');
-    if (!wrap) return;
-    try {
-      const [defs, valRes] = await Promise.all([
-        Api.properties.definitions('chat'),
-        Api.properties.chatValues(chat.id),
-      ]);
-      const values = valRes.custom_properties || {};
-      if (!defs.length) {
-        wrap.innerHTML = `<div style="font-size:11.5px;color:var(--text-3)">
-          No custom properties defined.
-          <a href="#" onclick="navigateTo('settings');return false" style="color:var(--accent)">Create in Settings</a></div>`;
-        return;
-      }
-      const sections = {};
-      defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
-      wrap.innerHTML = Object.entries(sections).map(([sec, list]) => `
-        ${Object.keys(sections).length > 1 ? `<div class="prop-section-title">${esc(sec)}</div>` : ''}
-        ${list.map(d => {
-          const v = values[String(d.id)];
-          if (d.prop_type === 'single_select') {
-            return `<div class="prop-row"><label>${esc(d.name)}</label>
-              <select data-prop="${d.id}"><option value="">—</option>
-                ${(d.options || []).map(o => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}
-              </select></div>`;
-          }
-          if (d.prop_type === 'multi_select') {
-            const cur = Array.isArray(v) ? v : [];
-            return `<div class="prop-row"><label>${esc(d.name)}</label>
-              <div class="prop-multi" data-prop-multi="${d.id}">
-                ${(d.options || []).map(o => `<label><input type="checkbox" value="${esc(o)}" ${cur.includes(o) ? 'checked' : ''}>${esc(o)}</label>`).join('')}
-              </div></div>`;
-          }
-          const type = d.prop_type === 'date' ? 'date' : d.prop_type === 'number' ? 'number' : 'text';
-          return `<div class="prop-row"><label>${esc(d.name)}</label>
-            <input type="${type}" data-prop="${d.id}" value="${v != null ? esc(String(v)) : ''}"></div>`;
-        }).join('')}`).join('');
-
-      const save = async (id, value) => {
-        try { await Api.properties.setChat(chat.id, { [id]: value }); toast('Property saved', 'success'); }
-        catch(e) { toast(e.message, 'error'); }
-      };
-      wrap.querySelectorAll('[data-prop]').forEach(inp =>
-        inp.addEventListener('change', () => save(inp.dataset.prop, inp.value)));
-      wrap.querySelectorAll('[data-prop-multi]').forEach(group =>
-        group.querySelectorAll('input').forEach(cb => cb.addEventListener('change', () => {
-          const vals = [...group.querySelectorAll('input:checked')].map(c => c.value);
-          save(group.dataset.propMulti, vals);
-        })));
-    } catch(_) {
-      wrap.innerHTML = '<span style="font-size:11.5px;color:var(--text-3)">Could not load properties</span>';
-    }
-  })();
-
-  // Add label handler
-  const addLabelSel = document.getElementById('detail-add-label-select');
-  if (addLabelSel) {
-    addLabelSel.addEventListener('change', async e => {
-      const labelId = e.target.value;
-      if (!labelId) return;
-      const labelObj = State.labels.find(l => l.id == labelId);
-      if (!labelObj) return;
-      const newLabels = [...chatLabels, labelObj.name];
-      try {
-        await Api.inbox.updateChat(chat.id, { labels: newLabels });
-        chat.labels = newLabels;
-        toast('Label added', 'success');
-        renderContactDetail(chat);
-        renderChatList(State.inbox.chats);
-      } catch(err) { toast(err.message, 'error'); }
-    });
-  }
-
-  // Remove label handlers
-  body.querySelectorAll('[data-remove-label]').forEach(btn => {
-    btn.addEventListener('click', async e => {
-      e.stopPropagation();
-      const lbl = btn.dataset.removeLabel;
-      const newLabels = chatLabels.filter(l => l !== lbl && String(l) !== lbl);
-      try {
-        await Api.inbox.updateChat(chat.id, { labels: newLabels });
-        chat.labels = newLabels;
-        toast('Label removed', 'success');
-        renderContactDetail(chat);
-        renderChatList(State.inbox.chats);
-      } catch(err) { toast(err.message, 'error'); }
-    });
-  });
-
-  // Close/resolve chat
   document.getElementById('detail-close-chat-btn').addEventListener('click', async () => {
+    const next = resolved ? 'open' : 'resolved';
     try {
-      await Api.inbox.updateChat(chat.id, { status: 'resolved' });
-      chat.status = 'resolved';
-      toast('Chat marked as resolved', 'success');
+      await Api.inbox.updateChat(chat.id, { status: next });
+      chat.status = next;
+      toast(next === 'resolved' ? 'Chat marked as resolved' : 'Chat reopened', 'success');
       renderContactDetail(chat);
-      renderChatList(State.inbox.chats);
-    } catch(err) { toast(err.message, 'error'); }
+      cxRerenderRow(chat);
+    } catch (err) { toast(err.message, 'error'); }
   });
+  document.getElementById('detail-flag-btn').addEventListener('click', () => cxToggleFlag(chat));
+}
+
+async function cxToggleFlag(chat) {
+  try {
+    await Api.inbox.updateChat(chat.id, { is_flagged: !chat.is_flagged });
+    chat.is_flagged = !chat.is_flagged;
+    cxRerenderRow(chat);
+    if (State.inbox.selectedChatId == chat.id) {
+      renderThreadHeaderState(chat);
+      if (document.getElementById('detail-panel')?.style.display !== 'none' && _cxDetailTab === 'details') renderContactDetail(chat);
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function cxTabProperties(chat, body, stale) {
+  body.innerHTML = `<div class="detail-section"><div class="detail-section-label">Properties</div><div id="detail-properties">${cxDpLoading()}</div></div>`;
+  const wrap = document.getElementById('detail-properties');
+  let defs, valRes;
+  try {
+    [defs, valRes] = await Promise.all([Api.properties.definitions('chat'), Api.properties.chatValues(chat.id)]);
+  } catch (_) {
+    if (!stale()) wrap.innerHTML = '<span style="font-size:11.5px;color:var(--text-3)">Could not load properties</span>';
+    return;
+  }
+  if (stale()) return;
+  const values = valRes.custom_properties || {};
+  if (!defs.length) {
+    wrap.innerHTML = `<div style="font-size:11.5px;color:var(--text-3)">
+      No custom properties defined.
+      <a href="#" onclick="navigateTo('settings/custom-properties');return false" style="color:var(--accent)">Create in Settings</a></div>`;
+    return;
+  }
+  const sections = {};
+  defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
+  wrap.innerHTML = Object.entries(sections).map(([sec, list]) => `
+    ${Object.keys(sections).length > 1 ? `<div class="prop-section-title">${esc(sec)}</div>` : ''}
+    ${list.map(d => {
+      const v = values[String(d.id)];
+      if (d.prop_type === 'single_select') {
+        return `<div class="prop-row"><label>${esc(d.name)}</label>
+          <select data-prop="${d.id}"><option value="">—</option>
+            ${(d.options || []).map(o => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}
+          </select></div>`;
+      }
+      if (d.prop_type === 'multi_select') {
+        const cur = Array.isArray(v) ? v : [];
+        return `<div class="prop-row"><label>${esc(d.name)}</label>
+          <div class="prop-multi" data-prop-multi="${d.id}">
+            ${(d.options || []).map(o => `<label><input type="checkbox" value="${esc(o)}" ${cur.includes(o) ? 'checked' : ''}>${esc(o)}</label>`).join('')}
+          </div></div>`;
+      }
+      const type = d.prop_type === 'date' ? 'date' : d.prop_type === 'number' ? 'number' : 'text';
+      return `<div class="prop-row"><label>${esc(d.name)}</label>
+        <input type="${type}" data-prop="${d.id}" value="${v != null ? esc(String(v)) : ''}"></div>`;
+    }).join('')}`).join('');
+
+  const save = async (id, value) => {
+    try { await Api.properties.setChat(chat.id, { [id]: value }); toast('Property saved', 'success'); }
+    catch(e) { toast(e.message, 'error'); }
+  };
+  wrap.querySelectorAll('[data-prop]').forEach(inp =>
+    inp.addEventListener('change', () => save(inp.dataset.prop, inp.value)));
+  wrap.querySelectorAll('[data-prop-multi]').forEach(group =>
+    group.querySelectorAll('input').forEach(cb => cb.addEventListener('change', () => {
+      const vals = [...group.querySelectorAll('input:checked')].map(c => c.value);
+      save(group.dataset.propMulti, vals);
+    })));
+}
+
+async function cxTabAI(chat, body, stale) {
+  const state = chat.ai_state || (chat.ai_active ? 'ACTIVE' : 'INACTIVE');
+  body.innerHTML = `
+    <div class="detail-section">
+      <div class="detail-section-label">AI agent for this chat</div>
+      <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.7rem">
+        <span class="${pillClass(state)}" style="font-size:11px">${esc(state)}</span>
+        <span style="font-size:12px;color:var(--text-3)">${chat.ai_active ? 'Replies automatically; pauses when a human replies.' : 'Not replying automatically.'}</span>
+      </div>
+      <button class="btn ${chat.ai_active ? 'btn-secondary' : 'btn-primary'} btn-sm" id="cx-ai-toggle">${cxIcon('bot', 14)} ${chat.ai_active ? 'Deactivate AI' : 'Activate AI'}</button>
+    </div>
+    <div class="detail-section">
+      <div class="detail-section-label">Assist</div>
+      <div class="cx-dp-btnrow">
+        <button class="btn btn-secondary btn-sm" id="cx-ai-summary">${cxIcon('note', 14)} Summarize</button>
+        <button class="btn btn-secondary btn-sm" id="cx-ai-suggest">${cxIcon('sparkle', 14)} Suggest reply</button>
+      </div>
+      <div id="cx-ai-out" class="cx-ai-out" hidden></div>
+    </div>`;
+  document.getElementById('cx-ai-toggle').addEventListener('click', () => cxToggleAI(chat));
+  document.getElementById('cx-ai-summary').addEventListener('click', async e => {
+    const out = document.getElementById('cx-ai-out');
+    e.currentTarget.disabled = true;
+    out.hidden = false; out.innerHTML = cxDpLoading();
+    try {
+      const res = await Api.ai.summarize(chat.id);
+      if (stale()) return;
+      out.innerHTML = esc(res.summary || '').replace(/\n/g, '<br>').replace(/(^|<br>)-\s*/g, '$1• ');
+    } catch (err) { if (!stale()) out.textContent = err.message; }
+    if (!stale()) e.currentTarget.disabled = false;
+  });
+  document.getElementById('cx-ai-suggest').addEventListener('click', () => cxSuggestReply(chat));
+}
+
+async function cxToggleAI(chat) {
+  try {
+    if (chat.ai_active) { await Api.ai.deactivate(chat.id); chat.ai_active = false; chat.ai_state = 'INACTIVE'; toast('AI deactivated', 'success'); }
+    else { await Api.ai.activate(chat.id); chat.ai_active = true; chat.ai_state = 'ACTIVE'; toast('AI activated', 'success'); }
+    cxRerenderRow(chat);
+    if (State.inbox.selectedChatId == chat.id) {
+      renderThreadHeaderState(chat);
+      if (_cxDetailTab === 'ai' && document.getElementById('detail-panel')?.style.display !== 'none') renderContactDetail(chat);
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function cxSuggestReply(chat) {
+  try {
+    const res = await Api.ai.suggestReply(chat.id);
+    const ta = document.getElementById('reply-text');
+    if (ta && State.inbox.selectedChatId == chat.id) {
+      ta.value = res.suggestion || res.reply || '';
+      ta.dispatchEvent(new Event('input'));
+      ta.focus();
+    }
+    toast('Reply suggestion ready', 'success');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function cxTabTickets(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const [tickets, tasks] = await Promise.all([
+    Api.tickets.list({ chat_id: chat.id, limit: 50 }).catch(() => []),
+    Api.tasks.list({ chat_id: chat.id, view: 'all' }).catch(() => []),
+  ]);
+  if (stale()) return;
+  body.innerHTML = `
+    <div class="detail-section">
+      <div class="cx-sec-head"><span class="detail-section-label">Tickets (${tickets.length})</span>
+        <button class="cx-link-btn" id="cx-new-ticket">+ New ticket</button></div>
+      ${tickets.length ? tickets.map(t => `
+        <div class="cx-item">
+          <div class="cx-item-title">#${t.id} ${esc(t.title)}</div>
+          <div class="cx-item-meta"><span class="${pillClass(t.status)}">${esc(t.status)}</span><span class="${pillClass(t.priority)}">${esc(t.priority)}</span>${t.created_at ? `<span>${esc(cxFmtListDate(t.created_at))}</span>` : ''}</div>
+        </div>`).join('') : '<div class="cx-dp-muted">No tickets for this chat</div>'}
+    </div>
+    <div class="detail-section">
+      <div class="cx-sec-head"><span class="detail-section-label">Tasks (${tasks.length})</span>
+        <button class="cx-link-btn" id="cx-new-task">+ New task</button></div>
+      ${tasks.length ? tasks.map(t => `
+        <div class="cx-item">
+          <div class="cx-item-title">${t.status === 'done' ? '<s>' : ''}${esc(t.title)}${t.status === 'done' ? '</s>' : ''}</div>
+          <div class="cx-item-meta"><span class="${pillClass(t.priority)}">${esc(t.priority || '')}</span>${t.due_date ? `<span>${cxIcon('calendar', 11)} ${esc(cxFmtListDate(t.due_date))}</span>` : ''}${t.assignee_name ? `<span>${esc(t.assignee_name)}</span>` : ''}</div>
+        </div>`).join('') : '<div class="cx-dp-muted">No tasks for this chat</div>'}
+    </div>`;
+  const again = () => { if (State.inbox.selectedChatId == chat.id) renderContactDetail(chat, 'tickets'); };
+  document.getElementById('cx-new-ticket').addEventListener('click', () => showTicketModal({ chatId: chat.id }));
+  document.getElementById('cx-new-task').addEventListener('click', () => showTaskModal({ chatId: chat.id, onSaved: again }));
+}
+
+// ── Members tab (groups) ── rendered in pages of 80 as you scroll, so 1,000+
+// member groups stay light; pictures load lazily for rows on screen.
+const CX_MEM_PAGE = 80;
+const _cxMemPics = new Map();     // `${chatId}|${pid}` → url | '' (none)
+let _cxMemPicQueue = [], _cxMemPicBusy = 0, _cxMemObs = null;
+function cxMemberPictureObserve(chat, root) {
+  if (_cxMemObs) _cxMemObs.disconnect();
+  _cxMemPicQueue = [];
+  if (!('IntersectionObserver' in window)) return;
+  _cxMemObs = new IntersectionObserver(entries => entries.forEach(en => {
+    if (!en.isIntersecting) return;
+    _cxMemObs.unobserve(en.target);
+    const pid = en.target.dataset.pid;
+    const key = `${chat.id}|${pid}`;
+    if (_cxMemPics.has(key)) { cxPaintMemberPic(en.target, _cxMemPics.get(key)); return; }
+    _cxMemPicQueue.push({ el: en.target, pid, key, chatId: chat.id });
+    cxPumpMemberPics();
+  }), { root, rootMargin: '120px' });
+}
+function cxPumpMemberPics() {
+  while (_cxMemPicBusy < 3 && _cxMemPicQueue.length) {
+    const job = _cxMemPicQueue.shift();
+    if (!job.el.isConnected) continue;
+    _cxMemPicBusy++;
+    Api.groups.memberPicture(job.chatId, job.pid)
+      .then(r => { const u = cxSafePicture(r?.url); _cxMemPics.set(job.key, u); cxPaintMemberPic(job.el, u); })
+      .catch(() => _cxMemPics.set(job.key, ''))
+      .finally(() => { _cxMemPicBusy--; cxPumpMemberPics(); });
+  }
+}
+function cxPaintMemberPic(av, url) {
+  if (!url || !av.isConnected || av.querySelector('img')) return;
+  const img = document.createElement('img');
+  img.alt = ''; img.referrerPolicy = 'no-referrer'; img.loading = 'lazy';
+  img.onerror = () => img.remove();
+  img.src = url;
+  av.appendChild(img);
+}
+function cxMemberLabel(p) {
+  if (p.is_me) return 'You';
+  if (p.has_number !== false && /^\d{6,}$/.test(p.number)) return cxFmtPhone(p.number);
+  return p.name || 'Hidden number';
+}
+function cxMemberRow(p, canManage) {
+  const label = cxMemberLabel(p);
+  const sub = p.is_me ? (p.name || 'This WhatsApp number') : (p.has_number === false ? (p.name ? '~' : 'Number hidden by WhatsApp') : (p.name || '~'));
+  const menu = canManage && !p.is_me && !(p.is_super_admin);
+  return `<div class="cx-member" data-pid="${esc(p.id)}">
+    <span class="cx-avatar cx-mem-av" data-pid="${esc(p.id)}" style="width:34px;height:34px;background:${avatarColor(p.number || p.id)}">${cxIcon('user', 16)}</span>
+    <span class="cx-member-text"><span class="cx-member-num">${esc(label)}</span><span class="cx-member-sub">${esc(sub)}</span></span>
+    ${p.is_super_admin ? '<span class="cx-admin" title="Group owner">Owner</span>' : p.is_admin ? '<span class="cx-admin">Admin</span>' : ''}
+    ${menu ? `<button class="cx-ibtn sm cx-mem-menu" data-mem-menu="${esc(p.id)}" title="Member actions" aria-label="Member actions">${cxIcon('more', 15)}</button>` : ''}
+  </div>`;
+}
+function cxManageTip(res) {
+  if (!res.phone_working) return 'This WhatsApp number is disconnected';
+  if (!res.crm_admin) return 'Only CRM admins can manage group members';
+  if (res.is_member === false) return 'Your number is no longer in this group';
+  if (!res.me_admin) return 'Your WhatsApp number is not an admin of this group';
+  return '';
+}
+
+async function cxTabMembers(chat, body, stale, refresh) {
+  body.innerHTML = cxDpLoading();
+  let res;
+  try { res = await cxParticipants(chat, refresh); }
+  catch (e) { if (!stale()) body.innerHTML = `<div class="cx-dp-empty">${esc(e.message || 'Could not load members')}</div>`; return; }
+  if (stale()) return;
+  const list = res.participants || [];
+  if (!res.api_available && !list.length) {
+    body.innerHTML = '<div class="cx-dp-empty">Members are only available while this WhatsApp number is connected.</div>';
+    return;
+  }
+  const can = !!res.can_manage;
+  const tip = cxManageTip(res);
+  body.innerHTML = `
+    <div class="cx-mem-actions">
+      <button class="cx-mem-action" id="cx-mem-add" ${can ? '' : `disabled aria-disabled="true"`} title="${esc(can ? 'Add members to this group' : tip)}">
+        <span class="cx-mem-action-ic">${cxIcon('userPlus', 16)}</span><span>Add Members</span>
+      </button>
+      <button class="cx-mem-action" id="cx-mem-invite" ${can ? '' : `disabled aria-disabled="true"`} title="${esc(can ? 'Get the group invite link' : tip)}">
+        <span class="cx-mem-action-ic">${cxIcon('link', 16)}</span><span>Invite to group via link</span>
+      </button>
+      <div class="cx-invite" id="cx-invite" hidden></div>
+    </div>
+    <div class="cx-mem-count"><span>${list.length.toLocaleString()} member${list.length === 1 ? '' : 's'}</span><i></i>
+      <button class="cx-ibtn sm" id="cx-mem-refresh" title="Refresh members" aria-label="Refresh members">${cxIcon('sync', 13)}</button></div>
+    <div class="cx-mem-search">${cxIcon('search', 14)}<input type="search" id="cx-mem-search" placeholder="Search name or number…" autocomplete="off" aria-label="Search members"></div>
+    <div id="cx-mem-list" class="cx-mem-list"></div>
+    <div id="cx-mem-more" class="cx-mem-more"></div>`;
+
+  const listEl = document.getElementById('cx-mem-list');
+  const moreEl = document.getElementById('cx-mem-more');
+  let rows = list, shown = 0, moreObs = null;
+  cxMemberPictureObserve(chat, body);
+  const renderMore = () => {
+    const next = rows.slice(shown, shown + CX_MEM_PAGE);
+    listEl.insertAdjacentHTML('beforeend', next.map(p => cxMemberRow(p, can)).join(''));
+    shown += next.length;
+    if (_cxMemObs) listEl.querySelectorAll('.cx-mem-av:not([data-obs])').forEach(av => { av.dataset.obs = '1'; _cxMemObs.observe(av); });
+    moreEl.textContent = shown < rows.length ? `Showing ${shown.toLocaleString()} of ${rows.length.toLocaleString()}` : '';
+    if (!rows.length) listEl.innerHTML = '<div class="cx-dp-muted" style="padding:.75rem 1rem">No members match</div>';
+  };
+  const reset = () => { listEl.innerHTML = ''; shown = 0; renderMore(); };
+  if ('IntersectionObserver' in window) {
+    moreObs = new IntersectionObserver(en => { if (en[0].isIntersecting && shown < rows.length && !stale()) renderMore(); }, { root: body, rootMargin: '400px' });
+    moreObs.observe(moreEl);
+  } else moreEl.addEventListener('click', renderMore);
+  reset();
+
+  let t = null;
+  document.getElementById('cx-mem-search').addEventListener('input', e => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      const q = e.target.value.trim().toLowerCase();
+      const qd = q.replace(/\D/g, '');
+      rows = !q ? list : list.filter(p => (qd && p.has_number !== false && p.number.includes(qd)) || (p.name || '').toLowerCase().includes(q) || (p.is_me && 'you'.includes(q)));
+      reset();
+    }, 120);
+  });
+  document.getElementById('cx-mem-refresh').addEventListener('click', () => cxTabMembers(chat, body, stale, true));
+
+  const again = () => { cxForgetGroup(chat.id); if (!stale()) cxTabMembers(chat, body, stale, true); };
+  document.getElementById('cx-mem-add').addEventListener('click', () => { if (can) cxShowAddMembers(chat, again); });
+  document.getElementById('cx-mem-invite').addEventListener('click', async e => {
+    if (!can) return;
+    if (!confirm('Get this group’s invite link?\n\nAnyone who has the link can join the group. WhatsApp creates a link if the group has none yet.')) return;
+    const btn = e.currentTarget, box = document.getElementById('cx-invite');
+    btn.disabled = true;
+    try {
+      const r = await Api.groups.inviteLink(chat.id);
+      if (stale()) return;
+      box.hidden = false;
+      box.innerHTML = `<input type="text" readonly value="${esc(r.link)}" aria-label="Invite link"><button class="btn btn-secondary btn-sm" id="cx-invite-copy">${cxIcon('copy', 13)} Copy</button>`;
+      document.getElementById('cx-invite-copy').addEventListener('click', () => cxCopy(r.link, 'Invite link copied'));
+    } catch (err) { toast(err.message, 'error'); }
+    if (btn.isConnected) btn.disabled = false;
+  });
+
+  listEl.addEventListener('click', e => {
+    const b = e.target.closest('[data-mem-menu]');
+    if (!b) return;
+    e.stopPropagation();
+    const p = list.find(x => x.id === b.dataset.memMenu);
+    if (p) cxOpenMemberMenu(b, chat, p, again);
+  });
+}
+
+function cxCopy(text, msg) {
+  const done = () => toast(msg || 'Copied', 'success');
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done, () => toast('Could not copy', 'error'));
+  else {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch (_) { toast('Could not copy', 'error'); }
+    ta.remove();
+  }
+}
+
+function cxOpenMemberMenu(anchor, chat, p, onDone) {
+  const who = cxMemberLabel(p);
+  const pop = cxPopover(anchor, `
+    <div class="cx-pop-title">${esc(who)}</div>
+    ${p.is_admin
+      ? `<button class="cx-pop-item" data-act="demote">${cxIcon('shield', 14)}<span>Dismiss as admin</span></button>`
+      : `<button class="cx-pop-item" data-act="promote">${cxIcon('shield', 14)}<span>Make group admin</span></button>`}
+    <button class="cx-pop-item danger" data-act="remove">${cxIcon('userMinus', 14)}<span>Remove from group</span></button>`,
+    { alignRight: true });
+  const Q = {
+    promote: [`Make ${who} an admin of “${displayName(chat)}”?`, 'is now an admin'],
+    demote: [`Dismiss ${who} as admin of “${displayName(chat)}”?`, 'is no longer an admin'],
+    remove: [`Remove ${who} from “${displayName(chat)}”?\n\nThey will stop receiving the group’s messages.`, 'was removed'],
+  };
+  pop.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', async ev => {
+    ev.stopPropagation();
+    const act = b.dataset.act;
+    cxClosePop();
+    if (!confirm(Q[act][0])) return;
+    try {
+      await Api.groups.memberAction(chat.id, act, [p.id]);
+      toast(`${who} ${Q[act][1]}`, 'success');
+      onDone();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+function cxShowAddMembers(chat, onDone) {
+  showModal('Add members', `
+    <div class="form-group">
+      <label for="cx-add-nums">Phone numbers (with country code)</label>
+      <textarea id="cx-add-nums" style="min-height:120px" placeholder="+91 98765 43210&#10;+44 7700 900123"></textarea>
+      <div style="font-size:11.5px;color:var(--text-3);margin-top:.35rem">One per line or comma-separated, up to 50. WhatsApp may send an invite instead when someone’s privacy settings don’t allow being added.</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="cx-add-go">Add to group</button>
+    </div>`);
+  document.getElementById('cx-add-go').addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    const numbers = document.getElementById('cx-add-nums').value.split(/[\n,;]+/).map(x => x.trim()).filter(Boolean);
+    if (!numbers.length) return toast('Enter at least one number', 'error');
+    if (numbers.length > 50) return toast('Up to 50 numbers at a time', 'error');
+    if (!confirm(`Add ${numbers.length} number${numbers.length === 1 ? '' : 's'} to “${displayName(chat)}”?`)) return;
+    btn.disabled = true;
+    try {
+      const r = await Api.groups.addMembers(chat.id, numbers);
+      closeModal();
+      const already = (r.already_members || []).length;
+      toast(r.requested ? `Sent ${r.requested} to WhatsApp${already ? ` · ${already} already in the group` : ''}` : 'Everyone is already in the group', 'success');
+      onDone();
+    } catch (err) { toast(err.message, 'error'); btn.disabled = false; }
+  });
+}
+
+async function cxTabMedia(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const res = await Api.media.list({ chat_id: chat.id, limit: 60 });
+  if (stale()) return;
+  const items = res.items || [];
+  if (!items.length) { body.innerHTML = '<div class="cx-dp-empty">No media in this chat yet</div>'; return; }
+  body.innerHTML = `<div class="cx-dp-media">${items.map(m => cxMediaTile(m, { compact: true })).join('')}</div>`;
+  cxObserveMedia(body);
+  body.querySelectorAll('.cx-tile').forEach(t => t.addEventListener('click', e => {
+    if (e.target.closest('audio,video,[data-dl-id]')) return;
+    const el = document.querySelector(`#messages-area .msg[data-mid="${t.dataset.mid}"]`);
+    if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.classList.add('cx-flash'); setTimeout(() => el.classList.remove('cx-flash'), 2200); }
+    else toast('Scroll up in the chat to load this older message', 'default');
+  }));
+}
+
+function cxRangeDates(range, from, to) {
+  const now = new Date();
+  const midnight = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const today = midnight(now);
+  if (range === 'today') return { from: today.toISOString(), to: now.toISOString() };
+  if (range === 'yesterday') return { from: new Date(today.getTime() - 864e5).toISOString(), to: today.toISOString() };
+  if (range === '7d') return { from: new Date(today.getTime() - 6 * 864e5).toISOString(), to: now.toISOString() };
+  if (range === '30d') return { from: new Date(today.getTime() - 29 * 864e5).toISOString(), to: now.toISOString() };
+  if (range === 'month') return { from: new Date(now.getFullYear(), now.getMonth(), 1).toISOString(), to: now.toISOString() };
+  if (range === 'custom' && from && to) {
+    const [fy, fm, fd] = from.split('-').map(Number), [ty, tm, td] = to.split('-').map(Number);
+    return { from: new Date(fy, fm - 1, fd).toISOString(), to: new Date(ty, tm - 1, td + 1).toISOString() };
+  }
+  return null;
+}
+const CX_GA_PRESETS = [
+  ['today', 'Today'], ['yesterday', 'Yesterday'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['month', 'This month'],
+];
+// "23-Sep-26 to 24-Sep-26" (the end is inclusive)
+function cxRangeLabel(r) {
+  const d = cxRangeDates(r.range, r.from, r.to);
+  if (!d) return 'Pick dates';
+  const f = new Date(d.from), t = new Date(new Date(d.to).getTime() - 1);
+  const fmt = x => `${String(x.getDate()).padStart(2, '0')}-${x.toLocaleString('en', { month: 'short' })}-${String(x.getFullYear()).slice(-2)}`;
+  return `${fmt(f)} to ${fmt(t < f ? f : t)}`;
+}
+const cxIsoDay = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+let _cxAnalyticsRange = { range: '7d', from: '', to: '' };
+async function cxTabAnalytics(chat, body, stale) {
+  const r = _cxAnalyticsRange;
+  body.innerHTML = `
+    <div class="detail-section cx-ga">
+      <div class="cx-ga-head">
+        <span class="cx-ga-title">Group Analytics</span>
+        <button class="cx-ibtn sm" id="cx-ga-refresh" title="Refresh" aria-label="Refresh analytics">${cxIcon('sync', 14)}</button>
+        <span class="cx-grow"></span>
+        <button class="cx-range-btn" id="cx-ga-range" aria-haspopup="menu" title="Date range"><span id="cx-ga-range-label">${esc(cxRangeLabel(r))}</span>${cxIcon('chevDown', 13)}</button>
+      </div>
+      <div class="cx-ga-grid" id="cx-ga-grid">${cxDpLoading()}</div>
+    </div>`;
+  const load = async () => {
+    const grid = document.getElementById('cx-ga-grid');
+    if (!grid) return;
+    document.getElementById('cx-ga-range-label').textContent = cxRangeLabel(r);
+    const dates = cxRangeDates(r.range, r.from, r.to);
+    if (!dates) { grid.innerHTML = '<div class="cx-dp-muted">Pick both dates</div>'; return; }
+    grid.innerHTML = cxDpLoading();
+    const btn = document.getElementById('cx-ga-refresh');
+    btn?.classList.add('spinning');
+    let res;
+    try { res = await Api.groups.analyticsRange(chat.id, dates); }
+    catch (e) { if (!stale()) grid.innerHTML = `<div class="cx-dp-muted">${esc(e.message)}</div>`; return; }
+    finally { btn?.classList.remove('spinning'); }
+    if (stale() || !grid.isConnected) return;
+    const card = (label, icon, cls, v, tip) => `
+      <div class="cx-ga-card ${cls}${v == null ? ' untracked' : ''}" ${tip ? `title="${esc(tip)}"` : ''}>
+        <span class="cx-ga-icon">${cxIcon(icon, 26)}</span>
+        <span class="cx-ga-val">${v == null ? '--' : Number(v).toLocaleString()}</span>
+        <span class="cx-ga-label">${label}</span>
+      </div>`;
+    const since = res.tracked_since || {};
+    const nt = 'Not tracked yet — counted from the moment this number starts receiving these events';
+    grid.innerHTML =
+      card('Messages', 'msg', 'c-green', res.messages ?? res.total_messages, `${(res.incoming ?? 0).toLocaleString()} received · ${(res.outgoing ?? 0).toLocaleString()} sent`) +
+      card('Reactions', 'heart', 'c-purple', res.reactions, since.reactions ? `Tracked since ${cxFmtListDate(since.reactions)}` : nt) +
+      card('Members Joined', 'userPlus', 'c-blue', res.members_joined, since.members ? `Tracked since ${cxFmtListDate(since.members)}` : nt) +
+      card('Members Exited', 'userMinus', 'c-red', res.members_exited,
+        res.members_exited == null ? nt : `${res.members_left ?? 0} left · ${res.members_removed ?? 0} removed`);
+  };
+  document.getElementById('cx-ga-refresh').addEventListener('click', load);
+  document.getElementById('cx-ga-range').addEventListener('click', e => {
+    e.stopPropagation();
+    const pop = cxPopover(e.currentTarget, `
+      <div class="cx-pop-title">Date range</div>
+      ${CX_GA_PRESETS.map(([v, l]) => `<button class="cx-pop-item${r.range === v ? ' sel' : ''}" data-range="${v}"><span>${l}</span>${r.range === v ? cxIcon('check', 14) : ''}</button>`).join('')}
+      <div class="cx-pop-sep"></div>
+      <div class="cx-pop-title">Custom</div>
+      <div class="cx-ga-custom">
+        <input type="date" id="cx-ga-from" aria-label="From" value="${esc(r.range === 'custom' ? r.from : '')}">
+        <span>–</span>
+        <input type="date" id="cx-ga-to" aria-label="To" value="${esc(r.range === 'custom' ? r.to : '')}">
+      </div>
+      <div style="display:flex;justify-content:flex-end;padding:.35rem .4rem .2rem"><button class="btn btn-primary btn-sm" id="cx-ga-apply">Apply</button></div>`,
+      { alignRight: true, cls: 'cx-pop-wide' });
+    pop.querySelectorAll('[data-range]').forEach(b => b.addEventListener('click', () => {
+      r.range = b.dataset.range; cxClosePop(); load();
+    }));
+    const f = pop.querySelector('#cx-ga-from'), t = pop.querySelector('#cx-ga-to');
+    if (!f.value) { f.value = cxIsoDay(new Date(Date.now() - 6 * 864e5)); t.value = cxIsoDay(new Date()); }
+    pop.querySelector('#cx-ga-apply').addEventListener('click', () => {
+      if (!f.value || !t.value) return toast('Pick both dates', 'error');
+      if (f.value > t.value) return toast('The start date must be before the end date', 'error');
+      Object.assign(r, { range: 'custom', from: f.value, to: t.value });
+      cxClosePop(); load();
+    });
+  });
+  await load();
+}
+
+async function cxTabHistory(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const rows = await Api.inbox.activity(chat.id);
+  if (stale()) return;
+  if (!rows.length) { body.innerHTML = '<div class="cx-dp-empty">No activity recorded for this chat yet</div>'; return; }
+  body.innerHTML = `<div class="detail-section cx-timeline">${rows.map(r => `
+    <div class="cx-tl-row">
+      <span class="cx-tl-dot"></span>
+      <div>
+        <div class="cx-tl-text">${esc(r.description || formatLogEvent(r.action))}</div>
+        <div class="cx-tl-meta">${r.agent_name ? esc(r.agent_name) + ' · ' : ''}${r.created_at ? esc(parseServerDate(r.created_at).toLocaleString('en', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })) : ''}</div>
+      </div>
+    </div>`).join('')}</div>`;
+}
+
+async function cxTabNotes(chat, body, stale) {
+  body.innerHTML = cxDpLoading();
+  const notes = await Api.notes.list(chat.id);
+  if (stale()) return;
+  body.innerHTML = `
+    <div class="detail-section">
+      <textarea id="cx-note-new" class="cx-note-input" placeholder="Add a private note — only your team sees it. @name mentions a teammate."></textarea>
+      <div style="display:flex;justify-content:flex-end;margin-top:.4rem"><button class="btn btn-primary btn-sm" id="cx-note-save">Add note</button></div>
+    </div>
+    <div class="detail-section">
+      ${notes.length ? notes.slice().reverse().map(n => `
+        <div class="cx-note" data-nid="${n.id}">
+          <div class="cx-note-head"><b>${esc(n.agent_name || 'Team')}</b><span>${n.created_at ? esc(cxFmtListDate(n.created_at)) : ''}</span>
+            <button class="cx-ibtn sm" data-del-note="${n.id}" title="Delete note">${cxIcon('trash', 13)}</button></div>
+          <div class="cx-note-body">${esc(n.content || '').replace(/\n/g, '<br>')}</div>
+        </div>`).join('') : '<div class="cx-dp-muted">No notes yet</div>'}
+    </div>`;
+  document.getElementById('cx-note-save').addEventListener('click', async () => {
+    const content = document.getElementById('cx-note-new').value.trim();
+    if (!content) return;
+    try {
+      await Api.notes.create({ chat_id: chat.id, content });
+      toast('Note saved', 'success');
+      renderContactDetail(chat, 'notes');
+      if (State.inbox.selectedChatId == chat.id) loadMessages(chat.id, true);
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  body.querySelectorAll('[data-del-note]').forEach(b => b.addEventListener('click', async () => {
+    if (!confirm('Delete this note?')) return;
+    try {
+      await Api.notes.del(+b.dataset.delNote);
+      renderContactDetail(chat, 'notes');
+      if (State.inbox.selectedChatId == chat.id) loadMessages(chat.id, true);
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+// ── Settings tab ── chat facts, assignment, team access, AI switches and
+// (groups) WhatsApp group settings; editing those needs a CRM admin acting
+// through a number that is a group admin.
+function cxFmtDateTime(ts) {
+  const d = parseServerDate(ts);
+  if (!d || isNaN(d.getTime())) return '—';
+  return `${d.getDate()} ${d.toLocaleString('en', { month: 'short' })} ${d.getFullYear()}, ${d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`;
+}
+function cxSettingsAssignHtml(chat) {
+  const a = chat.assigned_to != null ? _cxAgentMap[chat.assigned_to] : null;
+  return `${cxAssigneeAvatar(chat.assigned_to, 22, { dot: chat.assigned_to != null })}<span>${chat.assigned_to == null ? 'Unassigned' : esc(a?.name || `Agent #${chat.assigned_to}`)}</span>${cxIcon('chevDown', 13)}`;
+}
+function cxToggle(id, on, opts = {}) {
+  return `<button type="button" class="cx-switch${on ? ' on' : ''}" id="${id}" role="switch" aria-checked="${!!on}" ${opts.disabled ? 'disabled' : ''} ${opts.title ? `title="${esc(opts.title)}"` : ''} aria-label="${esc(opts.label || '')}"><i></i></button>`;
+}
+
+async function cxTabSettings(chat, body, stale) {
+  const phone = cxPhoneOf(chat);
+  body.innerHTML = `
+    <div class="cx-set">
+      <div class="cx-set-row"><span>Chat ID</span><span class="cx-set-val"><code class="cx-set-id" title="${esc(chat.chat_wid)}">${esc(chat.chat_wid)}</code>
+        <button class="cx-ibtn sm" id="cx-set-copy" title="Copy chat ID" aria-label="Copy chat ID">${cxIcon('copy', 13)}</button></span></div>
+      <div class="cx-set-row"><span>Created at</span><span class="cx-set-val" id="cx-set-created">${esc(cxFmtDateTime(chat.created_at))}</span></div>
+      <div class="cx-set-row"><span>Chat Type</span><span class="cx-set-val">${chat.is_group ? 'Group' : 'Individual'}</span></div>
+      <div class="cx-set-row"><span>Assigned To</span><span class="cx-set-val"><button class="cx-set-assign" id="cx-set-assign" aria-haspopup="menu">${cxSettingsAssignHtml(chat)}</button></span></div>
+      <div class="cx-set-row"><span>Team access</span><span class="cx-set-val cx-team" id="cx-set-team"><span class="spinner" style="width:14px;height:14px"></span></span></div>
+      <div class="cx-set-row"><span>Org Phones</span><span class="cx-set-val">${phone
+        ? `<span class="cx-phone-chip" title="${esc(phone.name || '')} · ${phone.waha_status === 'WORKING' ? 'connected' : 'disconnected'}">${CX_WA_LOGO}<span>${esc(cxPhoneLabel(phone))}</span><span class="cx-dot ${phone.waha_status === 'WORKING' ? 'ok' : 'bad'}"></span></span>`
+        : '—'}</span></div>
+
+      <div class="cx-set-sec">AI</div>
+      <div class="cx-set-row"><span>Allow AI Flagging<small>Auto-flag incoming messages that match your AI flag rules</small></span><span class="cx-set-val">${cxToggle('cx-set-flagging', chat.ai_flagging !== false, { label: 'Allow AI flagging' })}</span></div>
+      <div class="cx-set-row"><span>Allow AI Agent<small>${chat.ai_active ? 'Replying automatically; pauses when a human replies' : 'Not replying automatically'}</small></span><span class="cx-set-val">${cxToggle('cx-set-aiagent', !!chat.ai_active, { label: 'Allow AI agent' })}</span></div>
+
+      ${chat.is_group ? `<div class="cx-set-sec">Group Settings</div><div id="cx-set-group">${cxDpLoading()}</div>` : ''}
+    </div>`;
+
+  document.getElementById('cx-set-copy').addEventListener('click', () => cxCopy(chat.chat_wid, 'Chat ID copied'));
+  document.getElementById('cx-set-assign').addEventListener('click', e => { e.stopPropagation(); cxOpenAssignPop(e.currentTarget, chat, { alignRight: true }); });
+  document.getElementById('cx-set-flagging').addEventListener('click', async e => {
+    const b = e.currentTarget, next = chat.ai_flagging === false;
+    b.disabled = true;
+    try {
+      await Api.inbox.updateChat(chat.id, { ai_flagging: next });
+      chat.ai_flagging = next;
+      b.classList.toggle('on', next); b.setAttribute('aria-checked', String(next));
+      toast(next ? 'AI flagging allowed for this chat' : 'AI flagging turned off for this chat', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+    b.disabled = false;
+  });
+  document.getElementById('cx-set-aiagent').addEventListener('click', async e => {
+    e.currentTarget.disabled = true;
+    await cxToggleAI(chat);
+    if (!stale() && _cxDetailTab === 'settings') renderContactDetail(chat, 'settings');
+  });
+
+  cxTeam(chat).then(team => {
+    if (stale()) return;
+    cxRefreshOnlineDots();
+    const el = document.getElementById('cx-set-team');
+    if (!el) return;
+    const shown = team.slice(0, 6);
+    el.innerHTML = team.length
+      ? shown.map(a => `<span class="cx-team-av">${cxAssigneeAvatar(a.id, 24, { dot: true, title: `${a.name}${a.role === 'admin' ? ' (admin)' : ''} · ${a.online ? 'online' : 'offline'}` })}</span>`).join('') +
+        (team.length > shown.length ? `<span class="cx-team-more" title="${esc(team.slice(6).map(a => a.name).join(', '))}">+${team.length - shown.length}</span>` : '')
+      : '<span class="cx-dp-muted">Nobody</span>';
+  }).catch(() => { const el = document.getElementById('cx-set-team'); if (el && !stale()) el.textContent = '—'; });
+
+  if (!chat.is_group) return;
+  let info;
+  try { info = await cxGroupInfo(chat); }
+  catch (e) { const g = document.getElementById('cx-set-group'); if (g && !stale()) g.innerHTML = `<div class="cx-dp-muted">${esc(e.message || 'Could not load group settings')}</div>`; return; }
+  if (stale()) return;
+  const g = document.getElementById('cx-set-group');
+  if (!g) return;
+  if (info.created_at) document.getElementById('cx-set-created').textContent = cxFmtDateTime(info.created_at);
+  if (!info.available) {
+    g.innerHTML = `<div class="cx-dp-muted">${info.phone_working ? 'WhatsApp didn’t return this group’s details.' : 'Group settings are available while this WhatsApp number is connected.'}</div>`;
+    return;
+  }
+  const can = !!info.can_manage;
+  const tip = can ? '' : cxManageTip(info);
+  g.innerHTML = `
+    <div class="cx-set-block">
+      <div class="cx-set-bhead"><span>Group name</span>${can ? `<button class="cx-link-btn" data-edit="subject">Edit</button>` : ''}</div>
+      <div class="cx-set-text" id="cx-set-subject">${esc(info.subject || displayName(chat))}</div>
+    </div>
+    <div class="cx-set-block">
+      <div class="cx-set-bhead"><span>Description</span>${can ? `<button class="cx-link-btn" data-edit="description">Edit</button>` : ''}</div>
+      <div class="cx-set-text cx-set-desc" id="cx-set-description">${info.description ? esc(info.description) : '<span class="cx-dp-muted">No description</span>'}</div>
+    </div>
+    <div class="cx-set-row"><span>Only admins can send messages</span><span class="cx-set-val">${cxToggle('cx-set-announce', info.messages_admin_only, { disabled: !can, title: tip, label: 'Only admins can send messages' })}</span></div>
+    <div class="cx-set-row"><span>Only admins can edit group info</span><span class="cx-set-val">${cxToggle('cx-set-restrict', info.info_admin_only, { disabled: !can, title: tip, label: 'Only admins can edit group info' })}</span></div>
+    ${can ? '' : `<div class="cx-set-note">${cxIcon('info', 13)}<span>${esc(tip)}</span></div>`}`;
+  if (!can) return;
+
+  const save = async (patch, okMsg) => {
+    try {
+      const res = await Api.groups.updateSettings(chat.id, patch);
+      _cxGroupInfo.set(chat.id, Promise.resolve({ ...info, ...res }));
+      if (patch.subject) {
+        chat.name = patch.subject;
+        cxRerenderRow(chat);
+        document.querySelectorAll('.cx-tname, .cx-dp-name').forEach(el => { el.textContent = patch.subject; });
+      }
+      toast(okMsg, 'success');
+    } catch (err) { toast(err.message, 'error'); }
+    if (!stale()) renderContactDetail(chat, 'settings');
+  };
+  g.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
+    const field = b.dataset.edit;
+    const holder = document.getElementById(`cx-set-${field}`);
+    const cur = field === 'subject' ? (info.subject || '') : (info.description || '');
+    const max = field === 'subject' ? 100 : 2048;
+    holder.innerHTML = `${field === 'subject'
+      ? `<input type="text" id="cx-set-edit" maxlength="${max}">`
+      : `<textarea id="cx-set-edit" maxlength="${max}" rows="6"></textarea>`}
+      <div class="cx-set-edit-bar"><span id="cx-set-left"></span>
+        <button class="btn btn-secondary btn-sm" id="cx-set-cancel">Cancel</button>
+        <button class="btn btn-primary btn-sm" id="cx-set-save">Save</button></div>`;
+    const inp = document.getElementById('cx-set-edit');
+    inp.value = cur;
+    const left = () => { document.getElementById('cx-set-left').textContent = `${max - inp.value.length} left`; };
+    inp.addEventListener('input', left); left(); inp.focus();
+    document.getElementById('cx-set-cancel').addEventListener('click', () => renderContactDetail(chat, 'settings'));
+    document.getElementById('cx-set-save').addEventListener('click', () => {
+      const v = field === 'subject' ? inp.value.trim() : inp.value;
+      if (field === 'subject' && !v) return toast('Group name can’t be empty', 'error');
+      if (v === cur) return renderContactDetail(chat, 'settings');
+      if (!confirm(`Change the ${field === 'subject' ? 'name' : 'description'} of this WhatsApp group for all ${Number(info.count || 0).toLocaleString()} members?`)) return;
+      save({ [field]: v }, field === 'subject' ? 'Group name updated' : 'Description updated');
+    });
+  }));
+  const bindSwitch = (id, key, onMsg, offMsg) => document.getElementById(id).addEventListener('click', e => {
+    const next = !info[key];
+    if (!confirm(next ? onMsg : offMsg)) return;
+    e.currentTarget.disabled = true;
+    save({ [key]: next }, 'Group settings updated');
+  });
+  bindSwitch('cx-set-announce', 'messages_admin_only',
+    'Only admins will be able to send messages in this group. Continue?',
+    'All members will be able to send messages in this group. Continue?');
+  bindSwitch('cx-set-restrict', 'info_admin_only',
+    'Only admins will be able to edit the group name, picture and description. Continue?',
+    'All members will be able to edit the group name, picture and description. Continue?');
+}
+
+// ── Thread ─────────────────────────────────────────────────────── //
+const CX_EMOJI = ('😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😜 🤪 🤗 🤔 🤐 😐 😏 😒 🙄 😬 😌 😔 😴 😷 🤒 🥳 😎 🤓 😕 😟 😮 😲 😳 🥺 😢 😭 😱 😤 😡 👍 👎 👌 ✌️ 🤞 🤝 🙏 👏 🙌 💪 👋 ☝️ 👉 👀 ' +
+  '❤️ 🧡 💛 💚 💙 💜 🖤 💔 💯 ✨ 🔥 ⭐ 🎉 🎊 🎁 🎂 ✅ ❌ ⚠️ ❓ ❗ 📌 📎 📞 📱 💬 📅 ⏰ 🚀 💡 💰 🛒 📦 🚚 🏠 ☕ 🌹').split(' ');
+const CX_LANGS = ['English', 'Hindi', 'Gujarati', 'Marathi', 'Tamil', 'Telugu', 'Bengali', 'Urdu', 'Arabic', 'Spanish', 'French', 'German', 'Portuguese'];
+
+function cxInsertAtCursor(ta, text) {
+  const s = ta.selectionStart ?? ta.value.length, e = ta.selectionEnd ?? ta.value.length;
+  ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+  ta.selectionStart = ta.selectionEnd = s + text.length;
+  ta.dispatchEvent(new Event('input'));
+  ta.focus();
+}
+
+function cxThreadSubtitle(chat) {
+  if (!chat.is_group) return chatSubtitle(chat) || '';
+  return 'Group';
+}
+async function cxFillGroupSubtitle(chat) {
+  if (!chat.is_group) return;
+  try {
+    const res = await cxParticipants(chat);
+    const el = document.getElementById('cx-thread-sub');
+    if (!el || State.inbox.selectedChatId != chat.id) return;
+    const list = res.participants || [];
+    const nums = list.slice(0, 40).map(p => p.is_me ? 'You' : (p.has_number !== false && /^\d{6,}$/.test(p.number) ? cxFmtPhone(p.number) : (p.name || ''))).filter(Boolean);
+    if (nums.length) { el.textContent = nums.join(', ') + (list.length > 40 ? ', …' : ''); el.title = `${list.length.toLocaleString()} members`; }
+  } catch (_) {}
+}
+
+// Refresh the bits of the thread header that depend on chat state
+function renderThreadHeaderState(chat) {
+  const ai = document.getElementById('btn-ai-toggle');
+  if (ai) ai.innerHTML = `${cxIcon('bot', 13)} ${chat.ai_active ? 'Turn AI agent off' : 'Turn AI agent on'}`;
+  const hb = document.getElementById('cx-assign-btn');
+  if (hb) hb.innerHTML = cxAssigneeAvatar(chat.assigned_to, 28, { dot: true });
+  const cf = document.getElementById('cx-chip-flag');
+  if (cf) { cf.classList.toggle('on', !!chat.is_flagged); cf.title = chat.is_flagged ? 'Flagged — click to unflag' : 'Flag this chat'; }
+  const flag = document.getElementById('btn-flag');
+  if (flag) flag.innerHTML = `${cxIcon('flag', 13)} ${chat.is_flagged ? 'Unflag' : 'Flag'}`;
+  const res = document.getElementById('btn-close-chat');
+  if (res) res.innerHTML = `${cxIcon('check', 13)} ${(chat.status || 'open') === 'resolved' ? 'Reopen chat' : 'Resolve chat'}`;
+  document.getElementById('cx-thead-flag')?.toggleAttribute('hidden', !chat.is_flagged);
+}
+
+// Small spinner next to the thread name while messages sync from WhatsApp
+const _cxSyncing = new Map();   // chat id → syncs in flight
+function cxSetSyncing(chatId, on) {
+  const n = Math.max(0, (_cxSyncing.get(+chatId) || 0) + (on ? 1 : -1));
+  if (n) _cxSyncing.set(+chatId, n); else _cxSyncing.delete(+chatId);
+  const el = document.getElementById('cx-tsync-ind');
+  if (el && State.inbox.selectedChatId == chatId) el.hidden = !n;
+}
+async function cxSyncThread(chat) {
+  const btn = document.getElementById('cx-thread-sync');
+  btn?.classList.add('spinning');
+  cxSetSyncing(chat.id, true);
+  try {
+    const r = await Api.inbox.syncMessages(chat.id, 200);
+    if (chat.is_group) {
+      // Pull fresh group data past the server's 5-minute cache
+      cxParticipants(chat, true).catch(() => {});
+      cxGroupInfo(chat, true).catch(() => {});
+      cxFillGroupSubtitle(chat); cxUpdateComposerState(chat);
+    }
+    if (State.inbox.selectedChatId == chat.id) await loadMessages(chat.id, true);
+    toast(`Synced ${r?.synced ?? 0} messages`, 'success');
+  } catch (e) { toast(e.message || 'Sync failed', 'error'); }
+  finally { btn?.classList.remove('spinning'); cxSetSyncing(chat.id, false); }
+}
+
+// Composer guard: the chat's number must be connected and (for groups) still
+// a member. Otherwise show the red banner and block WhatsApp sends.
+const CX_VOICE_TIP = 'Voice notes need audio conversion — not supported by your WhatsApp API tier';
+let _cxComposerSeq = 0;
+async function cxUpdateComposerState(chat) {
+  const seq = ++_cxComposerSeq;
+  const phone = cxPhoneOf(chat);
+  let bad = !phone || phone.waha_status !== 'WORKING';
+  if (!bad && chat.is_group) {
+    try { const info = await cxGroupInfo(chat); if (info && info.is_member === false) bad = true; }
+    catch (_) { /* unknown — don't block */ }
+  }
+  if (seq !== _cxComposerSeq || State.inbox.selectedChatId != chat.id) return;
+  cxShowPhoneBanner(bad);
+}
+function cxShowPhoneBanner(bad) {
+  const banner = document.getElementById('cx-phone-banner');
+  const area = document.getElementById('reply-area');
+  if (!banner || !area) return;
+  banner.hidden = !bad;
+  area.classList.toggle('phone-bad', !!bad);
+  const send = document.getElementById('send-btn');
+  if (send) {
+    const block = !!bad && !area.classList.contains('note-mode');
+    send.disabled = block;
+    send.title = block ? 'Reconnect the phone to send' : 'Send (Enter)';
+  }
+}
+// Sending-phone chip menu: a chat lives on one number, so the others are
+// listed for context but can't be picked here.
+function cxOpenPhoneSwitch(anchor, chat) {
+  const own = cxPhoneOf(chat);
+  const pop = cxPopover(anchor, `
+    <div class="cx-pop-title">Send from</div>
+    ${State.phones.map(p => {
+      const mine = own && p.id === own.id;
+      const st = p.waha_status === 'WORKING' ? 'Connected' : (p.waha_status || 'Disconnected').toLowerCase().replace(/^./, c => c.toUpperCase());
+      return `<button class="cx-pop-item${mine ? ' sel' : ''}" ${mine ? '' : 'disabled title="Not part of this chat"'}>
+        <span class="cx-dot ${p.waha_status === 'WORKING' ? 'ok' : 'bad'}"></span>
+        <span>${esc(cxPhoneLabel(p))}<small>${mine ? esc(st) : 'Not part of this chat'}</small></span>${mine ? cxIcon('check', 14) : ''}
+      </button>`;
+    }).join('') || '<div class="cx-dp-muted" style="padding:.4rem .55rem">No phones connected</div>'}
+    <div class="cx-pop-sep"></div>
+    <button class="cx-pop-item" data-recheck="1">${cxIcon('sync', 14)}<span>Refresh phone status</span></button>`,
+    { above: true, alignRight: true });
+  pop.querySelector('[data-recheck]').addEventListener('click', ev => {
+    ev.stopPropagation(); cxClosePop();
+    cxRecheckPhone(chat, document.getElementById('cx-banner-refresh'));
+  });
+}
+async function cxRecheckPhone(chat, btn) {
+  const phone = cxPhoneOf(chat);
+  btn?.classList.add('spinning');
+  try {
+    if (phone) {
+      const r = await Api.phones.status(phone.id);
+      if (r?.status) { phone.waha_status = r.status; updatePhoneBadge(); }
+    }
+    if (chat.is_group) cxForgetGroup(chat.id);
+    await cxUpdateComposerState(chat);
+    const ok = document.getElementById('cx-phone-banner')?.hidden;
+    toast(ok ? 'Phone is connected' : 'Still disconnected or not part of this chat', ok ? 'success' : 'error');
+  } catch (e) { toast(e.message || 'Could not check the phone', 'error'); }
+  finally { btn?.classList.remove('spinning'); }
 }
 
 function renderThread(chat) {
   const panel = document.getElementById('thread-panel');
   if (!panel) return;
-  const isAI = chat.ai_active;
   const isDetailOpen = document.getElementById('detail-panel')?.style.display !== 'none';
+  const phone = cxPhoneOf(chat);
+  const sendPhones = phone ? [phone] : State.phones;
   panel.innerHTML = `
-    <div class="thread-header">
-      <div class="thread-contact-info">
-        <div class="chat-avatar" style="background:${avatarColor(displayName(chat))};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(displayName(chat))}</div>
-        <div class="thread-contact-text">
-          <div class="thread-name">${esc(displayName(chat))}</div>
-          <div class="thread-meta">${esc(chatSubtitle(chat))} ${chat.assigned_to ? '· Assigned' : '· Open'}</div>
-        </div>
+    <div class="thread-header cx-thead">
+      <button class="cx-ibtn cx-back" id="cx-back" title="Back to chats">${cxIcon('chevLeft', 18)}</button>
+      ${cxAvatar(chat, 40)}
+      <div class="thread-contact-text">
+        <div class="thread-name"><span class="cx-tname">${esc(displayName(chat))}</span><span class="cx-thead-flag" id="cx-thead-flag" title="Flagged" ${chat.is_flagged ? '' : 'hidden'}>${cxIcon('flag', 13)}</span><span class="cx-tsync spinning" id="cx-tsync-ind" title="Syncing messages…" ${_cxSyncing.get(chat.id) ? '' : 'hidden'}>${cxIcon('sync', 13)}</span></div>
+        <div class="thread-meta" id="cx-thread-sub">${esc(cxThreadSubtitle(chat))}</div>
       </div>
-      <div class="thread-actions">
-        <button id="btn-ai-toggle" class="${isAI ? 'active-ai' : ''}" title="${isAI ? 'Deactivate AI' : 'Activate AI'}">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-          ${isAI ? 'AI On' : 'AI Off'}
-        </button>
-        <button id="btn-suggest" title="AI suggest reply">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          Suggest
-        </button>
-        <button id="btn-close-chat" class="btn-close-chat" title="Resolve chat">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-          Resolve
-        </button>
+      <div class="cx-thead-actions">
+        <button class="cx-assign-btn" id="cx-assign-btn" title="Assign chat" aria-label="Assign chat">${cxAssigneeAvatar(chat.assigned_to, 28, { dot: true })}</button>
+        <button class="cx-ibtn" id="cx-thread-sync" title="Refresh — sync messages from WhatsApp" aria-label="Refresh messages">${cxIcon('sync')}</button>
+        <button class="cx-ibtn" id="cx-tsearch-btn" title="Search in this chat" aria-label="Search in this chat">${cxIcon('search')}</button>
         <div class="thread-more-wrap">
-          <button id="btn-more" title="More actions" class="btn-icon-only">
-            <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" style="width:14px;height:14px"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
-          </button>
+          <button class="cx-ibtn" id="btn-more" title="More actions" aria-label="More actions">${cxIcon('more')}</button>
           <div class="thread-more-menu" id="thread-more-menu">
-            <button id="btn-summarize">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="21" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="11" y2="18"/></svg>
-              Summary
-            </button>
-            <button id="btn-ticket">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
-              Create Ticket
-            </button>
-            <button id="btn-note">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-              Add Note
-            </button>
-            <button id="btn-flag">
-              <svg viewBox="0 0 24 24" fill="${chat.is_flagged ? 'var(--warning)':'none'}" stroke="var(--warning)" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
-              ${chat.is_flagged ? 'Unflag' : 'Flag'}
-            </button>
+            <button id="btn-ai-toggle"></button>
+            <button id="btn-summarize">${cxIcon('note', 13)} Summary</button>
+            <button id="btn-ticket">${cxIcon('ticket', 13)} Create Ticket</button>
+            <button id="btn-task">${cxIcon('task', 13)} Create Task</button>
+            <button id="btn-note">${cxIcon('edit', 13)} Add Note</button>
+            <button id="btn-flag"></button>
+            <button id="btn-close-chat"></button>
           </div>
         </div>
-        <button id="btn-details-toggle" class="btn-icon-only${isDetailOpen ? ' btn-details-active' : ''}" title="Toggle contact details">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-        </button>
+        <button class="cx-ibtn${isDetailOpen ? ' on' : ''}" id="btn-details-toggle" title="Toggle details panel">${cxIcon('panel')}</button>
       </div>
     </div>
-    <div class="messages-area" id="messages-area">
+    <div class="cx-tsearch" id="cx-tsearch" hidden>
+      ${cxIcon('search', 14)}
+      <input type="search" id="cx-tsearch-input" placeholder="Search loaded messages…" autocomplete="off">
+      <span class="cx-tsearch-count" id="cx-tsearch-count"></span>
+      <button class="cx-ibtn sm" id="cx-tsearch-prev" title="Previous">${cxIcon('chevUp', 14)}</button>
+      <button class="cx-ibtn sm" id="cx-tsearch-next" title="Next">${cxIcon('chevDown', 14)}</button>
+      <button class="cx-ibtn sm" id="cx-tsearch-close" title="Close">${cxIcon('x', 14)}</button>
+    </div>
+    <div class="messages-area cx-messages" id="messages-area">
       <div class="loading-center"><div class="spinner"></div></div>
     </div>
-    <div class="reply-area" id="reply-area">
-      <div class="composer-tabs">
-        <span class="composer-tab active" id="tab-whatsapp">WhatsApp</span>
-        <span class="composer-tab" id="tab-note">Private Note</span>
+    <div class="reply-area cx-composer" id="reply-area">
+      <div class="composer-tabs cx-ctabs" role="tablist">
+        <button type="button" class="composer-tab active" id="tab-whatsapp" role="tab">WhatsApp</button>
+        <button type="button" class="composer-tab" id="tab-note" role="tab">Private Note</button>
       </div>
-      <div class="reply-toolbar" id="reply-toolbar">
-        <button class="btn btn-ghost btn-sm" id="btn-qr">/ Quick Reply</button>
-        <button class="btn btn-ghost btn-sm" id="btn-polish" title="AI polish: fix grammar and tone">✨ Polish</button>
-        <button class="btn btn-ghost btn-sm" id="btn-attach" title="Send image or file by URL">📎 Media</button>
-        <button class="btn btn-ghost btn-sm" id="btn-schedule" title="Schedule this message">🕐 Schedule</button>
-        <select id="phone-select" class="btn btn-secondary btn-sm" style="border:1px solid var(--border);padding:3px 6px">
-          ${State.phones.map(p => `<option value="${p.id}">${esc(p.name||p.phone_number)}</option>`).join('')}
-        </select>
-      </div>
-      <div class="reply-bar">
-        <textarea id="reply-text" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
-        <button class="btn btn-primary" id="send-btn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:15px;height:15px"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-        </button>
+      <div class="cx-cbox">
+        <div class="reply-bar cx-rbar">
+          <textarea id="reply-text" rows="1" placeholder="Message…"></textarea>
+          <button class="cx-send" id="send-btn" title="Send (Enter)" aria-label="Send">${cxIcon('send', 17)}</button>
+        </div>
+        <div class="cx-cbanner" id="cx-phone-banner" role="alert" title="Selected phone is disconnected or not part of this chat! Please reconnect or switch the active phone" hidden>
+          <span>Selected phone is disconnected or not part of this chat! Please reconnect or switch the active phone</span>
+          <button type="button" class="cx-cbanner-btn" id="cx-banner-refresh">Refresh ${cxIcon('sync', 12)}</button>
+        </div>
+        <div class="cx-tools" id="reply-toolbar">
+          <button class="cx-ibtn wa-only" id="btn-attach" title="Send an image or file (by URL)" aria-label="Attach">${cxIcon('clip')}</button>
+          <button class="cx-ibtn" id="cx-emoji-btn" title="Emoji" aria-label="Emoji">${cxIcon('smile')}</button>
+          <button class="cx-ibtn" id="cx-translate-btn" title="Translate draft" aria-label="Translate draft">${cxIcon('translate')}</button>
+          <button class="cx-ibtn" id="cx-ai-btn" title="AI: suggest a reply or polish your draft" aria-label="AI assist">${cxIcon('sparkle')}</button>
+          <span class="cx-tip-wrap wa-only" title="${esc(CX_VOICE_TIP)}"><button class="cx-ibtn" id="btn-voice" disabled aria-label="Voice note (not supported)">${cxIcon('mic')}</button></span>
+          <button class="cx-ibtn wa-only" id="btn-qr" title="Quick replies & signatures (or type /)" aria-label="Quick replies">${cxIcon('zap')}</button>
+          <button class="cx-ibtn wa-only" id="btn-schedule" title="Schedule this message" aria-label="Schedule">${cxIcon('clock')}</button>
+          <span class="cx-grow"></span>
+          <span class="cx-from-chip wa-only" id="cx-from-chip">
+            <button type="button" class="cx-chip-main" id="cx-chip-phone" title="Replies go out from the number this chat belongs to">${CX_WA_LOGO}<span>${esc(cxPhoneLabel(phone) || 'No number')}</span></button>
+            <button type="button" class="cx-chip-flag${chat.is_flagged ? ' on' : ''}" id="cx-chip-flag" title="${chat.is_flagged ? 'Flagged — click to unflag' : 'Flag this chat'}" aria-label="Flag chat">${cxIcon('flag', 13)}</button>
+            <button type="button" class="cx-chip-sw" id="cx-chip-switch" title="Sending phone" aria-label="Choose sending phone">${cxIcon('chevUpDown', 13)}</button>
+          </span>
+          <select id="phone-select" hidden>${sendPhones.map(p => `<option value="${p.id}">${esc(p.name || p.phone_number)}</option>`).join('')}</select>
+        </div>
       </div>
     </div>`;
 
-  // AI toggle
-  document.getElementById('btn-ai-toggle').addEventListener('click', async () => {
-    try {
-      if (chat.ai_active) {
-        await Api.ai.deactivate(chat.id);
-        chat.ai_active = false;
-        toast('AI deactivated', 'success');
-      } else {
-        await Api.ai.activate(chat.id);
-        chat.ai_active = true;
-        toast('AI activated', 'success');
-      }
-      renderThread(chat);
-      loadMessages(chat.id);
-    } catch(e) { toast(e.message, 'error'); }
+  renderThreadHeaderState(chat);
+  cxFillGroupSubtitle(chat);
+  cxUpdateComposerState(chat);
+  cxTeam(chat).then(cxRefreshOnlineDots).catch(() => {});
+  document.getElementById('cx-banner-refresh').addEventListener('click', e => cxRecheckPhone(chat, e.currentTarget));
+  document.getElementById('cx-chip-flag').addEventListener('click', () => cxToggleFlag(chat));
+  document.getElementById('cx-chip-switch').addEventListener('click', e => { e.stopPropagation(); cxOpenPhoneSwitch(e.currentTarget, chat); });
+  document.getElementById('cx-chip-phone').addEventListener('click', e => { e.stopPropagation(); cxOpenPhoneSwitch(e.currentTarget, chat); });
+
+  document.getElementById('cx-back').addEventListener('click', () => {
+    document.getElementById('inbox-layout')?.classList.remove('cx-thread-open');
+  });
+  document.getElementById('cx-assign-btn').addEventListener('click', e => { e.stopPropagation(); cxOpenAssignPop(e.currentTarget, chat, { alignRight: true }); });
+  document.getElementById('btn-ai-toggle').addEventListener('click', () => cxToggleAI(chat));
+  document.getElementById('cx-thread-sync').addEventListener('click', () => cxSyncThread(chat));
+
+  // Search in chat: highlights matches among loaded messages
+  const sBar = document.getElementById('cx-tsearch');
+  const sInput = document.getElementById('cx-tsearch-input');
+  let hits = [], hitIdx = -1;
+  const runSearch = () => {
+    const area = document.getElementById('messages-area');
+    const q = sInput.value.trim().toLowerCase();
+    hits = [];
+    area?.querySelectorAll('.msg').forEach(el => {
+      const match = !!q && el.textContent.toLowerCase().includes(q);
+      el.classList.toggle('cx-hit', match);
+      el.classList.toggle('cx-dim', !!q && !match);
+      if (match) hits.push(el);
+    });
+    hitIdx = hits.length ? hits.length - 1 : -1;
+    focusHit();
+  };
+  const focusHit = () => {
+    hits.forEach((h, i) => h.classList.toggle('cx-hit-cur', i === hitIdx));
+    document.getElementById('cx-tsearch-count').textContent = sInput.value.trim() ? (hits.length ? `${hitIdx + 1} of ${hits.length}` : 'No matches') : '';
+    if (hitIdx >= 0) hits[hitIdx].scrollIntoView({ block: 'center' });
+  };
+  const closeSearch = () => { sBar.hidden = true; sInput.value = ''; runSearch(); };
+  document.getElementById('cx-tsearch-btn').addEventListener('click', () => {
+    if (sBar.hidden) { sBar.hidden = false; sInput.focus(); } else closeSearch();
+  });
+  sInput.addEventListener('input', runSearch);
+  sInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); if (hits.length) { hitIdx = (hitIdx - 1 + hits.length) % hits.length; focusHit(); } }
+    if (e.key === 'Escape') closeSearch();
+  });
+  document.getElementById('cx-tsearch-prev').addEventListener('click', () => { if (hits.length) { hitIdx = (hitIdx - 1 + hits.length) % hits.length; focusHit(); } });
+  document.getElementById('cx-tsearch-next').addEventListener('click', () => { if (hits.length) { hitIdx = (hitIdx + 1) % hits.length; focusHit(); } });
+  document.getElementById('cx-tsearch-close').addEventListener('click', closeSearch);
+  panel._cxRunSearch = () => { if (!sBar.hidden && sInput.value.trim()) runSearch(); };
+
+  const ta = document.getElementById('reply-text');
+  const autosize = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; };
+  ta.addEventListener('input', autosize);
+
+  // AI assist: suggest a reply (WhatsApp mode) or polish the draft
+  document.getElementById('cx-ai-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    const note = replyArea.classList.contains('note-mode');
+    const pop = cxPopover(btn, `<div class="cx-pop-title">AI assist</div>
+      ${note ? '' : `<button class="cx-pop-item" data-ai="suggest">${cxIcon('sparkle', 14)}<span>Suggest a reply</span></button>`}
+      <button class="cx-pop-item" data-ai="polish">${cxIcon('wand', 14)}<span>Polish grammar &amp; tone</span></button>`, { above: true });
+    pop.querySelector('[data-ai="suggest"]')?.addEventListener('click', () => { cxClosePop(); cxSuggestReply(chat); });
+    pop.querySelector('[data-ai="polish"]').addEventListener('click', async () => {
+      cxClosePop();
+      const draft = ta.value.trim();
+      if (!draft) return toast('Type a draft first', 'error');
+      btn.disabled = true; btn.classList.add('spinning');
+      try {
+        const res = await Api.ai.polish(draft);
+        ta.value = res.polished || draft; autosize();
+        toast('Reply polished', 'success');
+      } catch(err) { toast(err.message, 'error'); }
+      btn.disabled = false; btn.classList.remove('spinning');
+    });
   });
 
-  // Suggest reply
-  document.getElementById('btn-suggest').addEventListener('click', async () => {
-    try {
-      const res = await Api.ai.suggestReply(chat.id);
-      document.getElementById('reply-text').value = res.suggestion || res.reply || JSON.stringify(res);
-      toast('Reply suggestion ready', 'success');
-    } catch(e) { toast(e.message, 'error'); }
-  });
-
-  // Polish draft reply
-  document.getElementById('btn-polish').addEventListener('click', async () => {
-    const ta = document.getElementById('reply-text');
+  // Translate draft into a chosen language (existing AI translate endpoint)
+  document.getElementById('cx-translate-btn').addEventListener('click', e => {
+    e.stopPropagation();
     const draft = ta.value.trim();
-    if (!draft) return toast('Type a draft first', 'error');
-    const btn = document.getElementById('btn-polish');
-    btn.disabled = true; btn.textContent = '✨ Polishing…';
-    try {
-      const res = await Api.ai.polish(draft);
-      ta.value = res.polished || draft;
-      toast('Reply polished', 'success');
-    } catch(e) { toast(e.message, 'error'); }
-    btn.disabled = false; btn.textContent = '✨ Polish';
+    if (!draft) return toast('Type a draft to translate', 'error');
+    const btn = e.currentTarget;
+    const pop = cxPopover(btn, `<div class="cx-pop-title">Translate draft to</div>
+      ${CX_LANGS.map(l => `<button class="cx-pop-item" data-lang="${l}"><span>${l}</span></button>`).join('')}`,
+      { above: true, cls: 'cx-pop-scroll' });
+    pop.querySelectorAll('[data-lang]').forEach(b => b.addEventListener('click', async () => {
+      cxClosePop();
+      btn.disabled = true; btn.classList.add('spinning');
+      try {
+        const res = await Api.ai.translate(ta.value.trim(), b.dataset.lang);
+        if (res.translated) { ta.value = res.translated; autosize(); }
+        toast(`Translated to ${b.dataset.lang}`, 'success');
+      } catch (err) { toast(err.message, 'error'); }
+      btn.disabled = false; btn.classList.remove('spinning');
+    }));
+  });
+
+  // Emoji picker (built-in grid)
+  document.getElementById('cx-emoji-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    const pop = cxPopover(e.currentTarget, `<div class="cx-emoji-grid">${CX_EMOJI.map(em => `<button type="button" data-em="${em}">${em}</button>`).join('')}</div>`,
+      { above: true, cls: 'cx-pop-emoji' });
+    pop.querySelectorAll('[data-em]').forEach(b => b.addEventListener('click', ev => {
+      ev.stopPropagation();
+      cxInsertAtCursor(ta, b.dataset.em);
+    }));
   });
 
   // Send media by URL
@@ -1406,7 +3225,7 @@ function renderThread(chat) {
 
   // Schedule current draft
   document.getElementById('btn-schedule').addEventListener('click', () => {
-    showScheduleModal(chat.id, document.getElementById('reply-text').value.trim());
+    showScheduleModal(chat.id, ta.value.trim());
   });
 
   // Summarize
@@ -1420,10 +3239,8 @@ function renderThread(chat) {
     } catch(e) { toast(e.message, 'error'); }
   });
 
-  // Create ticket
-  document.getElementById('btn-ticket').addEventListener('click', () => {
-    showTicketModal({ chatId: chat.id });
-  });
+  document.getElementById('btn-ticket').addEventListener('click', () => showTicketModal({ chatId: chat.id }));
+  document.getElementById('btn-task').addEventListener('click', () => showTaskModal({ chatId: chat.id }));
 
   // Add note
   document.getElementById('btn-note').addEventListener('click', () => {
@@ -1439,28 +3256,22 @@ function renderThread(chat) {
       try {
         await Api.notes.create({ chat_id: chat.id, content });
         closeModal(); toast('Note saved', 'success');
-        loadMessages(chat.id);
+        loadMessages(chat.id, true);
       } catch(e) { toast(e.message, 'error'); }
     });
   });
 
-  // Flag toggle
-  document.getElementById('btn-flag').addEventListener('click', async () => {
-    try {
-      await Api.inbox.updateChat(chat.id, { is_flagged: !chat.is_flagged });
-      chat.is_flagged = !chat.is_flagged;
-      renderThread(chat);
-      loadChats();
-    } catch(e) { toast(e.message, 'error'); }
-  });
+  document.getElementById('btn-flag').addEventListener('click', () => cxToggleFlag(chat));
 
-  // Resolve/close chat
+  // Resolve / reopen chat
   document.getElementById('btn-close-chat').addEventListener('click', async () => {
+    const next = (chat.status || 'open') === 'resolved' ? 'open' : 'resolved';
     try {
-      await Api.inbox.updateChat(chat.id, { status: 'resolved' });
-      chat.status = 'resolved';
-      toast('Chat resolved', 'success');
-      loadChats();
+      await Api.inbox.updateChat(chat.id, { status: next });
+      chat.status = next;
+      toast(next === 'resolved' ? 'Chat resolved' : 'Chat reopened', 'success');
+      renderThreadHeaderState(chat);
+      if (State.inbox.statusFilter) loadChats(); else cxRerenderRow(chat);
     } catch(e) { toast(e.message, 'error'); }
   });
 
@@ -1472,25 +3283,16 @@ function renderThread(chat) {
     moreMenu.classList.toggle('open');
   });
   document.addEventListener('click', function closeMoreMenu(e) {
-    if (!moreMenu.contains(e.target) && e.target !== moreBtn) {
-      moreMenu.classList.remove('open');
-      document.removeEventListener('click', closeMoreMenu);
-    }
+    if (!moreMenu.isConnected) { document.removeEventListener('click', closeMoreMenu); return; }
+    if (!moreMenu.contains(e.target) && e.target !== moreBtn) moreMenu.classList.remove('open');
+    else if (moreMenu.contains(e.target) && e.target.closest('button')) moreMenu.classList.remove('open');
   });
 
   // Details panel toggle
   document.getElementById('btn-details-toggle').addEventListener('click', () => {
     const detailPanel = document.getElementById('detail-panel');
-    const layout = document.getElementById('inbox-layout');
-    const btn = document.getElementById('btn-details-toggle');
-    if (detailPanel.style.display === 'none' || !detailPanel.style.display) {
-      renderContactDetail(chat);
-      btn.classList.add('btn-details-active');
-    } else {
-      detailPanel.style.display = 'none';
-      layout.classList.remove('detail-open');
-      btn.classList.remove('btn-details-active');
-    }
+    if (detailPanel.style.display === 'none' || !detailPanel.style.display) renderContactDetail(chat);
+    else cxCloseDetail();
   });
 
   // Quick reply picker
@@ -1509,7 +3311,7 @@ function renderThread(chat) {
         </div>`);
       document.querySelectorAll('[data-qr]').forEach(el => {
         el.addEventListener('click', () => {
-          document.getElementById('reply-text').value = el.dataset.qr;
+          ta.value = el.dataset.qr; autosize();
           closeModal();
         });
       });
@@ -1527,37 +3329,42 @@ function renderThread(chat) {
     tabWA.classList.toggle('active', !note);
     tabNote.classList.toggle('active', false);
     tabNote.classList.toggle('note-active', note);
+    tabWA.setAttribute('aria-selected', String(!note));
+    tabNote.setAttribute('aria-selected', String(note));
     replyArea.classList.toggle('note-mode', note);
-    document.getElementById('reply-text').placeholder = note
-      ? 'Write a private note — only your team can see this…'
-      : 'Type a message… (Enter to send, Shift+Enter for newline)';
+    ta.placeholder = note ? 'Write a private note — only your team can see this…' : 'Message…';
+    // Notes never leave the CRM, so a disconnected phone only blocks WhatsApp sends
+    cxShowPhoneBanner(replyArea.classList.contains('phone-bad'));
+    ta.focus();
   };
   tabWA.addEventListener('click', () => setComposerMode('whatsapp'));
   tabNote.addEventListener('click', () => setComposerMode('note'));
 
   // Send message (or save private note)
   const sendMsg = async () => {
-    const text = document.getElementById('reply-text').value.trim();
+    const text = ta.value.trim();
     if (!text) return;
     const btn = document.getElementById('send-btn');
     btn.disabled = true;
     try {
       if (composerMode === 'note') {
         await Api.notes.create({ chat_id: chat.id, content: text });
-        document.getElementById('reply-text').value = '';
+        ta.value = ''; autosize();
         toast('Private note added — team only', 'success');
-        await loadMessages(chat.id);   // show the note in the thread
+        await loadMessages(chat.id, true);   // show the note in the thread
       } else {
+        if (replyArea.classList.contains('phone-bad')) { cxShowPhoneBanner(true); return toast('This chat’s phone is disconnected — reconnect it to send', 'error'); }
         const phoneId = document.getElementById('phone-select')?.value;
         if (!phoneId) { btn.disabled = false; return toast('Select a phone', 'error'); }
         await Api.inbox.send({ chat_id: chat.id, phone_id: +phoneId, body: text, message_type: 'text' });
-        document.getElementById('reply-text').value = '';
+        ta.value = ''; autosize();
         // WS new_message event from backend broadcasts the sent message to all agents in real time.
         // Only fall back to a full reload when WS is disconnected.
         if (!WS.alive) await loadMessages(chat.id);
       }
     } catch(e) { toast(e.message, 'error'); }
     btn.disabled = false;
+    cxShowPhoneBanner(replyArea.classList.contains('phone-bad'));
   };
 
   document.getElementById('send-btn').addEventListener('click', sendMsg);
@@ -1569,7 +3376,6 @@ function renderThread(chat) {
   const closeQrSuggest = () => { if (qrBox) { qrBox.remove(); qrBox = null; } };
 
   async function updateQrSuggest() {
-    const ta = document.getElementById('reply-text');
     const text = ta.value;
     if (!text.startsWith('/') || text.includes(' ') || composerMode === 'note') { closeQrSuggest(); return; }
     if (!qrCache) {
@@ -1591,28 +3397,28 @@ function renderThread(chat) {
       </div>`).join('');
     qrBox.querySelectorAll('.qr-row').forEach(row => row.addEventListener('mousedown', e => {
       e.preventDefault();
-      ta.value = matches[+row.dataset.i].message;
+      ta.value = matches[+row.dataset.i].message; autosize();
       closeQrSuggest();
       ta.focus();
     }));
     qrBox._matches = matches;
   }
 
-  document.getElementById('reply-text').addEventListener('input', updateQrSuggest);
-  document.getElementById('reply-text').addEventListener('blur', () => setTimeout(closeQrSuggest, 150));
-  document.getElementById('reply-text').addEventListener('keydown', e => {
+  ta.addEventListener('input', updateQrSuggest);
+  ta.addEventListener('blur', () => setTimeout(closeQrSuggest, 150));
+  ta.addEventListener('keydown', e => {
     if (qrBox && qrBox._matches?.length) {
       if (e.key === 'ArrowDown') { e.preventDefault(); qrSel = (qrSel + 1) % qrBox._matches.length; updateQrSuggest(); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); qrSel = (qrSel - 1 + qrBox._matches.length) % qrBox._matches.length; updateQrSuggest(); return; }
       if (e.key === 'Tab' || e.key === 'Enter') {
         e.preventDefault();
-        document.getElementById('reply-text').value = qrBox._matches[qrSel].message;
+        ta.value = qrBox._matches[qrSel].message; autosize();
         closeQrSuggest();
         return;
       }
       if (e.key === 'Escape') { closeQrSuggest(); return; }
     }
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMsg(); }
   });
 }
 
@@ -1621,10 +3427,14 @@ let _msgScrollObserver = null;
 let _msgLoadingOlder = false;
 let _msgNoMoreOlder = false;
 let _msgLastSyncedChatId = null; // chat ID that was most recently synced; prevents double-sync in _fetchOlderMessages
+let _msgLoadSeq = 0;             // bumps on every loadMessages(); stale responses compare against it
 
 async function loadMessages(chatId, _alreadySynced) {
   const area = document.getElementById('messages-area');
   if (!area) return;
+  const seq = ++_msgLoadSeq;
+  // True when the user switched chats (or a newer load started) while we were awaiting
+  const stale = () => seq !== _msgLoadSeq || State.inbox.selectedChatId != chatId || !area.isConnected;
   const chat = State.inbox.chats?.find(c => c.id == chatId);
   const isGroup = chat?.is_group || false;
 
@@ -1642,18 +3452,23 @@ async function loadMessages(chatId, _alreadySynced) {
   try {
     // Always do a live WAHA sync first (200 msgs) unless WS just reconnected
     if (!_alreadySynced) {
+      cxSetSyncing(chatId, true);
       try { await Api.inbox.syncMessages(chatId, 200); _msgLastSyncedChatId = chatId; } catch(_) {}
+      finally { cxSetSyncing(chatId, false); }
+      if (stale()) return;
     }
 
     let messages = await Api.inbox.messages(chatId, { limit: 100 });
-    State.inbox.messages = messages;
+    if (stale()) return;
 
     // Interleave private team notes into the thread
     let notes = [];
     try { notes = await Api.notes.list(chatId); } catch(_) {}
+    if (stale()) return;
+    State.inbox.messages = messages;
     const thread = messages.map(m => ({ kind: 'msg', ts: m.timestamp, item: m }))
       .concat(notes.map(n => ({ kind: 'note', ts: n.created_at, item: n })))
-      .sort((a, b) => new Date(a.ts) - new Date(b.ts));
+      .sort((a, b) => parseServerDate(a.ts) - parseServerDate(b.ts));
 
     const msgHtml = thread.map(t => t.kind === 'note' ? renderNoteBubble(t.item) : renderMessage(t.item, isGroup)).join('');
 
@@ -1661,13 +3476,17 @@ async function loadMessages(chatId, _alreadySynced) {
     area.innerHTML =
       `<div id="scroll-top-sentinel" style="height:1px;width:100%"></div>
        <div class="msg-spacer"></div>` +
-      (msgHtml || `<div style="text-align:center;padding:1rem;font-size:13px;color:var(--text-3)">No messages yet — send the first one!</div>`);
+      (msgHtml || `<div class="cx-empty-thread" style="text-align:center;padding:1rem;font-size:13px;color:var(--text-3)">No messages yet — send the first one!</div>`);
 
+    cxRedoDayChips(area);
     area.scrollTop = area.scrollHeight;
+    cxObserveMedia(area);
+    document.getElementById('thread-panel')?._cxRunSearch?.();
 
     // Attach IntersectionObserver for seamless infinite scroll upward
     _attachScrollSentinel(chatId, isGroup, area);
   } catch(e) {
+    if (stale()) return;
     area.innerHTML = `<div class="loading-center text-muted">Could not load messages. Check your connection.</div>`;
   }
 }
@@ -1675,19 +3494,29 @@ async function loadMessages(chatId, _alreadySynced) {
 function _attachScrollSentinel(chatId, isGroup, area) {
   const sentinel = document.getElementById('scroll-top-sentinel');
   if (!sentinel) return;
-  _msgScrollObserver = new IntersectionObserver(async (entries) => {
+  if (_msgScrollObserver) _msgScrollObserver.disconnect();
+  const seq = _msgLoadSeq;
+  const observer = new IntersectionObserver(async (entries) => {
+    // Observer belongs to one chat load; retire it once another chat/load takes over
+    if (seq !== _msgLoadSeq || State.inbox.selectedChatId != chatId || !area.isConnected) {
+      observer.disconnect();
+      if (_msgScrollObserver === observer) _msgScrollObserver = null;
+      return;
+    }
     if (!entries[0].isIntersecting) return;
     if (_msgLoadingOlder || _msgNoMoreOlder) return;
     _msgLoadingOlder = true;
-    await _fetchOlderMessages(chatId, isGroup, area);
-    _msgLoadingOlder = false;
+    try { await _fetchOlderMessages(chatId, isGroup, area, seq); }
+    finally { if (seq === _msgLoadSeq) _msgLoadingOlder = false; }
   }, { root: area, threshold: 0.1 });
-  _msgScrollObserver.observe(sentinel);
+  _msgScrollObserver = observer;
+  observer.observe(sentinel);
 }
 
-async function _fetchOlderMessages(chatId, isGroup, area) {
+async function _fetchOlderMessages(chatId, isGroup, area, seq) {
   const sentinel = document.getElementById('scroll-top-sentinel');
   if (!sentinel || !area) return;
+  const stale = () => seq !== _msgLoadSeq || State.inbox.selectedChatId != chatId || !area.isConnected;
 
   // Show tiny spinner above sentinel
   const spinnerEl = document.createElement('div');
@@ -1704,6 +3533,7 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
     // 1. Try DB first using timestamp cursor (correct for historically-synced messages
     //    that arrive with high IDs but early timestamps — id-based cursor misses them)
     let older = oldestTs ? await Api.inbox.messages(chatId, { limit: 50, before_ts: oldestTs }) : [];
+    if (stale()) return;
 
     // 2. DB exhausted → pull from WAHA
     // Skip if loadMessages already synced this exact chat moments ago (avoids double-sync
@@ -1715,6 +3545,7 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
           ? await Api.inbox.messages(chatId, { limit: 50, before_ts: oldestTs })
           : await Api.inbox.messages(chatId, { limit: 50 });
       } catch(_) {}
+      if (stale()) return;
     }
     _msgLastSyncedChatId = null; // consume the guard — subsequent scroll-ups can WAHA sync normally
 
@@ -1724,15 +3555,18 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
       _msgNoMoreOlder = true;
       // Show a permanent "no more" tag at the top
       sentinel.insertAdjacentHTML('afterend',
-        `<div style="text-align:center;padding:.75rem;font-size:11px;color:var(--text-4);letter-spacing:.03em;opacity:.6">— beginning of conversation —</div>`);
+        `<div style="text-align:center;padding:.75rem;font-size:11px;color:var(--text-3);letter-spacing:.03em;opacity:.7">— beginning of conversation —</div>`);
       if (_msgScrollObserver) { _msgScrollObserver.disconnect(); _msgScrollObserver = null; }
       return;
     }
 
     // Prepend older messages into state
-    State.inbox.messages = older.concat(current);
+    State.inbox.messages = older.concat(State.inbox.messages || []);
     const html = older.map(m => renderMessage(m, isGroup)).join('');
     sentinel.insertAdjacentHTML('afterend', html);
+    cxRedoDayChips(area);
+    cxObserveMedia(area);
+    document.getElementById('thread-panel')?._cxRunSearch?.();
 
     // Keep viewport anchored so content doesn't jump
     area.scrollTop = area.scrollHeight - prevScrollHeight;
@@ -1741,103 +3575,351 @@ async function _fetchOlderMessages(chatId, isGroup, area) {
   }
 }
 
+// Date separator chips ("22-09-2026") before the first item of each day
+function cxRedoDayChips(area) {
+  area.querySelectorAll(':scope > .cx-day').forEach(e => e.remove());
+  let last = '';
+  area.querySelectorAll(':scope > [data-ts]').forEach(el => {
+    const ms = +el.dataset.ts;
+    if (!ms) return;
+    const d = new Date(ms);
+    const key = d.toDateString();
+    if (key !== last) {
+      last = key;
+      el.insertAdjacentHTML('beforebegin', `<div class="cx-day"><span>${cxDayLabel(d)}</span></div>`);
+    }
+  });
+}
+function cxTsAttr(ts) {
+  const d = parseServerDate(ts);
+  return d && !isNaN(d.getTime()) ? d.getTime() : '';
+}
+
+// WhatsApp formatting — XSS-safe: escape first, then apply markup to the escaped text
+function waFormat(text) {
+  let s = esc(String(text || '').replace(/\u0000/g, ''));
+  const codes = [];
+  s = s.replace(/```([\s\S]+?)```/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  const edge = '(^|[\\s(>\\u0000])', end = '(?=$|[\\s).,!?:;<\\u0000])';
+  s = s.replace(new RegExp(edge + '\\*(?!\\s)([^*\\n]+?)\\*' + end, 'g'), '$1<strong>$2</strong>');
+  s = s.replace(new RegExp(edge + '_(?!\\s)([^_\\n]+?)_' + end, 'g'), '$1<em>$2</em>');
+  s = s.replace(new RegExp(edge + '~(?!\\s)([^~\\n]+?)~' + end, 'g'), '$1<s>$2</s>');
+  s = s.replace(/\bhttps?:\/\/[^\s<]*[^\s<.,:;!?)\]]/g, u => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
+  s = s.replace(/\n/g, '<br>');
+  s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="cx-mono">${codes[+i] ?? ''}</code>`);
+  return s;
+}
+function cxTextBlock(body) {
+  const lines = (String(body).match(/\n/g) || []).length + 1;
+  const long = body.length > 900 || lines > 12;
+  return `<div class="cx-text${long ? ' cx-clamp' : ''}">${waFormat(body)}</div>${long ? '<button type="button" class="cx-readmore">… Read more</button>' : ''}`;
+}
+
+// Expand clamped messages; download document attachments (delegated, global)
+document.addEventListener('click', e => {
+  const more = e.target.closest('.cx-readmore');
+  if (more) {
+    more.previousElementSibling?.classList.remove('cx-clamp');
+    more.remove();
+    return;
+  }
+  const dl = e.target.closest('[data-dl-id]');
+  if (dl) {
+    e.stopPropagation();
+    Api.media.download(+dl.dataset.dlId, dl.dataset.dlName || 'file').catch(err => toast(err.message || 'Download failed', 'error'));
+    return;
+  }
+  const img = e.target.closest('.cx-mthumb.ready img, .cx-mimg');
+  if (img && img.closest('#messages-area')) cxLightbox(img.src);
+});
+
+function cxLightbox(src) {
+  const el = document.createElement('div');
+  el.className = 'cx-lightbox';
+  el.innerHTML = `<img src="${esc(src)}" alt=""><button class="cx-ibtn" title="Close">${cxIcon('x', 20)}</button>`;
+  el.addEventListener('click', () => el.remove());
+  document.body.appendChild(el);
+}
+
+// Media: files come through the authenticated /media/{id}/file proxy as blobs
+const _cxBlobCache = new Map();
+function cxMediaBlobUrl(id) {
+  if (_cxBlobCache.has(id)) return _cxBlobCache.get(id);
+  const p = Api.media.blob(id).then(b => URL.createObjectURL(b));
+  _cxBlobCache.set(id, p);
+  p.catch(() => _cxBlobCache.delete(id));
+  if (_cxBlobCache.size > 150) {
+    const [k, old] = _cxBlobCache.entries().next().value;
+    _cxBlobCache.delete(k);
+    old.then(u => URL.revokeObjectURL(u)).catch(() => {});
+  }
+  return p;
+}
+let _cxMediaObs = null;
+function cxObserveMedia(root) {
+  if (!root) return;
+  const pending = root.querySelectorAll('[data-media-id]:not([data-obs])');
+  if (!pending.length) return;
+  if (!('IntersectionObserver' in window)) { pending.forEach(el => { el.dataset.obs = '1'; cxHydrateMedia(el); }); return; }
+  if (!_cxMediaObs) {
+    _cxMediaObs = new IntersectionObserver(entries => entries.forEach(en => {
+      if (en.isIntersecting) { _cxMediaObs.unobserve(en.target); cxHydrateMedia(en.target); }
+    }), { rootMargin: '300px' });
+  }
+  pending.forEach(el => { el.dataset.obs = '1'; _cxMediaObs.observe(el); });
+}
+async function cxHydrateMedia(el) {
+  const id = +el.dataset.mediaId, kind = el.dataset.kind;
+  if (!id || !el.isConnected) return;
+  el.classList.add('loading');
+  try {
+    const url = await cxMediaBlobUrl(id);
+    if (!el.isConnected) return;
+    const area = el.closest('.messages-area');
+    const atBottom = area && area.scrollHeight - area.scrollTop - area.clientHeight < 80;
+    const keep = () => { if (atBottom && area.isConnected) area.scrollTop = area.scrollHeight; };
+    if (kind === 'image') {
+      const img = new Image();
+      img.alt = '';
+      img.onload = keep;
+      img.src = url;
+      el.replaceChildren(img);
+    } else if (kind === 'video') {
+      const v = document.createElement('video');
+      v.controls = !el.closest('.cx-tile'); v.preload = 'metadata'; v.muted = !!el.closest('.cx-tile');
+      v.src = url; v.onloadedmetadata = keep;
+      el.replaceChildren(v);
+      if (el.closest('.cx-tile')) el.insertAdjacentHTML('beforeend', `<span class="cx-play">${cxIcon('play', 18)}</span>`);
+    } else if (kind === 'audio') {
+      const a = document.createElement('audio');
+      a.controls = true; a.preload = 'metadata'; a.src = url;
+      el.replaceChildren(a);
+    }
+    el.classList.remove('loading');
+    el.classList.add('ready');
+  } catch (_) {
+    el.classList.remove('loading');
+    el.classList.add('failed');
+    el.title = 'Media not available (the WhatsApp number may be disconnected)';
+  }
+}
+
+function cxMediaBlock(m, mtype) {
+  const extUrl = m.media_source === 'external' && /^https:\/\//i.test(m.media_url || '') ? m.media_url : '';
+  const proxied = m.media_source === 'proxy' && m.id;
+  const kindOf = t => ['image', 'photo', 'sticker', 'gif'].includes(t) ? 'image'
+    : t === 'video' ? 'video' : ['audio', 'ptt', 'voice'].includes(t) ? 'audio'
+    : ['document', 'pdf', 'file'].includes(t) ? 'doc' : '';
+  const kind = kindOf(mtype);
+  if (kind === 'image') {
+    if (extUrl) return `<img class="cx-mimg" src="${esc(extUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer">`;
+    return proxied
+      ? `<div class="cx-mthumb${mtype === 'sticker' ? ' sticker' : ''}" data-media-id="${m.id}" data-kind="image">${cxIcon('image', 26)}<span>${mtype === 'sticker' ? 'Sticker' : 'Photo'}</span></div>`
+      : `<div class="msg-media-img">${cxIcon('image', 18)}<span>${mtype === 'sticker' ? 'Sticker' : 'Photo'}</span></div>`;
+  }
+  if (kind === 'video') {
+    return proxied
+      ? `<div class="cx-mthumb cx-mvideo" data-media-id="${m.id}" data-kind="video">${cxIcon('video', 26)}<span>Video</span></div>`
+      : `<div class="msg-media-img">${cxIcon('video', 18)}<span>Video</span></div>`;
+  }
+  if (kind === 'audio') {
+    return proxied
+      ? `<div class="cx-maudio" data-media-id="${m.id}" data-kind="audio">${cxIcon('mic', 16)}<span>${mtype === 'ptt' || mtype === 'voice' ? 'Voice message' : 'Audio'}</span></div>`
+      : `<div class="msg-media-audio">${cxIcon('mic', 16)}<span style="font-size:12px;opacity:.75">${mtype === 'ptt' ? 'Voice message' : 'Audio'}</span></div>`;
+  }
+  if (kind === 'doc') {
+    const name = m.media_filename || (m.body && !CX_MEDIA_LABEL_RE.test(m.body) ? m.body.split('\n')[0] : '') || 'Document';
+    const action = extUrl
+      ? `<a class="cx-ibtn sm" href="${esc(extUrl)}" target="_blank" rel="noopener noreferrer" title="Open">${cxIcon('download', 14)}</a>`
+      : proxied ? `<button type="button" class="cx-ibtn sm" data-dl-id="${m.id}" data-dl-name="${esc(name)}" title="Download">${cxIcon('download', 14)}</button>` : '';
+    return `<div class="cx-mdoc">${cxIcon('doc', 22)}<span class="cx-mdoc-name">${esc(name)}</span>${action}</div>`;
+  }
+  if (mtype === 'location') return `<div class="msg-media-doc">${cxIcon('location', 16)}<span>${esc(m.body || 'Location')}</span></div>`;
+  if (mtype === 'contact' || mtype === 'vcard') return `<div class="msg-media-doc">${cxIcon('user', 16)}<span>${esc(m.body || 'Contact')}</span></div>`;
+  return '';
+}
+
 function renderNoteBubble(n) {
-  const content = esc(n.content || '').replace(/@([\w.]+)/g, '<strong style="color:#a16207">@$1</strong>');
-  return `<div class="msg me note-inline">
+  const content = esc(n.content || '').replace(/\n/g, '<br>').replace(/@([\w.]+)/g, '<strong class="cx-mention">@$1</strong>');
+  return `<div class="msg me note-inline" data-ts="${cxTsAttr(n.created_at)}">
     <div class="msg-bubble">
       <div class="note-author">📝 Private note · ${esc(n.agent_name || 'Team')}</div>
       ${content}
+      <span class="cx-btime">${fmt(n.created_at)} · team only</span>
     </div>
-    <div class="msg-info">${fmt(n.created_at)} · team only</div>
   </div>`;
+}
+
+// ── Org config hooks (Settings → Config; implemented in settings-org.js) ── //
+// Which side a bubble renders on ("Display Active Phone Messages On The Right")
+function orgMsgOnRight(m) {
+  return typeof window.soMsgOnRight === 'function' ? window.soMsgOnRight(m) : !!m.from_me;
+}
+// Extra bubble content: translation / "Translate" action, "View message" on deleted messages
+function orgMsgExtras(m) {
+  return typeof window.soMsgExtras === 'function' ? window.soMsgExtras(m) : '';
 }
 
 function renderMessage(m, isGroup) {
   if (m.body?.startsWith('[NOTE]') || m.message_type === 'note') {
     const content = m.body?.replace('[NOTE] ', '') || m.body;
-    return `<div class="note-msg">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+    return `<div class="note-msg" data-ts="${cxTsAttr(m.timestamp)}">
+      ${cxIcon('edit', 14)}
       <span><strong>Note:</strong> ${esc(content)}</span>
     </div>`;
   }
-  const cls = m.from_me ? 'me' : 'them';
-  let senderDisplay = '';
-  if (!m.from_me && (isGroup || m.sender_name)) {
-    senderDisplay = (m.sender_name || '').trim();
-    if (!senderDisplay && m.sender_number) {
-      // never show raw @lid ids as sender
-      senderDisplay = /^\d{6,}$/.test(m.sender_number) ? `+${m.sender_number}` : '';
-    }
-  }
-
-  let bubbleContent = '';
+  const me = !!m.from_me;
   const mtype = (m.message_type || 'text').toLowerCase();
 
-  if (mtype === 'image' || mtype === 'photo') {
-    bubbleContent = `<div class="msg-media-img">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-      <span>Photo</span>
-    </div>${m.body ? `<div style="font-size:12px;margin-top:.3rem">${esc(m.body)}</div>` : ''}`;
-  } else if (mtype === 'video') {
-    bubbleContent = `<div class="msg-media-img">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-      <span>Video</span>
-    </div>${m.body ? `<div style="font-size:12px;margin-top:.3rem">${esc(m.body)}</div>` : ''}`;
-  } else if (mtype === 'audio' || mtype === 'voice' || mtype === 'ptt') {
-    bubbleContent = `<div class="msg-media-audio">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
-      <div class="msg-audio-bars">${Array(5).fill(0).map(()=>`<span style="height:${8+Math.random()*12|0}px"></span>`).join('')}</div>
-      <span style="font-size:11px;color:inherit;opacity:.7">${mtype === 'ptt' ? 'Voice' : 'Audio'}</span>
-    </div>`;
-  } else if (mtype === 'document' || mtype === 'pdf') {
-    bubbleContent = `<div class="msg-media-doc">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-      <span>${esc(m.body || 'Document')}</span>
-    </div>`;
-  } else if (mtype === 'sticker') {
-    bubbleContent = `<span style="font-size:28px">🖼️</span>`;
-  } else if (mtype === 'location') {
-    bubbleContent = `<div class="msg-media-doc">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-      <span>${esc(m.body || 'Location')}</span>
-    </div>`;
-  } else if (mtype === 'contact' || mtype === 'vcard') {
-    bubbleContent = `<div class="msg-media-doc">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-      <span>${esc(m.body || 'Contact')}</span>
-    </div>`;
-  } else {
-    // Covers text, chat, gif, and any unknown types from WAHA
-    if (m.body) {
-      bubbleContent = esc(m.body).replace(/\n/g, '<br>');
-    } else if (m.has_media) {
-      // Media message where type string wasn't specifically matched above
-      const _fallbackLabel = {
-        gif: '🎞 GIF', image: '📷 Photo', photo: '📷 Photo',
-        video: '🎬 Video', audio: '🎤 Voice', ptt: '🎤 Voice',
-        document: '📄 Document', sticker: '🖼 Sticker',
-      }[mtype] || '📎 Media';
-      bubbleContent = `<div class="msg-media-doc">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-        <span>${_fallbackLabel}</span>
-      </div>`;
-    } else {
-      // Completely empty (deleted or system message) — show a dash so bubble is visible
-      bubbleContent = `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
+  // Incoming group messages: coloured sender name + their number on the right
+  let head = '';
+  if (!me && isGroup) {
+    const name = (m.sender_name || '').trim();
+    const num = /^\d{6,}$/.test(m.sender_number || '') ? cxFmtPhone(m.sender_number) : '';
+    const shown = name || num;
+    if (shown) {
+      head = `<div class="cx-bhead"><span class="cx-bname" style="color:${avatarColor(shown)}">${esc(shown)}</span>${name && num ? `<span class="cx-bnum">${esc(num)}</span>` : ''}</div>`;
     }
   }
 
-  // Skip rendering if somehow bubbleContent is still blank (defensive)
-  if (!bubbleContent) bubbleContent = `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
+  const media = cxMediaBlock(m, mtype);
+  let text = '';
+  const body = m.body || '';
+  const isAutoLabel = CX_MEDIA_LABEL_RE.test(body) || (mtype !== 'text' && mtype !== 'chat' && body === m.media_filename);
+  if (body && !(media && isAutoLabel) && !['location', 'contact', 'vcard'].includes(mtype)) text = cxTextBlock(body);
+  if (!media && !text) {
+    text = m.has_media
+      ? `<div class="msg-media-doc">${cxIcon('clip', 16)}<span>Media</span></div>`
+      : `<span style="opacity:.45;font-size:11px;font-style:italic">—</span>`;
+  }
 
-  return `<div class="msg ${cls}" data-mid="${m.id || ''}">
-    ${senderDisplay ? `<div class="msg-sender">${esc(senderDisplay)}</div>` : ''}
-    <div class="msg-bubble ${m.is_flagged ? 'flagged-msg' : ''}">
+  const byAgent = me && (m.sent_by_agent_id || m.sender_name === 'AI Agent') && m.sender_name ? `${esc(m.sender_name)} · ` : '';
+  const ticks = me ? (m.is_read ? '<span class="cx-ticks read">✓✓</span>' : '<span class="cx-ticks">✓</span>') : '';
+  return `<div class="msg ${orgMsgOnRight(m) ? 'me' : 'them'}" data-mid="${m.id || ''}" data-ts="${cxTsAttr(m.timestamp)}">
+    <div class="msg-bubble ${m.is_flagged ? 'flagged-msg' : ''}${media ? ' has-media' : ''}">
       ${m.is_flagged ? '<div class="msg-flag-badge">🚩 AI Flagged</div>' : ''}
-      ${bubbleContent}
+      ${head}${media}${text}${orgMsgExtras(m)}
+      <span class="cx-btime">${byAgent}${fmt(m.timestamp)} ${ticks}</span>
     </div>
-    <div class="msg-info">${fmt(m.timestamp)} ${m.from_me ? (m.is_read ? '<span style="color:#53bdeb">✓✓</span>' : '✓') : ''}</div>
   </div>`;
+}
+
+// ── MEDIA VIEW ─────────────────────────────────────────────────── //
+function cxMediaTile(m, opts = {}) {
+  const t = (m.message_type || '').toLowerCase();
+  const kind = ['image', 'photo', 'sticker', 'gif'].includes(t) ? 'image'
+    : t === 'video' ? 'video' : ['audio', 'ptt', 'voice'].includes(t) ? 'audio' : 'doc';
+  const extUrl = m.media_source === 'external' && /^https:\/\//i.test(m.media_url || '') ? m.media_url : '';
+  const proxied = m.media_source === 'proxy';
+  const name = m.media_filename || (m.body && !CX_MEDIA_LABEL_RE.test(m.body) ? m.body.split('\n')[0] : '');
+  let visual;
+  if (kind === 'image') {
+    visual = extUrl ? `<div class="cx-tile-media ready"><img src="${esc(extUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"></div>`
+      : `<div class="cx-tile-media" ${proxied ? `data-media-id="${m.id}" data-kind="image"` : ''}>${cxIcon('image', 26)}</div>`;
+  } else if (kind === 'video') {
+    visual = `<div class="cx-tile-media" ${proxied ? `data-media-id="${m.id}" data-kind="video"` : ''}>${cxIcon('video', 26)}</div>`;
+  } else if (kind === 'audio') {
+    visual = `<div class="cx-tile-media is-audio">${cxIcon('mic', 24)}<div class="cx-tile-audio" ${proxied ? `data-media-id="${m.id}" data-kind="audio"` : ''}><span>${t === 'ptt' || t === 'voice' ? 'Voice message' : 'Audio'}</span></div></div>`;
+  } else {
+    const dl = extUrl
+      ? `<a class="cx-ibtn sm" href="${esc(extUrl)}" target="_blank" rel="noopener noreferrer" title="Open">${cxIcon('download', 14)}</a>`
+      : proxied ? `<button type="button" class="cx-ibtn sm" data-dl-id="${m.id}" data-dl-name="${esc(name || 'document')}" title="Download">${cxIcon('download', 14)}</button>` : '';
+    visual = `<div class="cx-tile-media is-doc">${cxIcon('doc', 28)}<span class="cx-tile-docname">${esc(name || 'Document')}</span>${dl}</div>`;
+  }
+  const chatName = displayName({ name: m.chat_name, chat_wid: m.chat_wid });
+  return `<div class="cx-tile k-${kind}" data-cid="${m.chat_id}" data-mid="${m.id}" title="${esc(name || chatName)}">
+    ${visual}
+    ${opts.compact ? '' : `<div class="cx-tile-meta"><span class="cx-tile-chat">${m.chat_is_group ? cxIcon('users', 11) : ''}${esc(chatName || 'Chat')}</span><span class="cx-tile-date">${esc(cxFmtListDate(m.timestamp))}</span></div>`}
+  </div>`;
+}
+
+const _cxMP = { type: '', phone: '', search: '', before: null, done: false, loading: false, seq: 0 };
+async function renderMedia() {
+  const main = document.getElementById('main-content');
+  const types = [['', 'All'], ['image', 'Images'], ['video', 'Videos'], ['document', 'Docs'], ['audio', 'Audio']];
+  if (!State.phones.length) { try { State.phones = await Api.phones.list(); } catch (_) {} }
+  if (State.currentView !== 'media') return;
+  main.innerHTML = `
+    <div class="cx-media-page" id="cx-media-page">
+      <div class="cx-mp-head">
+        <div>
+          <h2>Media</h2>
+          <p>Photos, videos, documents and voice notes from every chat you can access</p>
+        </div>
+        <div class="cx-mp-filters">
+          <div class="cx-seg" id="cx-mp-type">${types.map(([v, l]) => `<button class="cx-seg-btn${_cxMP.type === v ? ' on' : ''}" data-type="${v}">${l}</button>`).join('')}</div>
+          <select id="cx-mp-phone" class="cx-select">
+            <option value="">All phones</option>
+            ${State.phones.map(p => `<option value="${p.id}" ${_cxMP.phone == p.id ? 'selected' : ''}>${esc(cxPhoneLabel(p))}</option>`).join('')}
+          </select>
+          <div class="cx-mp-search">${cxIcon('search', 14)}<input type="search" id="cx-mp-search" placeholder="Search by chat…" value="${esc(_cxMP.search)}"></div>
+        </div>
+      </div>
+      <div class="cx-mp-grid" id="cx-mp-grid"></div>
+      <div class="cx-mp-foot" id="cx-mp-foot"></div>
+    </div>`;
+
+  document.querySelectorAll('#cx-mp-type .cx-seg-btn').forEach(b => b.addEventListener('click', () => {
+    _cxMP.type = b.dataset.type;
+    document.querySelectorAll('#cx-mp-type .cx-seg-btn').forEach(x => x.classList.toggle('on', x === b));
+    cxLoadMedia(true);
+  }));
+  document.getElementById('cx-mp-phone').addEventListener('change', e => { _cxMP.phone = e.target.value; cxLoadMedia(true); });
+  document.getElementById('cx-mp-search').addEventListener('input', debounce(e => { _cxMP.search = e.target.value.trim(); cxLoadMedia(true); }, 300));
+  document.getElementById('cx-mp-grid').addEventListener('click', e => {
+    if (e.target.closest('audio,video,[data-dl-id],a')) return;
+    const tile = e.target.closest('.cx-tile');
+    if (tile) cxOpenChatAt(+tile.dataset.cid, +tile.dataset.mid);
+  });
+  await cxLoadMedia(true);
+}
+
+async function cxLoadMedia(reset) {
+  const grid = document.getElementById('cx-mp-grid');
+  const foot = document.getElementById('cx-mp-foot');
+  if (!grid) return;
+  if (reset) {
+    _cxMP.seq++; _cxMP.before = null; _cxMP.done = false; _cxMP.loading = false;
+    grid.innerHTML = '';
+    foot.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  }
+  if (_cxMP.loading || _cxMP.done) return;
+  _cxMP.loading = true;
+  const seq = _cxMP.seq;
+  const q = { limit: 60 };
+  if (_cxMP.type) q.type = _cxMP.type;
+  if (_cxMP.phone) q.phone_id = _cxMP.phone;
+  if (_cxMP.search) q.search = _cxMP.search;
+  if (_cxMP.before) q.before = _cxMP.before;
+  try {
+    const res = await Api.media.list(q);
+    if (seq !== _cxMP.seq || !grid.isConnected) return;
+    const items = res.items || [];
+    grid.insertAdjacentHTML('beforeend', items.map(m => cxMediaTile(m)).join(''));
+    cxObserveMedia(grid);
+    _cxMP.before = res.next_before;
+    _cxMP.done = !res.next_before;
+    if (!grid.children.length) {
+      foot.innerHTML = `<div class="empty-state">${cxIcon('image', 40)}<p>No media found${_cxMP.search || _cxMP.type || _cxMP.phone ? ' for these filters' : ' yet'}</p></div>`;
+    } else if (_cxMP.done) {
+      foot.innerHTML = '<div class="cx-mp-end">— end —</div>';
+    } else {
+      foot.innerHTML = '<div class="cx-mp-sentinel" id="cx-mp-sentinel"><div class="spinner" style="width:16px;height:16px"></div></div>';
+      const sentinel = document.getElementById('cx-mp-sentinel');
+      const obs = new IntersectionObserver(entries => {
+        if (!entries[0].isIntersecting) return;
+        obs.disconnect();
+        cxLoadMedia(false);
+      }, { root: document.getElementById('cx-media-page'), rootMargin: '400px' });
+      obs.observe(sentinel);
+    }
+  } catch (e) {
+    if (seq !== _cxMP.seq) return;
+    foot.innerHTML = `<div class="loading-center text-muted" style="flex-direction:column;gap:.5rem"><span>${esc(e.message || 'Could not load media')}</span><button class="btn btn-secondary btn-sm" id="cx-mp-retry">Retry</button></div>`;
+    document.getElementById('cx-mp-retry')?.addEventListener('click', () => cxLoadMedia(!grid.children.length));
+  } finally {
+    if (seq === _cxMP.seq) _cxMP.loading = false;
+  }
 }
 
 // ── Right-click a message → Create Ticket / Create Task ──────────
@@ -1887,7 +3969,7 @@ async function showTicketModal(opts) {
   const labelOpts = State.labels.map(l =>
     `<label style="display:flex;align-items:center;gap:.35rem;font-size:12.5px;font-weight:400;padding:.12rem 0">
       <input type="checkbox" class="tk-label" value="${l.id}">
-      <span class="lp-dot" style="width:9px;height:9px;border-radius:3px;background:${l.color};display:inline-block"></span>${esc(l.name)}
+      <span class="lp-dot" style="width:9px;height:9px;border-radius:3px;background:${safeColor(l.color)};display:inline-block"></span>${esc(l.name)}
     </label>`).join('');
 
   const propFields = defs.map(d => {
@@ -1957,13 +4039,13 @@ async function showTicketModal(opts) {
     try {
       const ticket = await Api.tickets.create({
         chat_id: chatId,
-        message_id: message?.id || null,
+        message_wid: message?.message_wid || null,
         title,
         description: document.getElementById('tkm-desc').value,
         status: document.getElementById('tkm-status').value,
         priority: document.getElementById('tkm-priority').value,
         assigned_to: parseInt(document.getElementById('tkm-assignee').value) || null,
-        due_date: dueInp.value || null,
+        due_date: localInputToIso(dueInp.value),
       });
       const labelIds = [...document.querySelectorAll('.tk-label:checked')].map(c => +c.value);
       for (const lid of labelIds) await Api.tickets.addLabel(ticket.id, lid).catch(() => {});
@@ -1982,7 +4064,7 @@ async function showTicketModal(opts) {
 
 // ── Full task modal (also used from message right-click) ─────────
 async function showTaskModal(opts) {
-  const { chatId, message } = opts || {};
+  const { chatId, message, onSaved } = opts || {};
   let agents = [];
   try { agents = await Api.auth.agents(); } catch(_) {}
   showModal('Create Task', `
@@ -2012,14 +4094,15 @@ async function showTaskModal(opts) {
       await Api.tasks.create({
         title,
         chat_id: chatId || null,
-        message_id: message?.id || null,
-        due_date: document.getElementById('tkt-due').value || null,
-        reminder_at: document.getElementById('tkt-reminder').value || null,
+        message_wid: message?.message_wid || null,
+        due_date: localInputToIso(document.getElementById('tkt-due').value),
+        reminder_at: localInputToIso(document.getElementById('tkt-reminder').value),
         assigned_to: parseInt(document.getElementById('tkt-assignee').value) || null,
         priority: document.getElementById('tkt-prio').value,
         notes: document.getElementById('tkt-notes').value.trim() || null,
       });
       closeModal(); toast('Task created', 'success');
+      if (typeof onSaved === 'function') onSaved();
     } catch(e) { toast(e.message, 'error'); }
   });
 }
@@ -2031,8 +4114,13 @@ function appendMessage(m) {
   // Keep state in sync so right-click context-menu actions work on real-time messages
   if (!State.inbox.messages) State.inbox.messages = [];
   State.inbox.messages.push(m);
+  const nearBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 160;
+  area.querySelector('.cx-empty-thread')?.remove();
   area.insertAdjacentHTML('beforeend', renderMessage(m, chat?.is_group || false));
-  area.scrollTop = area.scrollHeight;
+  cxRedoDayChips(area);
+  cxObserveMedia(area);
+  document.getElementById('thread-panel')?._cxRunSearch?.();
+  if (nearBottom || m.from_me) area.scrollTop = area.scrollHeight;
 }
 
 // ── TICKETS VIEW ────────────────────────────────────────────────── //
@@ -2043,7 +4131,7 @@ async function renderTickets() {
       <div class="section-header">
         <h2>Tickets</h2>
         <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem;align-items:center">
-          <select id="ticket-filter" style="font-size:12.5px;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:#ffffff;color:var(--text-2);font-weight:500;outline:none;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.05);transition:border-color 0.15s, box-shadow 0.15s;">
+          <select id="ticket-filter" style="font-size:12.5px;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text-2);font-weight:500;outline:none;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,0.05);transition:border-color 0.15s, box-shadow 0.15s;">
             <option value="">All statuses</option>
             <option value="open">Open</option>
             <option value="in_progress">In Progress</option>
@@ -2063,30 +4151,50 @@ async function renderTickets() {
               <tbody id="tickets-tbody"><tr><td colspan="8" style="text-align:center;padding:2rem"><div class="spinner"></div></td></tr></tbody>
             </table>
           </div>
+          <div id="tickets-more-wrap" style="display:none;text-align:center;padding:.75rem 1rem">
+            <button class="btn btn-secondary btn-sm" id="tickets-more-btn">Load more</button>
+          </div>
         </div>
       </div>
     </div>`;
 
+  State.tickets.filter = '';
   await loadTickets();
 
   document.getElementById('ticket-filter').addEventListener('change', e => {
     loadTickets(e.target.value);
   });
+  document.getElementById('tickets-more-btn').addEventListener('click', () => loadTickets(undefined, true));
 
   document.getElementById('new-ticket-btn').addEventListener('click', () => showCreateTicketModal());
 }
 
-async function loadTickets(status = '') {
+const TICKET_PAGE = 50;
+let _ticketsSeq = 0;
+
+// loadTickets(status?, append?) — status undefined keeps the current filter;
+// append=true fetches the next page (limit/offset) and adds it to the table
+async function loadTickets(status, append = false) {
+  if (status !== undefined) State.tickets.filter = status;
+  const filter = State.tickets.filter && State.tickets.filter !== 'all' ? State.tickets.filter : '';
+  const seq = ++_ticketsSeq;
+  const moreBtn = document.getElementById('tickets-more-btn');
+  if (moreBtn) { moreBtn.disabled = true; moreBtn.textContent = 'Loading…'; }
   try {
-    const q = {};
-    if (status) q.status = status;
-    const [list, agents] = await Promise.all([
+    const q = { limit: TICKET_PAGE, offset: append ? State.tickets.list.length : 0 };
+    if (filter) q.status = filter;
+    const [page, agents] = await Promise.all([
       Api.tickets.list(q),
       Api.auth.agents().catch(() => []),
     ]);
+    if (seq !== _ticketsSeq) return;   // superseded by a newer load
     const agentMap = {};
     agents.forEach(a => { agentMap[a.id] = a.name; });
+    const list = append ? State.tickets.list.concat(page) : page;
     State.tickets.list = list;
+    const moreWrap = document.getElementById('tickets-more-wrap');
+    if (moreWrap) moreWrap.style.display = page.length === TICKET_PAGE ? 'block' : 'none';
+    if (moreBtn) { moreBtn.disabled = false; moreBtn.textContent = 'Load more'; }
     const tbody = document.getElementById('tickets-tbody');
     if (!tbody) return;
     if (!list.length) {
@@ -2096,10 +4204,10 @@ async function loadTickets(status = '') {
       <tr>
         <td style="color:var(--text-3);font-size:12px">#${t.id}</td>
         <td><a href="#" class="ticket-link text-accent" data-tid="${t.id}" style="font-weight:600">${esc(t.title)}</a></td>
-        <td><span class="${pillClass(t.status)}">${t.status?.replace('_',' ')}</span></td>
-        <td><span class="${pillClass(t.priority)}">${t.priority}</span></td>
+        <td><span class="${pillClass(t.status)}">${esc(t.status?.replace('_',' '))}</span></td>
+        <td><span class="${pillClass(t.priority)}">${esc(t.priority)}</span></td>
         <td style="font-size:12px;color:var(--text-3)">${t.assigned_to ? esc(agentMap[t.assigned_to] || 'Agent #'+t.assigned_to) : '—'}</td>
-        <td style="font-size:12px;color:var(--text-3)">${t.due_date ? new Date(t.due_date).toLocaleDateString() : '—'}</td>
+        <td style="font-size:12px;color:var(--text-3)">${t.due_date ? parseServerDate(t.due_date).toLocaleDateString() : '—'}</td>
         <td>${t.sla_breached ? '<span class="pill" style="background:#FEF2F2;color:#DC2626">Breached</span>' : '<span class="pill" style="background:var(--success-bg);color:var(--success)">OK</span>'}</td>
         <td style="text-align:right">
           <button class="btn btn-ghost btn-sm ticket-edit" data-tid="${t.id}">Edit</button>
@@ -2117,7 +4225,13 @@ async function loadTickets(status = '') {
         catch(e) { toast(e.message, 'error'); }
       });
     });
-  } catch(e) { toast('Failed to load tickets', 'error'); }
+  } catch(e) {
+    if (seq !== _ticketsSeq) return;
+    if (moreBtn) { moreBtn.disabled = false; moreBtn.textContent = 'Load more'; }
+    const tbody = document.getElementById('tickets-tbody');
+    if (tbody && !append) tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:2rem;color:var(--text-3)">Could not load tickets</td></tr>`;
+    toast(e.message || 'Failed to load tickets', 'error');
+  }
 }
 
 async function showCreateTicketModal() {
@@ -2235,183 +4349,1537 @@ async function showEditTicketModal(ticket) {
 }
 
 // ── CONTACTS VIEW ───────────────────────────────────────────────── //
+// Server-paged table (50/page, infinite scroll) with filters, bulk actions
+// and a details drawer. Styles: css/contacts.css (ct-*).
+const CT_PAGE = 50;
+const CT = {
+  items: [], total: 0, offset: 0, loading: false, done: false, seq: 0,
+  search: '', filters: { labels: [], type: '', hasPhone: '', phoneId: '' },
+  selected: new Set(), io: null, picIO: null, picQueue: [], picBusy: 0,
+};
+
+const CT_ICON = {
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+  filter: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="17" x2="14" y2="17"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  updown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="7 9 12 4 17 9"/><polyline points="7 15 12 20 17 15"/></svg>',
+  person: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="8.5" r="4"/><path d="M4 20.5c0-4.1 3.6-7 8-7s8 2.9 8 7z"/></svg>',
+  grid: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2"/></svg>',
+  lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>',
+  sync: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
+  download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M9 6V4h6v2"/></svg>',
+  tag: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>',
+  chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+};
+
+// "919726256851" → "+91 97262 56851"; masked / missing numbers never render digits
+function ctFormatPhone(num) {
+  if (!num) return '';
+  const d = String(num).replace(/\D/g, '');
+  if (!d) return '';
+  if (d.length === 12 && d.startsWith('91')) return `+91 ${d.slice(2, 7)} ${d.slice(7)}`;
+  if (d.length === 11 && d.startsWith('1')) return `+1 ${d.slice(1, 4)} ${d.slice(4, 7)} ${d.slice(7)}`;
+  if (d.length === 12 && d.startsWith('44')) return `+44 ${d.slice(2, 6)} ${d.slice(6)}`;
+  if (d.length === 11 && d.startsWith('971')) return `+971 ${d.slice(3, 5)} ${d.slice(5, 8)} ${d.slice(8)}`;
+  return '+' + d.replace(/(\d{3})(?=\d{4,})/g, '$1 ');
+}
+function ctIsMasked(c) { return c.phone_number === '***masked***'; }
+function ctDisplayName(c) {
+  return (c.name || '').trim() || (c.pushname || '').trim()
+    || (c.phone_number && !ctIsMasked(c) ? ctFormatPhone(c.phone_number) : '') || 'WhatsApp user';
+}
+
+function ctAvatarHTML(c, size = '') {
+  const url = c.picture_url;
+  return `<span class="ct-avatar ${size}" data-pic="${c.id}">${url
+    ? `<img src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">`
+    : ''}${CT_ICON.person}</span>`;
+}
+
+function ctPhoneHTML(c) {
+  if (ctIsMasked(c)) return `<span class="ct-masked" title="Number hidden by an admin">${CT_ICON.lock}Masked</span>`;
+  if (!c.phone_number) return '<span class="ct-dash">—</span>';
+  return `<span class="ct-phone">${esc(ctFormatPhone(c.phone_number))}</span>`;
+}
+
+function ctLabelsHTML(c, all = false) {
+  const labels = (c.labels || []).map(id => State.labels.find(l => l.id === id)).filter(Boolean);
+  const shown = all ? labels : labels.slice(0, 2);
+  const more = labels.length - shown.length;
+  const chips = shown.map(l =>
+    `<span class="ct-chip" style="--chip:${safeColor(l.color)}" title="${esc(l.name)}"><span class="ct-chip-dot"></span><span class="ct-chip-txt">${esc(l.name)}</span></span>`).join('');
+  const moreHTML = more > 0 ? `<span class="ct-more" title="${esc(labels.slice(2).map(l => l.name).join(', '))}">+${more}</span>` : '';
+  return `<div class="ct-labels">${chips}${moreHTML}<button type="button" class="ct-add-label" data-label="${c.id}"${chips ? ' title="Edit labels"' : ''}>${chips ? CT_ICON.plus : `${CT_ICON.plus}Label`}</button></div>`;
+}
+
+function ctTypeHTML(c) {
+  return c.is_internal
+    ? `<span class="ct-type ct-internal">${CT_ICON.grid}Internal</span>`
+    : `<span class="ct-type ct-external">${CT_ICON.grid}External</span>`;
+}
+
+function ctRowHTML(c) {
+  const sel = CT.selected.has(c.id);
+  return `<tr class="ct-row${sel ? ' is-selected' : ''}" data-cid="${c.id}">
+    <td class="ct-cb"><input type="checkbox" class="ct-check" data-cid="${c.id}" ${sel ? 'checked' : ''} aria-label="Select ${esc(ctDisplayName(c))}"></td>
+    <td><div class="ct-name-cell">${ctAvatarHTML(c)}<span class="ct-name" title="${esc(ctDisplayName(c))}">${esc(ctDisplayName(c))}</span></div></td>
+    <td>${ctPhoneHTML(c)}</td>
+    <td>${c.username ? esc(c.username) : '<span class="ct-dash">—</span>'}</td>
+    <td>${ctLabelsHTML(c)}</td>
+    <td>${c.pushname ? `<span class="ct-push" title="${esc(c.pushname)}">~ ${esc(c.pushname)}</span>` : '<span class="ct-dash">—</span>'}</td>
+    <td>${ctTypeHTML(c)}</td>
+  </tr>`;
+}
+
+function ctActiveFilterCount() {
+  const f = CT.filters;
+  return f.labels.length + (f.type ? 1 : 0) + (f.hasPhone ? 1 : 0) + (f.phoneId ? 1 : 0);
+}
+
+function ctQuery() {
+  const q = { limit: CT_PAGE, offset: CT.offset };
+  const f = CT.filters;
+  if (CT.search) q.search = CT.search;
+  if (f.labels.length) q.label_ids = f.labels.join(',');
+  if (f.type) q.type = f.type;
+  if (f.hasPhone) q.has_phone = f.hasPhone === 'yes';
+  if (f.phoneId) q.phone_id = f.phoneId;
+  return q;
+}
+
 async function renderContacts() {
   const main = document.getElementById('main-content');
+  CT.selected.clear();
+  const admin = isAdmin();
   main.innerHTML = `
-    <div class="flex-col h-full">
-      <div class="section-header">
-        <h2>Contacts</h2>
-        <div class="header-actions" style="margin-left:auto;display:flex;gap:.5rem;align-items:center">
-          <div class="search-bar"><input type="search" id="contact-search" placeholder="Search…" style="width:200px"></div>
-          <button class="btn btn-primary btn-sm" id="new-contact-btn">+ New Contact</button>
+    <div class="ct-page">
+      <div class="ct-toolbar">
+        <label class="ct-search">${CT_ICON.search}
+          <input type="search" id="ct-search" placeholder="Search contacts..." value="${esc(CT.search)}" autocomplete="off">
+        </label>
+        <button type="button" class="ct-btn" id="ct-filter-btn" aria-haspopup="dialog">${CT_ICON.filter}<span>Filter</span><span class="ct-badge" id="ct-filter-count" hidden></span></button>
+        <span class="ct-count" id="ct-count"></span>
+        <div class="ct-toolbar-right">
+          <button type="button" class="ct-btn" id="ct-add-btn">${CT_ICON.plus}<span>Add contact</span></button>
+          <button type="button" class="ct-btn" id="ct-actions-btn" aria-haspopup="menu">Actions${CT_ICON.updown}</button>
         </div>
       </div>
-      <div class="list-container" id="contacts-list">
-        <div class="loading-center"><div class="spinner"></div></div>
+      <div class="ct-scroll" id="ct-scroll">
+        <table class="ct-table">
+          <thead><tr>
+            <th class="ct-cb"><input type="checkbox" id="ct-all" aria-label="Select all loaded contacts"></th>
+            <th>Contact Name</th><th>Phone</th><th>Username</th><th>Labels</th><th>WhatsApp Pushname</th><th>Internal / External</th>
+          </tr></thead>
+          <tbody id="ct-body"></tbody>
+        </table>
+        <div class="ct-foot" id="ct-foot"></div>
       </div>
     </div>`;
 
-  await loadContacts();
-  document.getElementById('contact-search').addEventListener('input', e => {
-    State.contacts.search = e.target.value;
-    debounce(loadContacts, 300)();
+  const search = document.getElementById('ct-search');
+  const onSearch = debounce(() => { CT.search = search.value.trim(); ctReload(); }, 300);
+  search.addEventListener('input', onSearch);
+  document.getElementById('ct-filter-btn').addEventListener('click', e => { e.stopPropagation(); ctOpenFilter(e.currentTarget); });
+  document.getElementById('ct-actions-btn').addEventListener('click', e => { e.stopPropagation(); ctOpenActions(e.currentTarget, admin); });
+  document.getElementById('ct-add-btn').addEventListener('click', () => showContactModal());
+  document.getElementById('ct-all').addEventListener('change', e => {
+    CT.items.forEach(c => e.target.checked ? CT.selected.add(c.id) : CT.selected.delete(c.id));
+    document.querySelectorAll('#ct-body .ct-row').forEach(tr => {
+      tr.classList.toggle('is-selected', e.target.checked);
+      tr.querySelector('.ct-check').checked = e.target.checked;
+    });
+    ctUpdateSelection();
   });
-  document.getElementById('new-contact-btn').addEventListener('click', () => showContactModal());
+
+  const body = document.getElementById('ct-body');
+  body.addEventListener('click', e => {
+    const cb = e.target.closest('.ct-check');
+    if (cb) {
+      const id = +cb.dataset.cid;
+      cb.checked ? CT.selected.add(id) : CT.selected.delete(id);
+      cb.closest('tr').classList.toggle('is-selected', cb.checked);
+      ctUpdateSelection();
+      return;
+    }
+    if (e.target.closest('.ct-cb')) return;
+    const lb = e.target.closest('.ct-add-label');
+    if (lb) { e.stopPropagation(); ctPickLabels(lb, CT.items.find(c => c.id === +lb.dataset.label)); return; }
+    const tr = e.target.closest('.ct-row');
+    if (tr) openContactDrawer(+tr.dataset.cid);
+  });
+
+  if (!State.labels.length) await loadLabels();
+  ctUpdateFilterBadge();
+  await ctReload();
+}
+
+function ctUpdateFilterBadge() {
+  const n = ctActiveFilterCount();
+  const b = document.getElementById('ct-filter-count');
+  if (!b) return;
+  b.hidden = !n; b.textContent = n;
+  document.getElementById('ct-filter-btn')?.classList.toggle('is-active', !!n);
+}
+
+function ctUpdateSelection() {
+  const all = document.getElementById('ct-all');
+  if (all) {
+    const loaded = CT.items.filter(c => CT.selected.has(c.id)).length;
+    all.checked = !!CT.items.length && loaded === CT.items.length;
+    all.indeterminate = loaded > 0 && loaded < CT.items.length;
+  }
+  ctUpdateCount();
+}
+
+function ctUpdateCount() {
+  const el = document.getElementById('ct-count');
+  if (!el) return;
+  const n = CT.total.toLocaleString('en-IN');
+  el.textContent = CT.selected.size ? `${CT.selected.size} of ${n} selected` : `${n} contact${CT.total === 1 ? '' : 's'}`;
+}
+
+async function ctReload() {
+  CT.items = []; CT.offset = 0; CT.done = false; CT.loading = false;
+  CT.selected.clear();
+  const body = document.getElementById('ct-body');
+  if (body) body.innerHTML = '';
+  const scroll = document.getElementById('ct-scroll');
+  if (scroll) scroll.scrollTop = 0;
+  await ctLoadMore();
+}
+
+async function ctLoadMore() {
+  if (CT.loading || CT.done) return;
+  CT.loading = true;
+  const seq = ++CT.seq;
+  const foot = document.getElementById('ct-foot');
+  if (foot) foot.innerHTML = '<div class="ct-loading"><div class="spinner"></div></div>';
+  try {
+    const res = await Api.contacts.list(ctQuery());
+    if (seq !== CT.seq || State.currentView !== 'contacts') return;
+    const body = document.getElementById('ct-body');
+    if (!body) return;
+    CT.total = res.total;
+    CT.items.push(...res.items);
+    CT.offset += res.items.length;
+    CT.done = res.items.length < CT_PAGE || CT.offset >= res.total;
+    body.insertAdjacentHTML('beforeend', res.items.map(ctRowHTML).join(''));
+    ctObservePictures(body);
+    ctUpdateSelection();
+    ctRenderFoot();
+  } catch (e) {
+    if (seq !== CT.seq) return;
+    if (foot) foot.innerHTML = `<div class="ct-empty">Could not load contacts. <button type="button" class="ct-link" id="ct-retry">Retry</button></div>`;
+    document.getElementById('ct-retry')?.addEventListener('click', () => ctLoadMore());
+    toast(e.message || 'Failed to load contacts', 'error');
+  } finally {
+    if (seq === CT.seq) CT.loading = false;
+  }
+}
+
+function ctRenderFoot() {
+  const foot = document.getElementById('ct-foot');
+  if (!foot) return;
+  if (!CT.items.length) {
+    const filtered = CT.search || ctActiveFilterCount();
+    foot.innerHTML = `<div class="ct-empty">
+      <span class="ct-empty-ic">${CT_ICON.person}</span>
+      <strong>${filtered ? 'No contacts match' : 'No contacts yet'}</strong>
+      <span>${filtered ? 'Try a different search or clear the filters.'
+        : (isAdmin() ? 'Import them from your connected WhatsApp numbers.' : 'Ask an admin to sync contacts from WhatsApp.')}</span>
+      ${!filtered && isAdmin() ? `<button type="button" class="ct-btn ct-btn-primary" id="ct-empty-sync">${CT_ICON.sync}Sync from WhatsApp</button>` : ''}
+    </div>`;
+    document.getElementById('ct-empty-sync')?.addEventListener('click', ctSync);
+    return;
+  }
+  if (CT.done) { foot.innerHTML = ''; return; }
+  foot.innerHTML = '<div class="ct-sentinel" id="ct-sentinel"></div>';
+  if (CT.io) CT.io.disconnect();
+  CT.io = new IntersectionObserver(entries => {
+    if (entries.some(en => en.isIntersecting)) ctLoadMore();
+  }, { root: document.getElementById('ct-scroll'), rootMargin: '300px' });
+  CT.io.observe(document.getElementById('ct-sentinel'));
+}
+
+// Lazy WhatsApp profile pictures for rows scrolled into view (4 requests at a time)
+function ctObservePictures(body) {
+  if (!CT.picIO) {
+    CT.picIO = new IntersectionObserver(entries => {
+      entries.forEach(en => {
+        if (!en.isIntersecting) return;
+        CT.picIO.unobserve(en.target);
+        CT.picQueue.push(+en.target.dataset.pic);
+      });
+      ctPumpPictures();
+    }, { rootMargin: '200px' });
+  }
+  body.querySelectorAll('.ct-avatar[data-pic]:not([data-observed])').forEach(el => {
+    el.dataset.observed = '1';
+    const c = CT.items.find(x => x.id === +el.dataset.pic);
+    if (c && !c.picture_url && !ctIsMasked(c)) CT.picIO.observe(el);
+  });
+}
+
+function ctPumpPictures() {
+  while (CT.picBusy < 4 && CT.picQueue.length) {
+    const id = CT.picQueue.shift();
+    CT.picBusy++;
+    Api.contacts.picture(id).then(r => {
+      if (!r || !r.url) return;
+      const c = CT.items.find(x => x.id === id);
+      if (c) c.picture_url = r.url;
+      document.querySelectorAll(`.ct-avatar[data-pic="${id}"]`).forEach(el => {
+        if (el.querySelector('img')) return;
+        const img = document.createElement('img');
+        img.alt = ''; img.referrerPolicy = 'no-referrer'; img.src = r.url;
+        img.onerror = () => img.remove();
+        el.prepend(img);
+      });
+    }).catch(() => {}).finally(() => { CT.picBusy--; ctPumpPictures(); });
+  }
+}
+
+function ctReplaceRow(c) {
+  const i = CT.items.findIndex(x => x.id === c.id);
+  if (i >= 0) CT.items[i] = { ...CT.items[i], ...c };
+  const tr = document.querySelector(`#ct-body .ct-row[data-cid="${c.id}"]`);
+  if (tr && i >= 0) {
+    tr.outerHTML = ctRowHTML(CT.items[i]);
+    ctObservePictures(document.getElementById('ct-body'));
+  }
+}
+
+function ctPickLabels(anchor, contact, onChange) {
+  if (!contact) return;
+  openLabelPicker(anchor, {
+    applied: new Set(contact.labels || []),
+    onToggle: async (label, on) => {
+      if (on) await Api.contacts.addLabel(contact.id, label.id);
+      else await Api.contacts.removeLabel(contact.id, label.id);
+      const set = new Set(contact.labels || []);
+      on ? set.add(label.id) : set.delete(label.id);
+      contact.labels = [...set];
+      ctReplaceRow(contact);
+      if (onChange) onChange(contact);
+    },
+  });
+}
+
+// Small anchored popover (filter panel / actions menu); closes on outside click / Esc
+let _ctPop = null;
+function ctClosePopover() {
+  if (!_ctPop) return;
+  _ctPop.el.remove();
+  document.removeEventListener('click', _ctPop.outside, true);
+  document.removeEventListener('keydown', _ctPop.key);
+  _ctPop.anchor?.setAttribute('aria-expanded', 'false');
+  _ctPop = null;
+}
+function ctPopover(anchor, cls, html, align = 'left') {
+  const same = _ctPop && _ctPop.anchor === anchor;
+  ctClosePopover();
+  if (same) return null;
+  const el = document.createElement('div');
+  el.className = 'ct-pop ' + cls;
+  el.innerHTML = html;
+  document.body.appendChild(el);
+  const r = anchor.getBoundingClientRect();
+  const w = el.offsetWidth;
+  const left = align === 'right' ? r.right - w : r.left;
+  el.style.left = Math.max(8, Math.min(left, window.innerWidth - w - 8)) + 'px';
+  el.style.top = (r.bottom + 6) + 'px';
+  const outside = e => { if (!el.contains(e.target) && !anchor.contains(e.target) && !e.target.closest('.label-picker')) ctClosePopover(); };
+  const key = e => { if (e.key === 'Escape') { ctClosePopover(); anchor.focus(); } };
+  document.addEventListener('click', outside, true);
+  document.addEventListener('keydown', key);
+  anchor.setAttribute('aria-expanded', 'true');
+  _ctPop = { el, anchor, outside, key };
+  return el;
+}
+
+function ctOpenFilter(anchor) {
+  const f = CT.filters;
+  const phones = State.phones || [];
+  const labelRows = State.labels.length
+    ? State.labels.map(l => `<label class="ct-opt"><input type="checkbox" name="ctf-label" value="${l.id}" ${f.labels.includes(l.id) ? 'checked' : ''}>
+        <span class="ct-chip-dot" style="background:${safeColor(l.color)}"></span><span>${esc(l.name)}</span></label>`).join('')
+    : '<div class="ct-pop-empty">No labels yet</div>';
+  const radio = (name, val, label, cur) =>
+    `<label class="ct-seg-opt"><input type="radio" name="${name}" value="${val}" ${cur === val ? 'checked' : ''}><span>${label}</span></label>`;
+  const el = ctPopover(anchor, 'ct-filter', `
+    <div class="ct-pop-head"><strong>Filter contacts</strong><button type="button" class="ct-link" data-act="clear">Clear all</button></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Labels</div><div class="ct-pop-list">${labelRows}</div></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Internal / External</div>
+      <div class="ct-seg">${radio('ctf-type', '', 'All', f.type)}${radio('ctf-type', 'internal', 'Internal', f.type)}${radio('ctf-type', 'external', 'External', f.type)}</div></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Phone number</div>
+      <div class="ct-seg">${radio('ctf-phone', '', 'Any', f.hasPhone)}${radio('ctf-phone', 'yes', 'Has phone', f.hasPhone)}${radio('ctf-phone', 'no', 'No phone', f.hasPhone)}</div></div>
+    <div class="ct-pop-sec"><div class="ct-pop-title">Chatted with our number</div>
+      <select id="ctf-our" class="ct-select"><option value="">Any number</option>${phones.map(p =>
+        `<option value="${p.id}" ${String(f.phoneId) === String(p.id) ? 'selected' : ''}>${esc(p.name || '')} · ${esc(ctFormatPhone(p.phone_number))}</option>`).join('')}</select></div>`);
+  if (!el) return;
+  const apply = () => {
+    f.labels = [...el.querySelectorAll('input[name="ctf-label"]:checked')].map(i => +i.value);
+    f.type = el.querySelector('input[name="ctf-type"]:checked')?.value || '';
+    f.hasPhone = el.querySelector('input[name="ctf-phone"]:checked')?.value || '';
+    f.phoneId = el.querySelector('#ctf-our').value;
+    ctUpdateFilterBadge();
+    ctReload();
+  };
+  el.addEventListener('change', apply);
+  el.querySelector('[data-act="clear"]').addEventListener('click', () => {
+    el.querySelectorAll('input[type="checkbox"]').forEach(i => { i.checked = false; });
+    el.querySelectorAll('input[type="radio"][value=""]').forEach(i => { i.checked = true; });
+    el.querySelector('#ctf-our').value = '';
+    apply();
+  });
+}
+
+function ctOpenActions(anchor, admin) {
+  const n = CT.selected.size;
+  const item = (act, icon, label, opts = {}) => `<button type="button" class="ct-menu-item${opts.danger ? ' is-danger' : ''}" data-act="${act}" role="menuitem" ${opts.disabled ? 'disabled' : ''} ${opts.title ? `title="${esc(opts.title)}"` : ''}>${icon}<span>${label}</span></button>`;
+  const adminOnly = admin ? {} : { disabled: true, title: 'Admins only' };
+  const el = ctPopover(anchor, 'ct-menu', `
+    ${item('sync', CT_ICON.sync, 'Sync from WhatsApp', adminOnly)}
+    ${item('export', CT_ICON.download, 'Export CSV', adminOnly)}
+    <div class="ct-menu-sep"></div>
+    ${item('label', CT_ICON.tag, `Add label to selected${n ? ` (${n})` : ''}`, n ? {} : { disabled: true, title: 'Select contacts first' })}
+    ${item('delete', CT_ICON.trash, `Delete selected${n ? ` (${n})` : ''}`, !admin ? adminOnly : (n ? { danger: true } : { disabled: true, danger: true, title: 'Select contacts first' }))}`, 'right');
+  if (!el) return;
+  el.setAttribute('role', 'menu');
+  el.addEventListener('click', async e => {
+    const b = e.target.closest('.ct-menu-item:not([disabled])');
+    if (!b) return;
+    const act = b.dataset.act;
+    if (act === 'label') { ctBulkLabel(anchor); return; }
+    ctClosePopover();
+    if (act === 'sync') ctSync();
+    else if (act === 'export') {
+      try { await Api.exports.contacts(); } catch (err) { toast(err.message, 'error'); }
+    } else if (act === 'delete') ctBulkDelete();
+  });
+}
+
+function ctBulkLabel(anchor) {
+  const ids = [...CT.selected];
+  ctClosePopover();
+  const applied = new Set();
+  openLabelPicker(anchor, {
+    applied,
+    onToggle: async (label, on) => {
+      if (!on) return;   // bulk: add only
+      const r = await Api.contacts.bulkLabel(ids, label.id);
+      CT.items.forEach(c => {
+        if (ids.includes(c.id) && !(c.labels || []).includes(label.id)) {
+          c.labels = [...(c.labels || []), label.id];
+          ctReplaceRow(c);
+        }
+      });
+      toast(`Label "${label.name}" added to ${r.added} contact${r.added === 1 ? '' : 's'}`, 'success');
+    },
+  });
+}
+
+async function ctBulkDelete() {
+  const ids = [...CT.selected];
+  if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} contact${ids.length === 1 ? '' : 's'}? Chats and messages are kept.`)) return;
+  try {
+    const r = await Api.contacts.bulkDelete(ids);
+    toast(`Deleted ${r.deleted} contact${r.deleted === 1 ? '' : 's'}`, 'success');
+    ctReload();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+let _ctSyncing = false;
+async function ctSync() {
+  if (_ctSyncing) return;
+  _ctSyncing = true;
+  toast('Syncing contacts from WhatsApp…');
+  try {
+    const r = await Api.contacts.sync();
+    const failed = Object.entries(r.phones || {}).filter(([k, v]) => k !== 'chats' && !v.ok).length;
+    toast(`Contacts synced: ${r.created} new, ${r.updated} updated${failed ? ` · ${failed} number${failed === 1 ? '' : 's'} offline (imported from chats)` : ''}`,
+      failed ? 'default' : 'success');
+    if (State.currentView === 'contacts') ctReload();
+  } catch (e) { toast(e.message || 'Sync failed', 'error'); }
+  finally { _ctSyncing = false; }
+}
+
+// ── Contact details drawer ──
+function closeContactDrawer() {
+  document.getElementById('ct-drawer-wrap')?.remove();
+  document.removeEventListener('keydown', _ctDrawerKey);
+}
+function _ctDrawerKey(e) { if (e.key === 'Escape' && !_labelPickerEl) closeContactDrawer(); }
+
+async function openContactDrawer(id) {
+  closeContactDrawer();
+  let c = CT.items.find(x => x.id === id);
+  const wrap = document.createElement('div');
+  wrap.id = 'ct-drawer-wrap';
+  wrap.className = 'ct-drawer-wrap';
+  wrap.innerHTML = `<div class="ct-drawer-scrim" data-close></div>
+    <aside class="ct-drawer" role="dialog" aria-modal="true" aria-labelledby="ct-dr-title"><div class="ct-loading"><div class="spinner"></div></div></aside>`;
+  document.body.appendChild(wrap);
+  document.addEventListener('keydown', _ctDrawerKey);
+  wrap.querySelector('[data-close]').addEventListener('click', closeContactDrawer);
+  try { c = { ...(c || {}), ...(await Api.contacts.get(id)) }; }
+  catch (e) { if (!c) { closeContactDrawer(); toast(e.message, 'error'); return; } }
+  if (!document.getElementById('ct-drawer-wrap')) return;
+  ctRenderDrawer(wrap.querySelector('.ct-drawer'), c);
+}
+
+function ctRenderDrawer(dr, c) {
+  const admin = isAdmin();
+  const props = Object.entries(c.custom_properties || {});
+  const fact = (k, v) => `<div class="ct-fact"><span>${k}</span><span>${v}</span></div>`;
+  const badges = [
+    c.is_my_contact ? '<span class="ct-tag">Saved contact</span>' : '',
+    c.is_business ? '<span class="ct-tag">Business</span>' : '',
+  ].join('');
+  dr.innerHTML = `
+    <div class="ct-dr-head">
+      ${ctAvatarHTML(c, 'lg')}
+      <div class="ct-dr-id">
+        <h3 id="ct-dr-title">${esc(ctDisplayName(c))}</h3>
+        <div class="ct-dr-sub">${ctPhoneHTML(c)} ${ctTypeHTML(c)}</div>
+      </div>
+      <button type="button" class="ct-icon-btn" data-close aria-label="Close">${CT_ICON.close}</button>
+    </div>
+    <div class="ct-dr-body">
+      <div class="ct-facts">
+        ${fact('WhatsApp pushname', c.pushname ? `~ ${esc(c.pushname)}` : '—')}
+        ${fact('Username', c.username ? esc(c.username) : '—')}
+        ${badges ? fact('WhatsApp', badges) : ''}
+        ${c.synced_at ? fact('Last synced', esc(parseServerDate(c.synced_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }))) : ''}
+      </div>
+      <div class="ct-dr-sec"><div class="ct-pop-title">Labels</div><div id="ct-dr-labels">${ctLabelsHTML(c, true)}</div></div>
+      <div class="ct-dr-sec ct-form">
+        <label>Name<input type="text" id="ctd-name" maxlength="255" value="${esc(c.name || '')}" placeholder="${esc(c.pushname || 'Contact name')}"></label>
+        <label>Email<input type="email" id="ctd-email" maxlength="255" value="${esc(c.email || '')}" placeholder="name@company.com"></label>
+        <label>Company<input type="text" id="ctd-company" maxlength="255" value="${esc(c.company || '')}"></label>
+        <label>Notes<textarea id="ctd-notes" rows="3" maxlength="5000" placeholder="Add a note about this contact">${esc(c.notes || '')}</textarea></label>
+        <div class="ct-props">
+          <div class="ct-pop-title">Custom properties</div>
+          <div id="ctd-props">${props.map(([k, v]) => ctPropRow(k, v)).join('')}</div>
+          <button type="button" class="ct-link" id="ctd-add-prop">${CT_ICON.plus}Add property</button>
+        </div>
+        ${admin ? `<label class="ct-inline"><input type="checkbox" id="ctd-masked" ${c.is_masked ? 'checked' : ''}> Mask this number for non-admins</label>` : ''}
+      </div>
+    </div>
+    <div class="ct-dr-foot">
+      ${admin ? `<button type="button" class="ct-btn ct-btn-danger-ghost" id="ctd-del">${CT_ICON.trash}Delete</button>` : ''}
+      <span style="flex:1"></span>
+      ${c.chat_id ? `<button type="button" class="ct-btn" id="ctd-chat">${CT_ICON.chat}Open chat</button>` : ''}
+      <button type="button" class="ct-btn ct-btn-primary" id="ctd-save">Save</button>
+    </div>`;
+  dr.querySelector('[data-close]').addEventListener('click', closeContactDrawer);
+  setTimeout(() => dr.querySelector('#ctd-name')?.focus(), 30);
+  const labelsBox = dr.querySelector('#ct-dr-labels');
+  labelsBox.addEventListener('click', e => {
+    const b = e.target.closest('.ct-add-label');
+    if (b) { e.stopPropagation(); ctPickLabels(b, c, cc => { labelsBox.innerHTML = ctLabelsHTML(cc, true); }); }
+  });
+  dr.querySelector('#ctd-add-prop').addEventListener('click', () => {
+    dr.querySelector('#ctd-props').insertAdjacentHTML('beforeend', ctPropRow('', ''));
+    dr.querySelector('#ctd-props .ct-prop:last-child input')?.focus();
+  });
+  dr.querySelector('#ctd-props').addEventListener('click', e => {
+    if (e.target.closest('.ct-prop-del')) e.target.closest('.ct-prop').remove();
+  });
+  dr.querySelector('#ctd-chat')?.addEventListener('click', () => {
+    const chatId = c.chat_id;
+    closeContactDrawer();
+    navigateTo('inbox');
+    Promise.resolve(_inboxReady).then(() => {
+      if (State.currentView !== 'inbox') return;
+      if (State.inbox.chats?.some(x => x.id === chatId)) openChat(chatId);
+      else toast('Chat not found in the current list', 'error');
+    });
+  });
+  dr.querySelector('#ctd-del')?.addEventListener('click', async () => {
+    if (!confirm(`Delete ${ctDisplayName(c)}? Chats and messages are kept.`)) return;
+    try {
+      await Api.contacts.del(c.id);
+      closeContactDrawer();
+      toast('Contact deleted', 'success');
+      ctReload();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  dr.querySelector('#ctd-save').addEventListener('click', async () => {
+    const custom = {};
+    dr.querySelectorAll('#ctd-props .ct-prop').forEach(row => {
+      const k = row.querySelector('.ct-prop-k').value.trim();
+      if (k) custom[k.slice(0, 100)] = row.querySelector('.ct-prop-v').value.slice(0, 1000);
+    });
+    const body = {
+      name: dr.querySelector('#ctd-name').value.trim(),
+      email: dr.querySelector('#ctd-email').value.trim(),
+      company: dr.querySelector('#ctd-company').value.trim(),
+      notes: dr.querySelector('#ctd-notes').value,
+      custom_properties: custom,
+    };
+    const masked = dr.querySelector('#ctd-masked');
+    if (masked) body.is_masked = masked.checked;
+    const btn = dr.querySelector('#ctd-save');
+    btn.disabled = true;
+    try {
+      const saved = await Api.contacts.update(c.id, body);
+      Object.assign(c, saved, { chat_id: c.chat_id, picture_url: c.picture_url || saved.picture_url });
+      ctReplaceRow(c);
+      toast('Contact saved', 'success');
+      closeContactDrawer();
+    } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+  });
+}
+
+function ctPropRow(k, v) {
+  return `<div class="ct-prop"><input class="ct-prop-k" type="text" maxlength="100" placeholder="Property" value="${esc(k)}">
+    <input class="ct-prop-v" type="text" maxlength="1000" placeholder="Value" value="${esc(v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : v)}">
+    <button type="button" class="ct-icon-btn ct-prop-del" aria-label="Remove property">${CT_ICON.close}</button></div>`;
 }
 
 function debounce(fn, ms) {
   let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
-async function loadContacts() {
-  const q = {};
-  if (State.contacts.search) q.search = State.contacts.search;
-  try {
-    const list = await Api.contacts.list(q);
-    State.contacts.list = list;
-    const el = document.getElementById('contacts-list');
-    if (!el) return;
-    if (!list.length) { el.innerHTML = `<div class="loading-center text-muted">No contacts</div>`; return; }
-    el.innerHTML = list.map(c => `
-      <div class="contact-card" data-cid="${c.id}">
-        <div class="contact-avatar">${initials(c.name||c.phone_number)}</div>
-        <div class="contact-info">
-          <div class="contact-name">${esc(c.name||'—')}</div>
-          <div class="contact-phone">${esc(c.phone_number)}</div>
-          ${c.company ? `<div class="contact-company">${esc(c.company)}</div>` : ''}
-        </div>
-        <div style="display:flex;gap:.35rem;margin-left:auto">
-          <button class="btn btn-ghost btn-sm contact-edit" data-cid="${c.id}">Edit</button>
-          <button class="btn btn-danger btn-sm contact-del icon-btn" data-cid="${c.id}" title="Delete contact"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg></button>
-        </div>
-      </div>`).join('');
-    el.querySelectorAll('.contact-edit').forEach(btn => {
-      btn.addEventListener('click', e => { e.stopPropagation(); showContactModal(list.find(c => c.id == btn.dataset.cid)); });
-    });
-    el.querySelectorAll('.contact-del').forEach(btn => {
-      btn.addEventListener('click', async e => {
-        e.stopPropagation();
-        if (!confirm('Delete contact?')) return;
-        try { await Api.contacts.del(btn.dataset.cid); toast('Deleted', 'success'); loadContacts(); }
-        catch(err) { toast(err.message, 'error'); }
-      });
-    });
-  } catch(_) {}
-}
-
-function showContactModal(contact = null) {
-  const c = contact || {};
-  showModal(contact ? 'Edit Contact' : 'New Contact', `
-    <div class="form-group"><label>Name</label><input type="text" id="ct-name" value="${esc(c.name||'')}"></div>
-    <div class="form-group"><label>Phone Number *</label><input type="text" id="ct-phone" value="${esc(c.phone_number||'')}" ${contact?'readonly':''}></div>
-    <div class="form-group"><label>Email</label><input type="email" id="ct-email" value="${esc(c.email||'')}"></div>
-    <div class="form-group"><label>Company</label><input type="text" id="ct-company" value="${esc(c.company||'')}"></div>
+function showContactModal() {
+  showModal('Add contact', `
+    <div class="form-group"><label>Phone number *</label><input type="tel" id="ct-phone" placeholder="+91 97262 56851" autocomplete="off"></div>
+    <div class="form-group"><label>Name</label><input type="text" id="ct-name" maxlength="255"></div>
+    <div class="form-group"><label>Email</label><input type="email" id="ct-email" maxlength="255"></div>
+    <div class="form-group"><label>Company</label><input type="text" id="ct-company" maxlength="255"></div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="ct-save">Save</button>
+      <button class="btn btn-primary" id="ct-save">Add contact</button>
     </div>`);
+  setTimeout(() => document.getElementById('ct-phone')?.focus(), 30);
   document.getElementById('ct-save').addEventListener('click', async () => {
     const phone = document.getElementById('ct-phone').value.trim();
-    if (!phone) return toast('Phone required', 'error');
+    if (phone.replace(/\D/g, '').length < 7) return toast('Enter the phone number with country code', 'error');
     try {
-      const body = { phone_number: phone, name: document.getElementById('ct-name').value, email: document.getElementById('ct-email').value, company: document.getElementById('ct-company').value };
-      if (contact) await Api.contacts.update(contact.id, body);
-      else await Api.contacts.create(body);
-      closeModal(); toast(contact ? 'Updated' : 'Created', 'success'); loadContacts();
-    } catch(e) { toast(e.message, 'error'); }
+      await Api.contacts.create({
+        phone_number: phone,
+        name: document.getElementById('ct-name').value.trim(),
+        email: document.getElementById('ct-email').value.trim() || null,
+        company: document.getElementById('ct-company').value.trim() || null,
+      });
+      closeModal(); toast('Contact added', 'success');
+      if (State.currentView === 'contacts') ctReload();
+    } catch (e) { toast(e.message, 'error'); }
   });
 }
 
 // ── ANALYTICS VIEW ──────────────────────────────────────────────── //
-async function renderAnalytics() {
+// Sub-routes: #analytics/<page>. Range / chat / filters persist across pages (memory only).
+// Analytics icons: Font Awesome Free 6.7.2 solid (CC BY 4.0) — [viewBox width, path]
+const AN_ICONS = {
+  chart: [512, 'M64 64c0-17.7-14.3-32-32-32S0 46.3 0 64L0 400c0 44.2 35.8 80 80 80l400 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L80 416c-8.8 0-16-7.2-16-16L64 64zm406.6 86.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L320 210.7l-57.4-57.4c-12.5-12.5-32.8-12.5-45.3 0l-112 112c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L240 221.3l57.4 57.4c12.5 12.5 32.8 12.5 45.3 0l128-128z'],
+  team: [640, 'M144 0a80 80 0 1 1 0 160A80 80 0 1 1 144 0zM512 0a80 80 0 1 1 0 160A80 80 0 1 1 512 0zM0 298.7C0 239.8 47.8 192 106.7 192l42.7 0c15.9 0 31 3.5 44.6 9.7c-1.3 7.2-1.9 14.7-1.9 22.3c0 38.2 16.8 72.5 43.3 96c-.2 0-.4 0-.7 0L21.3 320C9.6 320 0 310.4 0 298.7zM405.3 320c-.2 0-.4 0-.7 0c26.6-23.5 43.3-57.8 43.3-96c0-7.6-.7-15-1.9-22.3c13.6-6.3 28.7-9.7 44.6-9.7l42.7 0C592.2 192 640 239.8 640 298.7c0 11.8-9.6 21.3-21.3 21.3l-213.3 0zM224 224a96 96 0 1 1 192 0 96 96 0 1 1 -192 0zM128 485.3C128 411.7 187.7 352 261.3 352l117.3 0C452.3 352 512 411.7 512 485.3c0 14.7-11.9 26.7-26.7 26.7l-330.7 0c-14.7 0-26.7-11.9-26.7-26.7z'],
+  phone: [384, 'M16 64C16 28.7 44.7 0 80 0L304 0c35.3 0 64 28.7 64 64l0 384c0 35.3-28.7 64-64 64L80 512c-35.3 0-64-28.7-64-64L16 64zM224 448a32 32 0 1 0 -64 0 32 32 0 1 0 64 0zM304 64L80 64l0 320 224 0 0-320z'],
+  chats: [640, 'M208 352c114.9 0 208-78.8 208-176S322.9 0 208 0S0 78.8 0 176c0 38.6 14.7 74.3 39.6 103.4c-3.5 9.4-8.7 17.7-14.2 24.7c-4.8 6.2-9.7 11-13.3 14.3c-1.8 1.6-3.3 2.9-4.3 3.7c-.5 .4-.9 .7-1.1 .8l-.2 .2s0 0 0 0s0 0 0 0C1 327.2-1.4 334.4 .8 340.9S9.1 352 16 352c21.8 0 43.8-5.6 62.1-12.5c9.2-3.5 17.8-7.4 25.2-11.4C134.1 343.3 169.8 352 208 352zM448 176c0 112.3-99.1 196.9-216.5 207C255.8 457.4 336.4 512 432 512c38.2 0 73.9-8.7 104.7-23.9c7.5 4 16 7.9 25.2 11.4c18.3 6.9 40.3 12.5 62.1 12.5c6.9 0 13.1-4.5 15.2-11.1c2.1-6.6-.2-13.8-5.8-17.9c0 0 0 0 0 0s0 0 0 0l-.2-.2c-.2-.2-.6-.4-1.1-.8c-1-.8-2.5-2-4.3-3.7c-3.6-3.3-8.5-8.1-13.3-14.3c-5.5-7-10.7-15.4-14.2-24.7c24.9-29 39.6-64.7 39.6-103.4c0-92.8-84.9-168.9-192.6-175.5c.4 5.1 .6 10.3 .6 15.5z'],
+  ticket: [576, 'M64 64C28.7 64 0 92.7 0 128l0 64c0 8.8 7.4 15.7 15.7 18.6C34.5 217.1 48 235 48 256s-13.5 38.9-32.3 45.4C7.4 304.3 0 311.2 0 320l0 64c0 35.3 28.7 64 64 64l448 0c35.3 0 64-28.7 64-64l0-64c0-8.8-7.4-15.7-15.7-18.6C541.5 294.9 528 277 528 256s13.5-38.9 32.3-45.4c8.3-2.9 15.7-9.8 15.7-18.6l0-64c0-35.3-28.7-64-64-64L64 64zm64 112l0 160c0 8.8 7.2 16 16 16l288 0c8.8 0 16-7.2 16-16l0-160c0-8.8-7.2-16-16-16l-288 0c-8.8 0-16 7.2-16 16zM96 160c0-17.7 14.3-32 32-32l320 0c17.7 0 32 14.3 32 32l0 192c0 17.7-14.3 32-32 32l-320 0c-17.7 0-32-14.3-32-32l0-192z'],
+  message: [512, 'M64 0C28.7 0 0 28.7 0 64L0 352c0 35.3 28.7 64 64 64l96 0 0 80c0 6.1 3.4 11.6 8.8 14.3s11.9 2.1 16.8-1.5L309.3 416 448 416c35.3 0 64-28.7 64-64l0-288c0-35.3-28.7-64-64-64L64 0z'],
+  members: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM609.3 512l-137.8 0c5.4-9.4 8.6-20.3 8.6-32l0-8c0-60.7-27.1-115.2-69.8-151.8c2.4-.1 4.7-.2 7.1-.2l61.4 0C567.8 320 640 392.2 640 481.3c0 17-13.8 30.7-30.7 30.7zM432 256c-31 0-59-12.6-79.3-32.9C372.4 196.5 384 163.6 384 128c0-26.8-6.6-52.1-18.3-74.3C384.3 40.1 407.2 32 432 32c61.9 0 112 50.1 112 112s-50.1 112-112 112z'],
+  export: [576, 'M0 64C0 28.7 28.7 0 64 0L224 0l0 128c0 17.7 14.3 32 32 32l128 0 0 128-168 0c-13.3 0-24 10.7-24 24s10.7 24 24 24l168 0 0 112c0 35.3-28.7 64-64 64L64 512c-35.3 0-64-28.7-64-64L0 64zM384 336l0-48 110.1 0-39-39c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l80 80c9.4 9.4 9.4 24.6 0 33.9l-80 80c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l39-39L384 336zm0-208l-128 0L256 0 384 128z'],
+  info: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM216 336l24 0 0-64-24 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l48 0c13.3 0 24 10.7 24 24l0 88 8 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-80 0c-13.3 0-24-10.7-24-24s10.7-24 24-24zm40-208a32 32 0 1 1 0 64 32 32 0 1 1 0-64z'],
+  refresh: [512, 'M463.5 224l8.5 0c13.3 0 24-10.7 24-24l0-128c0-9.7-5.8-18.5-14.8-22.2s-19.3-1.7-26.2 5.2L413.4 96.6c-87.6-86.5-228.7-86.2-315.8 1c-87.5 87.5-87.5 229.3 0 316.8s229.3 87.5 316.8 0c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0c-62.5 62.5-163.8 62.5-226.3 0s-62.5-163.8 0-226.3c62.2-62.2 162.7-62.5 225.3-1L327 183c-6.9 6.9-8.9 17.2-5.2 26.2s12.5 14.8 22.2 14.8l119.5 0z'],
+  upload: [448, 'M246.6 9.4c-12.5-12.5-32.8-12.5-45.3 0l-128 128c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 109.3 192 320c0 17.7 14.3 32 32 32s32-14.3 32-32l0-210.7 73.4 73.4c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3l-128-128zM64 352c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64c0 53 43 96 96 96l256 0c53 0 96-43 96-96l0-64c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 64c0 17.7-14.3 32-32 32L96 448c-17.7 0-32-14.3-32-32l0-64z'],
+  filter: [512, 'M3.9 54.9C10.5 40.9 24.5 32 40 32l432 0c15.5 0 29.5 8.9 36.1 22.9s4.6 30.5-5.2 42.5L320 320.9 320 448c0 12.1-6.8 23.2-17.7 28.6s-23.8 4.3-33.5-3l-64-48c-8.1-6-12.8-15.5-12.8-25.6l0-79.1L9 97.3C-.7 85.4-2.8 68.8 3.9 54.9z'],
+  down: [512, 'M233.4 406.6c12.5 12.5 32.8 12.5 45.3 0l192-192c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L256 338.7 86.6 169.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l192 192z'],
+  right: [320, 'M310.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-192 192c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L242.7 256 73.4 86.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l192 192z'],
+  calendar: [448, 'M96 32l0 32L48 64C21.5 64 0 85.5 0 112l0 48 448 0 0-48c0-26.5-21.5-48-48-48l-48 0 0-32c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 32L160 64l0-32c0-17.7-14.3-32-32-32S96 14.3 96 32zM448 192L0 192 0 464c0 26.5 21.5 48 48 48l352 0c26.5 0 48-21.5 48-48l0-272z'],
+  search: [512, 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
+  clock: [512, 'M256 0a256 256 0 1 1 0 512A256 256 0 1 1 256 0zM232 120l0 136c0 8 4 15.5 10.7 20l96 64c11 7.4 25.9 4.4 33.3-6.7s4.4-25.9-6.7-33.3L280 243.2 280 120c0-13.3-10.7-24-24-24s-24 10.7-24 24z'],
+  check: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM369 209L241 337c-9.4 9.4-24.6 9.4-33.9 0l-64-64c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l47 47L335 175c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9z'],
+  unassigned: [640, 'M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L353.3 251.6C407.9 237 448 187.2 448 128C448 57.3 390.7 0 320 0C250.2 0 193.5 55.8 192 125.2L38.8 5.1zM264.3 304.3C170.5 309.4 96 387.2 96 482.3c0 16.4 13.3 29.7 29.7 29.7l388.6 0c3.9 0 7.6-.7 11-2.1l-261-205.6z'],
+  hourglass: [384, 'M32 0C14.3 0 0 14.3 0 32S14.3 64 32 64l0 11c0 42.4 16.9 83.1 46.9 113.1L146.7 256 78.9 323.9C48.9 353.9 32 394.6 32 437l0 11c-17.7 0-32 14.3-32 32s14.3 32 32 32l32 0 256 0 32 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l0-11c0-42.4-16.9-83.1-46.9-113.1L237.3 256l67.9-67.9c30-30 46.9-70.7 46.9-113.1l0-11c17.7 0 32-14.3 32-32s-14.3-32-32-32L320 0 64 0 32 0zM96 75l0-11 192 0 0 11c0 19-5.6 37.4-16 53L112 128c-10.3-15.6-16-34-16-53zm16 309c3.5-5.3 7.6-10.3 12.1-14.9L192 301.3l67.9 67.9c4.6 4.6 8.6 9.6 12.1 14.9L112 384z'],
+  userPlus: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM504 312l0-64-64 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l64 0 0-64c0-13.3 10.7-24 24-24s24 10.7 24 24l0 64 64 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-64 0 0 64c0 13.3-10.7 24-24 24s-24-10.7-24-24z'],
+  userMinus: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM472 200l144 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-144 0c-13.3 0-24-10.7-24-24s10.7-24 24-24z'],
+  userX: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM471 143c9.4-9.4 24.6-9.4 33.9 0l47 47 47-47c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9l-47 47 47 47c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0l-47-47-47 47c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l47-47-47-47c-9.4-9.4-9.4-24.6 0-33.9z'],
+  out: [384, 'M214.6 41.4c-12.5-12.5-32.8-12.5-45.3 0l-160 160c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L160 141.2 160 448c0 17.7 14.3 32 32 32s32-14.3 32-32l0-306.7L329.4 246.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3l-160-160z'],
+  in: [384, 'M169.4 470.6c12.5 12.5 32.8 12.5 45.3 0l160-160c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L224 370.8 224 64c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 306.7L54.6 265.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l160 160z'],
+  flag: [448, 'M64 32C64 14.3 49.7 0 32 0S0 14.3 0 32L0 64 0 368 0 480c0 17.7 14.3 32 32 32s32-14.3 32-32l0-128 64.3-16.1c41.1-10.3 84.6-5.5 122.5 13.4c44.2 22.1 95.5 24.8 141.7 7.4l34.7-13c12.5-4.7 20.8-16.6 20.8-30l0-247.7c0-23-24.2-38-44.8-27.7l-9.6 4.8c-46.3 23.2-100.8 23.2-147.1 0c-35.1-17.6-75.4-22-113.5-12.5L64 48l0-16z'],
+  stopwatch: [448, 'M176 0c-17.7 0-32 14.3-32 32s14.3 32 32 32l16 0 0 34.4C92.3 113.8 16 200 16 304c0 114.9 93.1 208 208 208s208-93.1 208-208c0-41.8-12.3-80.7-33.5-113.2l24.1-24.1c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L355.7 143c-28.1-23-62.2-38.8-99.7-44.6L256 64l16 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L224 0 176 0zm72 192l0 128c0 13.3-10.7 24-24 24s-24-10.7-24-24l0-128c0-13.3 10.7-24 24-24s24 10.7 24 24z'],
+  note: [448, 'M64 32C28.7 32 0 60.7 0 96L0 416c0 35.3 28.7 64 64 64l224 0 0-112c0-26.5 21.5-48 48-48l112 0 0-224c0-35.3-28.7-64-64-64L64 32zM448 352l-45.3 0L336 352c-8.8 0-16 7.2-16 16l0 66.7 0 45.3 32-32 64-64 32-32z'],
+  logs: [512, 'M75 75L41 41C25.9 25.9 0 36.6 0 57.9L0 168c0 13.3 10.7 24 24 24l110.1 0c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24l0 104c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65 0-94.1c0-13.3-10.7-24-24-24z'],
+  contacts: [512, 'M96 0C60.7 0 32 28.7 32 64l0 384c0 35.3 28.7 64 64 64l288 0c35.3 0 64-28.7 64-64l0-384c0-35.3-28.7-64-64-64L96 0zM208 288l64 0c44.2 0 80 35.8 80 80c0 8.8-7.2 16-16 16l-192 0c-8.8 0-16-7.2-16-16c0-44.2 35.8-80 80-80zm-32-96a64 64 0 1 1 128 0 64 64 0 1 1 -128 0zM512 80c0-8.8-7.2-16-16-16s-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64zM496 192c-8.8 0-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64c0-8.8-7.2-16-16-16zm16 144c0-8.8-7.2-16-16-16s-16 7.2-16 16l0 64c0 8.8 7.2 16 16 16s16-7.2 16-16l0-64z'],
+  actions: [512, 'M32 96l320 0 0-64c0-12.9 7.8-24.6 19.8-29.6s25.7-2.2 34.9 6.9l96 96c6 6 9.4 14.1 9.4 22.6s-3.4 16.6-9.4 22.6l-96 96c-9.2 9.2-22.9 11.9-34.9 6.9s-19.8-16.6-19.8-29.6l0-64L32 160c-17.7 0-32-14.3-32-32s14.3-32 32-32zM480 352c17.7 0 32 14.3 32 32s-14.3 32-32 32l-320 0 0 64c0 12.9-7.8 24.6-19.8 29.6s-25.7 2.2-34.9-6.9l-96-96c-6-6-9.4-14.1-9.4-22.6s3.4-16.6 9.4-22.6l96-96c9.2-9.2 22.9-11.9 34.9-6.9s19.8 16.6 19.8 29.6l0 64 320 0z'],
+  close: [384, 'M342.6 150.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L192 210.7 86.6 105.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L146.7 256 41.4 361.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 301.3 297.4 406.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L237.3 256 342.6 150.6z'],
+  comment: [512, 'M512 240c0 114.9-114.6 208-256 208c-37.1 0-72.3-6.4-104.1-17.9c-11.9 8.7-31.3 20.6-54.3 30.6C73.6 471.1 44.7 480 16 480c-6.5 0-12.3-3.9-14.8-9.9c-2.5-6-1.1-12.8 3.4-17.4c0 0 0 0 0 0s0 0 0 0s0 0 0 0c0 0 0 0 0 0l.3-.3c.3-.3 .7-.7 1.3-1.4c1.1-1.2 2.8-3.1 4.9-5.7c4.1-5 9.6-12.4 15.2-21.6c10-16.6 19.5-38.4 21.4-62.9C17.7 326.8 0 285.1 0 240C0 125.1 114.6 32 256 32s256 93.1 256 208z'],
+  user: [448, 'M224 256A128 128 0 1 0 224 0a128 128 0 1 0 0 256zm-45.7 48C79.8 304 0 383.8 0 482.3C0 498.7 13.3 512 29.7 512l388.6 0c16.4 0 29.7-13.3 29.7-29.7C448 383.8 368.2 304 269.7 304l-91.4 0z'],
+  group: [640, 'M72 88a56 56 0 1 1 112 0A56 56 0 1 1 72 88zM64 245.7C54 256.9 48 271.8 48 288s6 31.1 16 42.3l0-84.7zm144.4-49.3C178.7 222.7 160 261.2 160 304c0 34.3 12 65.8 32 90.5l0 21.5c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32l0-26.8C26.2 371.2 0 332.7 0 288c0-61.9 50.1-112 112-112l32 0c24 0 46.2 7.5 64.4 20.3zM448 416l0-21.5c20-24.7 32-56.2 32-90.5c0-42.8-18.7-81.3-48.4-107.7C449.8 183.5 472 176 496 176l32 0c61.9 0 112 50.1 112 112c0 44.7-26.2 83.2-64 101.2l0 26.8c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32zm8-328a56 56 0 1 1 112 0A56 56 0 1 1 456 88zM576 245.7l0 84.7c10-11.3 16-26.1 16-42.3s-6-31.1-16-42.3zM320 32a64 64 0 1 1 0 128 64 64 0 1 1 0-128zM240 304c0 16.2 6 31 16 42.3l0-84.7c-10 11.3-16 26.1-16 42.3zm144-42.3l0 84.7c10-11.3 16-26.1 16-42.3s-6-31.1-16-42.3zM448 304c0 44.7-26.2 83.2-64 101.2l0 42.8c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32l0-42.8c-37.8-18-64-56.5-64-101.2c0-61.9 50.1-112 112-112l32 0c61.9 0 112 50.1 112 112z'],
+  download: [512, 'M288 32c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 242.7-73.4-73.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l128 128c12.5 12.5 32.8 12.5 45.3 0l128-128c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L288 274.7 288 32zM64 352c-35.3 0-64 28.7-64 64l0 32c0 35.3 28.7 64 64 64l384 0c35.3 0 64-28.7 64-64l0-32c0-35.3-28.7-64-64-64l-101.5 0-45.3 45.3c-25 25-65.5 25-90.5 0L165.5 352 64 352zm368 56a24 24 0 1 1 0 48 24 24 0 1 1 0-48z'],
+};
+
+function anIcon(name, cls = '') {
+  const ic = AN_ICONS[name];
+  if (!ic) return '';
+  return `<svg class="an-ic ${cls}" viewBox="0 0 ${ic[0]} 512" fill="currentColor" aria-hidden="true"><path d="${ic[1]}"/></svg>`;
+}
+
+const AN_PAGES = {
+  team:     { nav: 'Team analytics',  title: 'Team analytics',  icon: 'team',    agentFilter: true,
+              info: 'Activity per team member for the selected range. Only messages sent from Hyperscope are attributed to a member; messages sent from the phone itself, bulk jobs, automations or the AI agent count in Total only.' },
+  phones:   { nav: 'Phone metrics',   title: 'Phone analytics', icon: 'phone',
+              info: 'Activity per connected WhatsApp number for the selected range.' },
+  chats:    { nav: 'Chat metrics',    title: 'Chat metrics',    icon: 'chats',
+              info: 'New chats are chats that first reached Hyperscope in the selected range (including chats imported when a phone is connected).' },
+  tickets:  { nav: 'Ticket metrics',  title: 'Ticket metrics',  icon: 'ticket',
+              info: 'Tickets created in the selected range, grouped by assignee. Unresolved age buckets count open tickets by how long ago they were created.' },
+  messages: { nav: 'Message metrics', title: 'Message metrics', icon: 'message', agentFilter: true,
+              info: 'Incoming and outgoing messages in the selected range. With a member filter, outgoing counts only messages that member sent from Hyperscope.' },
+  members:  { nav: 'Member metrics',  title: 'Member metrics',  icon: 'members',
+              info: 'Group membership changes: joins (including members added by an admin), leaves and removals.' },
+  exports:  { nav: 'Data exports',    title: 'Data exports',    icon: 'export', group: 'exports' },
+};
+
+const AN = {
+  sub: 'team',
+  range: null,            // { preset, from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' } (local dates, inclusive)
+  chat: null,             // { id, name }
+  phoneIds: [], agentIds: [],
+  data: null, charts: [], seq: 0,
+  agents: null,
+};
+
+const _AN_MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function _anYmd(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+function _anParseYmd(s) { const [y, m, d] = String(s).split('-').map(Number); return new Date(y, m - 1, d); }
+function _anAddDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function _anShortDate(d) { return `${String(d.getDate()).padStart(2, '0')}-${_AN_MON[d.getMonth()]}-${String(d.getFullYear()).slice(-2)}`; }
+
+function _anPresetRange(preset) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const r = { preset };
+  if (preset === 'today') { r.from = r.to = _anYmd(today); }
+  else if (preset === 'yesterday') { r.from = r.to = _anYmd(_anAddDays(today, -1)); }
+  else if (preset === '7d') { r.from = _anYmd(_anAddDays(today, -6)); r.to = _anYmd(today); }
+  else if (preset === '30d') { r.from = _anYmd(_anAddDays(today, -29)); r.to = _anYmd(today); }
+  else if (preset === 'month') { r.from = _anYmd(new Date(today.getFullYear(), today.getMonth(), 1)); r.to = _anYmd(today); }
+  else { r.preset = 'default'; r.from = _anYmd(_anAddDays(today, -1)); r.to = _anYmd(today); }
+  return r;
+}
+
+function _anQuery() {
+  if (!AN.range) AN.range = _anPresetRange('default');
+  const from = _anParseYmd(AN.range.from);
+  const end = _anAddDays(_anParseYmd(AN.range.to), 1);
+  const to = end > new Date() ? new Date() : end;
+  const q = { from: from.toISOString(), to: to.toISOString() };
+  try { q.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) { q.tz = 'UTC'; }
+  q.tz_offset = -from.getTimezoneOffset();  // fallback when the server lacks that zone name
+  if (AN.chat) q.chat_id = AN.chat.id;
+  if (AN.phoneIds.length) q.phone_ids = AN.phoneIds.join(',');
+  if (AN.agentIds.length && AN_PAGES[AN.sub]?.agentFilter) q.agent_ids = AN.agentIds.join(',');
+  return q;
+}
+
+function _anRangeLabel() {
+  if (!AN.range) AN.range = _anPresetRange('default');
+  return `${_anShortDate(_anParseYmd(AN.range.from))} to ${_anShortDate(_anParseYmd(AN.range.to))}`;
+}
+
+// Numbers / durations. null / undefined → "--" (not computable), with an optional tooltip.
+function _anNum(v, tip) {
+  if (v == null) return `<span class="an-na"${tip ? ` data-tip="${esc(tip)}"` : ''}>--</span>`;
+  return Number(v).toLocaleString('en-IN');
+}
+function _anDurText(sec) {
+  if (sec == null) return '--';
+  sec = Math.round(sec);
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+  if (d) return `${d}d ${h % 24}h`;
+  if (h) return `${h}h ${m % 60}m`;
+  return `${m}m ${sec % 60}s`;
+}
+function _anDur(sec, tip) {
+  if (sec == null) return _anNum(null, tip);
+  return _anDurText(sec);
+}
+
+function _anDestroyCharts() {
+  AN.charts.forEach(c => { try { c.destroy(); } catch (_) {} });
+  AN.charts = [];
+}
+
+function _anShellHTML() {
+  const item = (key) => {
+    const p = AN_PAGES[key];
+    return `<a href="#analytics/${key}" class="an-nav-item" data-an="${key}">${anIcon(p.icon)}<span>${esc(p.nav)}</span></a>`;
+  };
+  return `
+    <div class="an-shell" id="an-shell">
+      <nav class="an-nav" aria-label="Analytics">
+        <div class="an-nav-group">${anIcon('chart')}<span>Analytics</span></div>
+        ${['team', 'phones', 'chats', 'tickets', 'messages', 'members'].map(item).join('')}
+        <div class="an-nav-group an-nav-group-2">${anIcon('export')}<span>Exports</span></div>
+        ${item('exports')}
+      </nav>
+      <div class="an-main" id="an-main"></div>
+    </div>
+    <div class="an-tooltip" id="an-tooltip" role="tooltip"></div>`;
+}
+
+async function renderAnalytics(sub) {
+  sub = AN_PAGES[sub] ? sub : (AN.sub || 'team');
+  AN.sub = sub;
+  _anSyncRoute(sub);
   const main = document.getElementById('main-content');
-  main.innerHTML = `
-    <div class="flex-col h-full" style="overflow-y:auto">
-      <div class="section-header"><h2>Analytics</h2></div>
-      <div id="analytics-body">
-        <div class="loading-center"><div class="spinner"></div></div>
+  if (!document.getElementById('an-shell')) {
+    main.innerHTML = _anShellHTML();
+    main.querySelectorAll('.an-nav-item').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      navigateTo('analytics/' + a.dataset.an);
+    }));
+    _anBindTooltips(main);
+  }
+  main.querySelectorAll('.an-nav-item').forEach(a => {
+    const on = a.dataset.an === sub;
+    a.classList.toggle('active', on);
+    on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current');
+  });
+  _anDestroyCharts();
+  AN.data = null;
+  const host = document.getElementById('an-main');
+  host.scrollTop = 0;
+  if (sub === 'exports') { _anRenderExports(host); return; }
+  host.innerHTML = _anPageHTML(sub);
+  _anBindToolbar(host);
+  _anLoad();
+}
+
+// Keep the hash / breadcrumb on the concrete sub-page (e.g. after clicking "Analytics" in the sidebar)
+function _anSyncRoute(sub) {
+  const route = 'analytics/' + sub;
+  State.currentRoute = route;
+  if (location.hash !== '#' + route) history.replaceState(null, '', '#' + route);
+  const bc = document.getElementById('app-breadcrumb');
+  if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS.analytics)}</strong><span class="bc-sep" aria-hidden="true">&gt;</span><strong>${esc(sub)}</strong>`;
+}
+
+function _anPageHTML(sub) {
+  const p = AN_PAGES[sub];
+  const nFilters = AN.phoneIds.length + (p.agentFilter ? AN.agentIds.length : 0);
+  return `
+    <div class="an-page">
+      <div class="an-title">${anIcon(p.icon, 'an-title-ic')}<h1>${esc(p.title)}</h1></div>
+      <div class="an-toolbar">
+        <div class="an-pop-wrap">
+          <button class="an-btn" id="an-range-btn" aria-haspopup="true" aria-expanded="false">
+            ${anIcon('calendar', 'an-btn-lead')}<span id="an-range-label">${esc(_anRangeLabel())}</span>${anIcon('down', 'an-caret')}
+          </button>
+        </div>
+        <div class="an-chatpick${AN.chat ? ' has-chat' : ''}" id="an-chatpick">
+          ${anIcon('search', 'an-chatpick-ic')}
+          <input id="an-chat-input" type="text" autocomplete="off" placeholder="Select a chat..."
+                 aria-label="Filter by chat" value="${esc(AN.chat ? AN.chat.name : '')}">
+          <button class="an-chat-clear" id="an-chat-clear" title="Clear chat" aria-label="Clear chat">${anIcon('close')}</button>
+        </div>
+        <div class="an-pop-wrap">
+          <button class="an-btn" id="an-filter-btn" aria-haspopup="true" aria-expanded="false">
+            ${anIcon('filter', 'an-btn-lead')}<span>Filter</span>${nFilters ? `<span class="an-count">${nFilters}</span>` : ''}
+          </button>
+        </div>
+        <div class="an-spacer"></div>
+        <span class="an-info" tabindex="0" data-tip="${esc(p.info || '')}" aria-label="About this page">${anIcon('info')}</span>
+        <button class="an-btn" id="an-refresh">${anIcon('refresh', 'an-btn-lead')}<span>Refresh</span></button>
+        <button class="an-btn" id="an-export">${anIcon('upload', 'an-btn-lead')}<span>Export</span></button>
+      </div>
+      <div id="an-body" class="an-body"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>`;
+}
+
+function _anClosePops() {
+  document.querySelectorAll('.an-pop').forEach(p => p.remove());
+  document.querySelectorAll('.an-btn[aria-expanded="true"]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.an-pop, .an-pop-wrap, .an-chatpick')) {
+    _anClosePops();
+    document.getElementById('an-chat-list')?.remove();
+  }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.querySelector('.an-pop, #an-chat-list')) {
+    _anClosePops();
+    document.getElementById('an-chat-list')?.remove();
+  }
+});
+
+function _anBindToolbar(host) {
+  host.querySelector('#an-range-btn').addEventListener('click', e => _anOpenRange(e.currentTarget));
+  host.querySelector('#an-filter-btn').addEventListener('click', e => _anOpenFilter(e.currentTarget));
+  host.querySelector('#an-refresh').addEventListener('click', () => _anLoad());
+  host.querySelector('#an-export').addEventListener('click', () => _anExportCsv());
+  _anBindChatPicker(host);
+}
+
+function _anOpenRange(btn) {
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  _anClosePops();
+  if (open) return;
+  btn.setAttribute('aria-expanded', 'true');
+  const presets = [['today', 'Today'], ['yesterday', 'Yesterday'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['month', 'This month']];
+  const pop = document.createElement('div');
+  pop.className = 'an-pop an-range-pop';
+  pop.innerHTML = `
+    ${presets.map(([k, l]) => `<button class="an-pop-item${AN.range?.preset === k ? ' active' : ''}" data-preset="${k}">${l}${AN.range?.preset === k ? anIcon('check', 'an-pop-check') : ''}</button>`).join('')}
+    <div class="an-pop-sep"></div>
+    <div class="an-pop-label">Custom</div>
+    <div class="an-custom">
+      <label>From<input type="date" id="an-from" value="${esc(AN.range.from)}" max="${_anYmd(new Date())}"></label>
+      <label>To<input type="date" id="an-to" value="${esc(AN.range.to)}" max="${_anYmd(new Date())}"></label>
+    </div>
+    <button class="btn btn-primary btn-sm an-apply" id="an-range-apply">Apply</button>`;
+  btn.parentElement.appendChild(pop);
+  pop.querySelectorAll('[data-preset]').forEach(b => b.addEventListener('click', () => {
+    AN.range = _anPresetRange(b.dataset.preset);
+    _anClosePops(); _anRangeChanged();
+  }));
+  pop.querySelector('#an-range-apply').addEventListener('click', () => {
+    const f = pop.querySelector('#an-from').value, t = pop.querySelector('#an-to').value;
+    if (!f || !t) return toast('Pick both dates', 'error');
+    if (f > t) return toast('"From" must be on or before "To"', 'error');
+    if ((_anParseYmd(t) - _anParseYmd(f)) / 86400000 > 365) return toast('Pick at most 366 days', 'error');
+    AN.range = { preset: 'custom', from: f, to: t };
+    _anClosePops(); _anRangeChanged();
+  });
+}
+
+function _anRangeChanged() {
+  const l = document.getElementById('an-range-label');
+  if (l) l.textContent = _anRangeLabel();
+  _anLoad();
+}
+
+async function _anOpenFilter(btn) {
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  _anClosePops();
+  if (open) return;
+  btn.setAttribute('aria-expanded', 'true');
+  const withAgents = !!AN_PAGES[AN.sub]?.agentFilter;
+  const pop = document.createElement('div');
+  pop.className = 'an-pop an-filter-pop';
+  pop.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  btn.parentElement.appendChild(pop);
+  let phones = State.phones || [];
+  try { if (!phones.length) phones = State.phones = await Api.phones.list(); } catch (_) {}
+  if (withAgents && !AN.agents) { try { AN.agents = await Api.auth.agents(); } catch (_) { AN.agents = []; } }
+  if (!pop.isConnected) return;
+  const opt = (kind, id, label, sub, checked) => `
+    <label class="an-check"><input type="checkbox" data-kind="${kind}" value="${id}"${checked ? ' checked' : ''}>
+      <span class="an-check-text"><span>${esc(label)}</span>${sub ? `<small>${esc(sub)}</small>` : ''}</span></label>`;
+  pop.innerHTML = `
+    <div class="an-pop-label">Phones</div>
+    <div class="an-check-list">${phones.map(p => opt('phone', p.id, p.name || 'Phone', _dashFmtPhone(p.phone_number), AN.phoneIds.includes(p.id))).join('') || '<div class="an-pop-empty">No phones connected</div>'}</div>
+    ${withAgents ? `<div class="an-pop-sep"></div><div class="an-pop-label">Members</div>
+      <div class="an-check-list">${(AN.agents || []).map(a => opt('agent', a.id, a.name, a.email, AN.agentIds.includes(a.id))).join('') || '<div class="an-pop-empty">No members</div>'}</div>` : ''}
+    <div class="an-pop-foot">
+      <button class="btn btn-secondary btn-sm" id="an-filter-clear">Clear</button>
+      <button class="btn btn-primary btn-sm" id="an-filter-apply">Apply</button>
+    </div>`;
+  pop.querySelector('#an-filter-clear').addEventListener('click', () => {
+    AN.phoneIds = []; if (withAgents) AN.agentIds = [];
+    _anClosePops(); _anFiltersChanged();
+  });
+  pop.querySelector('#an-filter-apply').addEventListener('click', () => {
+    const vals = kind => [...pop.querySelectorAll(`input[data-kind="${kind}"]:checked`)].map(i => Number(i.value));
+    AN.phoneIds = vals('phone');
+    if (withAgents) AN.agentIds = vals('agent');
+    _anClosePops(); _anFiltersChanged();
+  });
+}
+
+function _anFiltersChanged() {
+  const btn = document.getElementById('an-filter-btn');
+  if (btn) {
+    btn.querySelector('.an-count')?.remove();
+    const n = AN.phoneIds.length + (AN_PAGES[AN.sub]?.agentFilter ? AN.agentIds.length : 0);
+    if (n) btn.insertAdjacentHTML('beforeend', `<span class="an-count">${n}</span>`);
+  }
+  _anLoad();
+}
+
+function _anBindChatPicker(host) {
+  const wrap = host.querySelector('#an-chatpick');
+  const input = host.querySelector('#an-chat-input');
+  let timer = null, seq = 0;
+  const close = () => document.getElementById('an-chat-list')?.remove();
+  const show = async () => {
+    const my = ++seq;
+    let list = [];
+    try { list = await Api.analytics.chatOptions(input.value.trim()); } catch (_) {}
+    if (my !== seq || !input.isConnected) return;  // superseded, or blurred (blur bumps seq)
+    close();
+    const box = document.createElement('div');
+    box.id = 'an-chat-list';
+    box.className = 'an-pop an-chat-list';
+    box.setAttribute('role', 'listbox');
+    box.innerHTML = list.length ? list.map(c => `
+      <button class="an-pop-item an-chat-opt" role="option" data-id="${c.id}" data-name="${esc(displayName(c.name))}">
+        <span class="agent-avatar xs" style="background:${safeColor(avatarColor(c.name))}">${esc(initials(displayName(c.name)))}</span>
+        <span class="an-chat-name">${esc(displayName(c.name))}</span>${c.is_group ? '<small>Group</small>' : ''}
+      </button>`).join('') : '<div class="an-pop-empty">No chats found</div>';
+    wrap.appendChild(box);
+    box.querySelectorAll('.an-chat-opt').forEach(b => b.addEventListener('mousedown', e => {
+      e.preventDefault();
+      AN.chat = { id: Number(b.dataset.id), name: b.dataset.name };
+      input.value = AN.chat.name;
+      wrap.classList.add('has-chat');
+      close(); input.blur(); _anLoad();
+    }));
+  };
+  input.addEventListener('focus', () => { input.select(); show(); });
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(show, 200); });
+  input.addEventListener('blur', () => setTimeout(() => {
+    seq++;
+    close();
+    input.value = AN.chat ? AN.chat.name : '';
+  }, 150));
+  host.querySelector('#an-chat-clear').addEventListener('click', () => {
+    AN.chat = null; input.value = ''; wrap.classList.remove('has-chat'); _anLoad();
+  });
+}
+
+// Floating tooltip for any [data-tip] inside the analytics shell
+function _anBindTooltips(root) {
+  const tip = () => document.getElementById('an-tooltip');
+  const showTip = el => {
+    const t = tip(); const text = el.getAttribute('data-tip');
+    if (!t || !text) return;
+    t.textContent = text;
+    t.classList.add('show');
+    const r = el.getBoundingClientRect(), w = t.offsetWidth, h = t.offsetHeight;
+    let left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+    let top = r.bottom + 8;
+    if (top + h > window.innerHeight - 8) top = r.top - h - 8;
+    t.style.left = left + 'px'; t.style.top = top + 'px';
+  };
+  const hide = () => tip()?.classList.remove('show');
+  root.addEventListener('mouseover', e => { const el = e.target.closest('[data-tip]'); if (el) showTip(el); });
+  root.addEventListener('mouseout', e => { if (e.target.closest('[data-tip]')) hide(); });
+  root.addEventListener('focusin', e => { const el = e.target.closest('[data-tip]'); if (el) showTip(el); });
+  root.addEventListener('focusout', hide);
+}
+
+async function _anLoad() {
+  const sub = AN.sub;
+  const body = document.getElementById('an-body');
+  if (!body || sub === 'exports') return;
+  const my = ++AN.seq;
+  body.classList.add('is-loading');
+  if (!AN.data) body.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  try {
+    const data = await Api.analytics[sub](_anQuery());
+    if (my !== AN.seq || AN.sub !== sub || !document.getElementById('an-body')) return;
+    AN.data = data;
+    _anDestroyCharts();
+    body.innerHTML = _AN_RENDER[sub].html(data);
+    _AN_RENDER[sub].after?.(data, body);
+  } catch (e) {
+    if (my !== AN.seq) return;
+    if (e.message === 'Chat not found' && AN.chat) {
+      AN.chat = null;
+      const inp = document.getElementById('an-chat-input'); if (inp) inp.value = '';
+      document.getElementById('an-chatpick')?.classList.remove('has-chat');
+    }
+    body.innerHTML = `<div class="an-card an-error">Could not load analytics — ${esc(e.message || 'request failed')}</div>`;
+  } finally {
+    if (my === AN.seq) body.classList.remove('is-loading');
+  }
+}
+
+// ── Shared pieces ── //
+function _anStat(icon, tone, label, value, tip) {
+  return `
+    <div class="an-card an-stat">
+      <div class="an-stat-head">
+        <span class="an-stat-ic tone-${tone}">${anIcon(icon)}</span>
+        <span class="an-stat-label">${esc(label)}</span>
+        ${tip ? `<span class="an-i" tabindex="0" data-tip="${esc(tip)}">${anIcon('info')}</span>` : ''}
+      </div>
+      <div class="an-stat-val">${value}</div>
+    </div>`;
+}
+
+function _anAvatar(row, total) {
+  if (total) return `<span class="an-avatar an-avatar-total">${anIcon('team')}</span>`;
+  const bg = row.avatar_color ? safeColor(row.avatar_color) : safeColor(avatarColor(row.name));
+  return `<span class="an-avatar" style="background:${bg}">${esc(initials(row.name))}${row.online ? '<i class="an-dot" title="Online"></i>' : ''}</span>`;
+}
+
+function _anUserCell(row, total) {
+  if (total) return `<div class="an-user">${_anAvatar(null, true)}<div><div class="an-user-name">Total</div><div class="an-user-sub">All members</div></div></div>`;
+  return `<div class="an-user">${_anAvatar(row)}<div class="an-user-meta"><div class="an-user-name">${esc(row.name)}</div>${row.email ? `<div class="an-user-sub">${esc(row.email)}</div>` : ''}</div></div>`;
+}
+
+function _anTh(label, tip, cls = '') {
+  return `<th class="${cls}">${esc(label)}${tip ? ` <span class="an-i" tabindex="0" data-tip="${esc(tip)}">${anIcon('info')}</span>` : ''}</th>`;
+}
+
+function _anEmptyRow(cols) {
+  return `<tr class="an-empty-row"><td colspan="${cols}">No data available</td></tr>`;
+}
+
+function _anFrtTip(d) {
+  return d.frt_basis === 'all_inbound'
+    ? 'No incoming message in this range was flagged, so this is measured from any incoming message to the next reply.'
+    : 'Median time from a flagged incoming message to the next reply in that chat.';
+}
+const _AN_NO_FRT = 'No replies to measure in this range.';
+
+// ── Chart (Chart.js; colours re-read from CSS variables on every build) ── //
+function _anCss(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+function _anBucketLabel(iso, bucket) {
+  const d = new Date(iso);
+  const day = `${String(d.getDate()).padStart(2, '0')}-${_AN_MON[d.getMonth()]}`;
+  return bucket === 'hour' ? [day, `${String(d.getHours()).padStart(2, '0')}:00`] : [day];
+}
+
+function _anChartCard(id, title, series, opts = {}) {
+  return `
+    <div class="an-card an-chart-card${opts.cls ? ' ' + opts.cls : ''}">
+      <div class="an-card-title">${esc(title)}${opts.tip ? ` <span class="an-i" tabindex="0" data-tip="${esc(opts.tip)}">${anIcon('info')}</span>` : ''}</div>
+      <div class="an-chart-box"><canvas id="${id}" role="img" aria-label="${esc(title)} chart"></canvas></div>
+      <div class="an-legend" data-for="${id}">
+        ${series.map((s, i) => `
+          <button class="an-legend-item" data-i="${i}" aria-pressed="true">
+            <i class="an-legend-sq" style="background:var(${s.color})"></i>
+            <span class="an-legend-text"><span>${esc(s.label)}</span>${s.desc ? `<small>${esc(s.desc)}</small>` : ''}</span>
+          </button>`).join('')}
       </div>
     </div>`;
-  try {
-    const phones = await Api.phones.list().catch(() => []);
-    State.phones = phones;
-    const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+}
 
-    if (!phoneConnected) {
-      const body = document.getElementById('analytics-body');
-      if (body) {
-        body.innerHTML = `<div class="empty-state whatsapp-disconnected-thread" style="padding:4rem 2rem">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.25;color:var(--text-3)">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-            <path d="M2 2l20 20"/>
-          </svg>
-          <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0.5rem 0 0.25rem">WhatsApp Disconnected</p>
-          <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to see analytics data.</span>
-          <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
-        </div>`;
-      }
-      return;
-    }
-
-    const [dash, msg, tkt, agents] = await Promise.all([
-      Api.analytics.dashboard(),
-      Api.analytics.messages(30),
-      Api.analytics.tickets(),
-      Api.analytics.agents(30),
-    ]);
-    const body = document.getElementById('analytics-body');
-    body.innerHTML = `
-      <div class="metrics-grid">
-        <div class="metric-card metric-accent">
-          <div class="metric-label">Total Chats</div>
-          <div class="metric-value">${dash.total_chats ?? 0}</div>
-          <div class="metric-sub">All conversations</div>
-        </div>
-        <div class="metric-card metric-blue">
-          <div class="metric-label">Messages (30d)</div>
-          <div class="metric-value">${(msg.outgoing_messages ?? 0) + (msg.incoming_messages ?? 0)}</div>
-          <div class="metric-sub">${msg.outgoing_messages ?? 0} sent · ${msg.incoming_messages ?? 0} received</div>
-        </div>
-        <div class="metric-card metric-orange">
-          <div class="metric-label">Open Tickets</div>
-          <div class="metric-value">${tkt.open ?? 0}</div>
-          <div class="metric-sub">${tkt.in_progress ?? 0} in progress</div>
-        </div>
-        <div class="metric-card metric-green">
-          <div class="metric-label">Resolved Tickets</div>
-          <div class="metric-value">${tkt.resolved ?? 0}</div>
-          <div class="metric-sub">${tkt.sla_breached ?? 0} SLA breached</div>
-        </div>
-        <div class="metric-card metric-accent">
-          <div class="metric-label">Unread Chats</div>
-          <div class="metric-value">${dash.unread_chats ?? 0}</div>
-        </div>
-        <div class="metric-card metric-orange">
-          <div class="metric-label">Flagged Chats</div>
-          <div class="metric-value">${dash.flagged_chats ?? 0}</div>
-        </div>
-      </div>
-      <div class="analytics-section">
-        <div class="content-card">
-          <div class="card-header">Agent Performance (30d)</div>
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead><tr><th>Agent</th><th>Messages Sent</th><th>Chats Assigned</th><th>Open Tickets</th></tr></thead>
-              <tbody>${(agents||[]).map(a => `
-                <tr>
-                  <td style="font-weight:600">${esc(a.agent_name||'Agent '+a.agent_id)}</td>
-                  <td>${a.messages_sent ?? 0}</td>
-                  <td>${a.chats_assigned ?? 0}</td>
-                  <td>${a.open_tickets ?? 0}</td>
-                </tr>`).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--text-3);padding:1.5rem">No data yet</td></tr>'}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>`;
-  } catch(e) {
-    document.getElementById('analytics-body').innerHTML = `<div class="loading-center text-muted">Could not load analytics</div>`;
+function _anExternalTooltip(context) {
+  const { chart, tooltip } = context;
+  let el = chart.canvas.parentNode.querySelector('.an-chart-tip');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'an-chart-tip';
+    chart.canvas.parentNode.appendChild(el);
   }
+  if (tooltip.opacity === 0) { el.style.opacity = 0; return; }
+  const title = (tooltip.title || []).join(' ');
+  el.innerHTML = `<div class="an-chart-tip-title">${esc(title)}</div>` + (tooltip.dataPoints || []).map(p => `
+    <div class="an-chart-tip-row"><i style="background:${esc(p.dataset.borderColor)}"></i>
+      <span>${esc(p.dataset.label)}</span><b>${Number(p.raw).toLocaleString('en-IN')}</b></div>`).join('');
+  el.style.opacity = 1;
+  const box = chart.canvas.parentNode;
+  const w = el.offsetWidth;
+  let left = tooltip.caretX + 14;
+  if (left + w > box.clientWidth) left = tooltip.caretX - w - 14;
+  el.style.left = Math.max(0, left) + 'px';
+  el.style.top = Math.max(0, Math.min(tooltip.caretY - el.offsetHeight / 2, box.clientHeight - el.offsetHeight)) + 'px';
+}
+
+function _anBuildChart(id, series, labels, bucket) {
+  const canvas = document.getElementById(id);
+  if (!canvas || typeof Chart === 'undefined') return;
+  const grid = _anCss('--border', '#e5e7eb');
+  const tick = _anCss('--text-3', '#9ca3af');
+  const labelsFmt = labels.map(l => _anBucketLabel(l, bucket));
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: labelsFmt,
+      datasets: series.map(s => {
+        const c = _anCss(s.color, '#15803d');
+        return {
+          label: s.label, data: s.data, borderColor: c, backgroundColor: c,
+          borderWidth: 1.6, pointRadius: 0, pointHoverRadius: 3.5, pointHitRadius: 8, tension: 0.3, cubicInterpolationMode: 'monotone', fill: false,
+        };
+      }),
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: { enabled: false, external: _anExternalTooltip,
+                   callbacks: { title: items => (items[0]?.label || []).toString().replace(',', ' ') } },
+      },
+      scales: {
+        x: {
+          grid: { display: false }, border: { color: grid },
+          ticks: { color: tick, font: { family: 'Inter', size: 11 }, maxRotation: 0, autoSkip: true, autoSkipPadding: 18 },
+        },
+        y: {
+          beginAtZero: true, grid: { color: grid }, border: { display: false, dash: [4, 4] },
+          ticks: { color: tick, font: { family: 'Inter', size: 11 }, precision: 0, padding: 8 },
+        },
+      },
+    },
+  });
+  AN.charts.push(chart);
+  const legend = document.querySelector(`.an-legend[data-for="${id}"]`);
+  legend?.querySelectorAll('.an-legend-item').forEach(b => b.addEventListener('click', () => {
+    const i = Number(b.dataset.i);
+    const vis = chart.isDatasetVisible(i);
+    chart.setDatasetVisibility(i, !vis);
+    b.setAttribute('aria-pressed', String(!vis));
+    b.classList.toggle('off', vis);
+    chart.update();
+  }));
+}
+
+// Rebuild charts when the theme flips so they pick up the new CSS variable colours
+new MutationObserver(() => {
+  if (State.currentView === 'analytics' && AN.data && AN.charts.length) {
+    const body = document.getElementById('an-body');
+    if (body) { _anDestroyCharts(); body.innerHTML = _AN_RENDER[AN.sub].html(AN.data); _AN_RENDER[AN.sub].after?.(AN.data, body); }
+  }
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+// ── Page renderers ── //
+const _AN_UPTIME_TIP = 'Presence tracking has no data for this range (it records time with Hyperscope open).';
+
+const _AN_RENDER = {
+  team: {
+    html(d) {
+      const t = d.total || {};
+      const frtTip = _anFrtTip(d);
+      const unattr = t.unattributed_messages
+        ? `${t.unattributed_messages.toLocaleString('en-IN')} message(s) were sent from the phone, bulk jobs, automations or the AI agent — they count in Total but not for a member.`
+        : 'Outgoing messages. Only messages sent from Hyperscope are attributed to a member.';
+      const row = (r, total) => `
+        <tr class="${total ? 'an-total-row' : ''}">
+          <td>${_anUserCell(r, total)}</td>
+          <td>${_anNum(r.active_chats)}</td>
+          <td>${_anNum(r.messages_sent)}</td>
+          <td>${_anNum(r.chats_initiated)}</td>
+          <td>${_anNum(r.tickets_closed)}</td>
+          <td>${_anNum(r.responses_flagged)}</td>
+          <td>${_anDur(r.median_frt_seconds, _AN_NO_FRT)}</td>
+          <td>${_anDur(r.uptime_seconds, _AN_UPTIME_TIP)}</td>
+        </tr>`;
+      return `
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead><tr>
+              ${_anTh('User')}
+              ${_anTh('Active chats', 'Chats with at least one message in range (for a member: chats they sent a message in).')}
+              ${_anTh('Messages sent', unattr)}
+              ${_anTh('Chats initiated', 'Chats whose first message in range was outgoing.')}
+              ${_anTh('Tickets closed', 'Tickets moved to resolved or closed in range (per member: who closed them).')}
+              ${_anTh('Responses (to flagged messages)', 'Replies to flagged incoming messages.')}
+              ${_anTh('Median first response time', frtTip)}
+              ${_anTh('User uptime', 'Time with Hyperscope open (at least one live connection) in range.')}
+            </tr></thead>
+            <tbody>${row(t, true)}${(d.rows || []).map(r => row(r)).join('') || _anEmptyRow(8)}</tbody>
+          </table></div>
+        </div>`;
+    },
+  },
+
+  phones: {
+    html(d) {
+      const t = d.total || {};
+      const row = (r, total) => `
+        <tr class="${total ? 'an-total-row' : ''}">
+          <td>${total
+            ? `<div class="an-user"><span class="an-avatar an-avatar-total">${anIcon('phone')}</span><div><div class="an-user-name">Total</div><div class="an-user-sub">All phones</div></div></div>`
+            : `<div class="an-user"><span class="an-avatar an-avatar-phone">${anIcon('phone')}</span><div class="an-user-meta"><div class="an-user-name">${esc(r.name || 'Phone')}</div><div class="an-user-sub">${esc(_dashFmtPhone(r.phone_number) || r.phone_number || '')}</div></div></div>`}</td>
+          <td>${_anNum(r.new_chats)}</td>
+          <td>${_anNum(r.messages_sent)}</td>
+          <td>${_anNum(r.responses_flagged)}</td>
+          <td>${_anDur(r.median_frt_seconds, _AN_NO_FRT)}</td>
+        </tr>`;
+      return `
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead><tr>
+              ${_anTh('Phone')}
+              ${_anTh('New chats created', 'Chats that first reached Hyperscope in range.')}
+              ${_anTh('Messages sent', 'All outgoing messages from this number.')}
+              ${_anTh('Responses (to flagged messages)', 'Replies to flagged incoming messages.')}
+              ${_anTh('Median first response time', _anFrtTip(d))}
+            </tr></thead>
+            <tbody>${row(t, true)}${(d.rows || []).map(r => row(r)).join('') || _anEmptyRow(5)}</tbody>
+          </table></div>
+        </div>`;
+    },
+  },
+
+  chats: {
+    html(d) {
+      const t = d.total || {};
+      return `
+        <div class="an-split">
+          <div class="an-stack">
+            ${_anStat('chats', 'green', 'Total new chats', _anNum(t.new_chats), 'One-to-one chats and groups that first reached Hyperscope in range.')}
+            ${_anStat('comment', 'blue', 'New one-to-one chats', _anNum(t.new_individual), 'New chats with a single contact.')}
+            ${_anStat('group', 'navy', 'New groups', _anNum(t.new_groups), 'New group chats.')}
+          </div>
+          ${_anChartCard('an-chart', 'New chats created', [
+            { label: 'Individual chats', color: '--an-green' }, { label: 'Group chats', color: '--an-navy' }])}
+        </div>
+        <div class="an-card an-table-card">
+          <div class="an-card-title">Most active chats</div>
+          <div class="an-table-wrap"><table class="an-table an-table-compact">
+            <thead><tr>${_anTh('Chat name')}${_anTh('Total messages', '', 'num')}</tr></thead>
+            <tbody>${(d.most_active || []).map(c => `
+              <tr><td><div class="an-user"><span class="an-avatar sm" style="background:${safeColor(avatarColor(c.name))}">${esc(initials(displayName(c.name)))}</span>
+                <div class="an-user-name">${esc(displayName(c.name))}${c.is_group ? ' <small class="an-tag">Group</small>' : ''}</div></div></td>
+                <td class="num">${_anNum(c.messages)}</td></tr>`).join('') || _anEmptyRow(2)}</tbody>
+          </table></div>
+        </div>`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Individual chats', color: '--an-green', data: s.individual || [] },
+        { label: 'Group chats', color: '--an-navy', data: s.group || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+
+  tickets: {
+    html(d) {
+      const t = d.total || {};
+      const age = r => r.unresolved_age || {};
+      const row = (r, total) => `
+        <tr class="${total ? 'an-total-row' : ''}">
+          <td>${total ? _anUserCell(null, true) : _anUserCell(r)}</td>
+          <td>${_anNum(r.total)}</td>
+          <td>${_anNum(r.open)}</td>
+          <td>${_anNum(r.closed)}</td>
+          <td>${_anDur(r.avg_resolution_seconds, 'No tickets resolved yet.')}</td>
+          <td class="an-sep-l">${_anNum(age(r).lt_1h)}</td>
+          <td>${_anNum(age(r).lt_24h)}</td>
+          <td>${_anNum(age(r).lt_7d)}</td>
+          <td>${_anNum(age(r).gt_7d)}</td>
+        </tr>`;
+      const totalRow = { total: t.total, open: t.unresolved, closed: t.resolved,
+                         avg_resolution_seconds: t.avg_resolution_seconds, unresolved_age: t.unresolved_age };
+      return `
+        <div class="an-stats an-stats-5">
+          ${_anStat('ticket', 'navy', 'Total tickets', _anNum(t.total), 'Tickets created in range.')}
+          ${_anStat('clock', 'amber', 'Unresolved tickets', _anNum(t.unresolved), 'Tickets created in range that are still open or in progress.')}
+          ${_anStat('check', 'green', 'Resolved tickets', _anNum(t.resolved), 'Tickets created in range that are resolved or closed.')}
+          ${_anStat('unassigned', 'grey', 'Unassigned', _anNum(t.unassigned), 'Unresolved tickets created in range with no assignee.')}
+          ${_anStat('hourglass', 'blue', 'Average resolution time', _anDur(t.avg_resolution_seconds, 'No tickets resolved in this range.'), 'Average time from creation to resolution for tickets resolved in range.')}
+        </div>
+        ${_anChartCard('an-chart', 'Ticket history', [
+          { label: 'Unresolved', color: '--an-peach', desc: 'Open or in-progress tickets at the end of each period' },
+          { label: 'Created', color: '--an-red', desc: 'Tickets created in each period' },
+          { label: 'Closed', color: '--an-green', desc: 'Tickets resolved or closed in each period' }], { cls: 'an-chart-wide' })}
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead>
+              <tr class="an-group-head"><th colspan="5"></th><th colspan="4" class="an-sep-l">Unresolved tickets by age</th></tr>
+              <tr>
+                ${_anTh('User')}
+                ${_anTh('Total', 'Tickets created in range, by assignee.')}
+                ${_anTh('Open / In progress', '', 'h-amber')}
+                ${_anTh('Closed', '', 'h-green')}
+                ${_anTh('Avg. resolution time', '', 'h-blue')}
+                ${_anTh('< 1 hour', '', 'an-sep-l')}${_anTh('< 24 hours')}${_anTh('< 7 days')}${_anTh('> 7 days')}
+              </tr>
+            </thead>
+            <tbody>${row(totalRow, true)}${(d.rows || []).map(r => row(r)).join('') || _anEmptyRow(9)}</tbody>
+          </table></div>
+        </div>`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Unresolved', color: '--an-peach', data: s.unresolved || [] },
+        { label: 'Created', color: '--an-red', data: s.created || [] },
+        { label: 'Closed', color: '--an-green', data: s.closed || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+
+  messages: {
+    html(d) {
+      const t = d.total || {};
+      const frtTip = _anFrtTip(d);
+      const row = r => `
+        <tr>
+          <td>${_anUserCell(r)}</td>
+          <td>${_anNum(r.active_chats)}</td>
+          <td>${_anNum(r.messages_sent)}</td>
+          <td>${_anNum(r.responses_flagged)}</td>
+          <td>${_anDur(r.median_frt_seconds, _AN_NO_FRT)}</td>
+        </tr>`;
+      return `
+        <div class="an-stats an-stats-5">
+          ${_anStat('chats', 'green', 'Active chats', _anNum(t.active_chats), 'Chats with at least one message in range.')}
+          ${_anStat('out', 'blue', 'Outgoing messages', _anNum(t.outgoing), 'Messages sent from your numbers.')}
+          ${_anStat('in', 'navy', 'Incoming messages', _anNum(t.incoming), 'Messages received on your numbers.')}
+          ${_anStat('flag', 'red', 'Responses to flagged messages', _anNum(t.responses_flagged), 'Replies to flagged incoming messages.')}
+          ${_anStat('stopwatch', 'amber', 'Median first response time', _anDur(t.median_frt_seconds, _AN_NO_FRT), frtTip)}
+        </div>
+        ${_anChartCard('an-chart', 'Message metrics overview', [
+          { label: 'Active chats', color: '--an-green' }, { label: 'Outgoing messages', color: '--an-blue' },
+          { label: 'Incoming messages', color: '--an-navy' }, { label: 'Responses to flagged messages', color: '--an-red' }], { cls: 'an-chart-wide' })}
+        <div class="an-card an-table-card">
+          <div class="an-table-wrap"><table class="an-table">
+            <thead><tr>
+              ${_anTh('User')}
+              ${_anTh('# Active chats', 'Chats the member sent a message in.')}
+              ${_anTh('# Messages sent', 'Messages the member sent from Hyperscope.')}
+              ${_anTh('# Responses (to flagged messages)')}
+              ${_anTh('Median first response time (to flagged messages)', frtTip)}
+            </tr></thead>
+            <tbody>${(d.rows || []).map(row).join('') || _anEmptyRow(5)}</tbody>
+          </table></div>
+        </div>`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Active chats', color: '--an-green', data: s.active_chats || [] },
+        { label: 'Outgoing messages', color: '--an-blue', data: s.outgoing || [] },
+        { label: 'Incoming messages', color: '--an-navy', data: s.incoming || [] },
+        { label: 'Responses to flagged messages', color: '--an-red', data: s.responses_flagged || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+
+  members: {
+    html(d) {
+      const t = d.total || {};
+      return `
+        <div class="an-stats an-stats-3">
+          ${_anStat('userPlus', 'green', 'Members joined', _anNum(t.joined), 'Members who joined a group or were added to one.')}
+          ${_anStat('userMinus', 'navy', 'Members left', _anNum(t.left), 'Members who left a group.')}
+          ${_anStat('userX', 'red', 'Members removed', _anNum(t.removed), 'Members removed from a group by an admin.')}
+        </div>
+        ${_anChartCard('an-chart', 'Member activity', [
+          { label: 'Joins', color: '--an-green' }, { label: 'Leaves', color: '--an-navy' }, { label: 'Removes', color: '--an-red' }], { cls: 'an-chart-wide' })}`;
+    },
+    after(d) {
+      const s = d.series || {};
+      _anBuildChart('an-chart', [
+        { label: 'Joins', color: '--an-green', data: s.joined || [] },
+        { label: 'Leaves', color: '--an-navy', data: s.left || [] },
+        { label: 'Removes', color: '--an-red', data: s.removed || [] },
+      ], s.buckets || [], d.range?.bucket);
+    },
+  },
+};
+
+// ── Page CSV export (what the page shows) ── //
+function _anExportCsv() {
+  const d = AN.data;
+  if (!d) return toast('Nothing to export yet', 'error');
+  const sec = v => (v == null ? '' : Math.round(v));
+  const series = (s, cols) => [['Period start', ...cols.map(c => c[1])],
+    ...(s.buckets || []).map((b, i) => [new Date(b).toLocaleString('en-GB'), ...cols.map(c => (s[c[0]] || [])[i] ?? 0)])];
+  let rows;
+  if (AN.sub === 'team') {
+    const h = ['User', 'Email', 'Active chats', 'Messages sent', 'Chats initiated', 'Tickets closed', 'Responses (to flagged messages)', 'Median first response time (s)', 'User uptime (s)'];
+    const r = (x, name, email) => [name, email, x.active_chats, x.messages_sent, x.chats_initiated, x.tickets_closed, x.responses_flagged, sec(x.median_frt_seconds), sec(x.uptime_seconds)];
+    rows = [h, r(d.total, 'Total', 'All members'), ...d.rows.map(x => r(x, x.name, x.email))];
+  } else if (AN.sub === 'phones') {
+    const r = (x, name, num) => [name, num, x.new_chats, x.messages_sent, x.responses_flagged, sec(x.median_frt_seconds)];
+    rows = [['Phone', 'Number', 'New chats created', 'Messages sent', 'Responses (to flagged messages)', 'Median first response time (s)'],
+            r(d.total, 'Total', ''), ...d.rows.map(x => r(x, x.name, x.phone_number))];
+  } else if (AN.sub === 'chats') {
+    rows = [...series(d.series, [['individual', 'Individual chats'], ['group', 'Group chats']]), [],
+            ['Most active chats', 'Total messages'], ...d.most_active.map(c => [displayName(c.name), c.messages])];
+  } else if (AN.sub === 'tickets') {
+    const a = x => x.unresolved_age || {};
+    const r = (x, name) => [name, x.total, x.open, x.closed, sec(x.avg_resolution_seconds), a(x).lt_1h, a(x).lt_24h, a(x).lt_7d, a(x).gt_7d];
+    const t = d.total;
+    rows = [['User', 'Total', 'Open / In progress', 'Closed', 'Avg. resolution time (s)', 'Unresolved < 1 hour', '< 24 hours', '< 7 days', '> 7 days'],
+            r({ total: t.total, open: t.unresolved, closed: t.resolved, avg_resolution_seconds: t.avg_resolution_seconds, unresolved_age: t.unresolved_age }, 'Total'),
+            ...d.rows.map(x => r(x, x.name)), [],
+            ...series(d.series, [['unresolved', 'Unresolved'], ['created', 'Created'], ['closed', 'Closed']])];
+  } else if (AN.sub === 'messages') {
+    rows = [['User', 'Email', '# Active chats', '# Messages sent', '# Responses (to flagged messages)', 'Median first response time (s)'],
+            ...d.rows.map(x => [x.name, x.email, x.active_chats, x.messages_sent, x.responses_flagged, sec(x.median_frt_seconds)]), [],
+            ...series(d.series, [['active_chats', 'Active chats'], ['outgoing', 'Outgoing messages'], ['incoming', 'Incoming messages'], ['responses_flagged', 'Responses to flagged messages']])];
+  } else if (AN.sub === 'members') {
+    rows = series(d.series, [['joined', 'Joins'], ['left', 'Leaves'], ['removed', 'Removes']]);
+  } else return;
+  const csv = rows.map(csvRow).join('\r\n');
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = `${AN.sub}-analytics_${AN.range.from}_to_${AN.range.to}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ── Data exports ── //
+const AN_EXPORTS = [
+  { key: 'chats',       icon: 'chats',    title: 'Chats export',          desc: 'All chats with type, phone, assignee, labels and custom properties.', range: 'Last activity', rangeOptional: true },
+  { key: 'tickets',     icon: 'ticket',   title: 'Tickets export',        desc: 'Tickets with status, priority, assignee, labels and SLA details.', range: 'Created', rangeOptional: true },
+  { key: 'messages',    icon: 'message',  title: 'Messages export',       desc: 'Message history with direction, sender and the member who sent it.', range: 'Sent', flagged: true },
+  { key: 'notes',       icon: 'note',     title: 'Private notes export',  desc: 'Internal team notes left on chats, with author and time.', range: 'Created', rangeOptional: true },
+  { key: 'phones',      icon: 'phone',    title: 'Phones export',         desc: 'Connected WhatsApp numbers with their session and status.' },
+  { key: 'chatActions', icon: 'actions',  title: 'Chat actions export',   desc: 'Group membership events — joins, adds, leaves, removals and admin changes.', range: 'Happened' },
+  { key: 'contacts',    icon: 'contacts', title: 'Contacts export',       desc: 'Your contact book with labels and custom properties (masked numbers stay masked).' },
+  { key: 'logs',        icon: 'logs',     title: 'Activity logs export',  desc: 'Full audit trail of actions taken in the workspace.', range: 'Happened' },
+];
+
+function _anRenderExports(host) {
+  const admin = isAdmin();
+  host.innerHTML = `
+    <div class="an-page an-exports">
+      <div class="an-title">${anIcon('export', 'an-title-ic')}<h1>Data exports</h1></div>
+      <p class="an-exports-sub">Download your workspace data as CSV files.${admin ? '' : ' Only admins can export data.'}</p>
+      <div class="an-export-list">
+        ${AN_EXPORTS.map(x => `
+          <button class="an-card an-export-card" data-key="${x.key}"${admin ? '' : ' disabled aria-disabled="true"'}>
+            <span class="an-export-ic">${anIcon(x.icon)}</span>
+            <span class="an-export-text"><span class="an-export-title">${esc(x.title)}</span><span class="an-export-desc">${esc(x.desc)}</span></span>
+            ${anIcon('right', 'an-export-chev')}
+          </button>`).join('')}
+      </div>
+    </div>`;
+  if (!admin) return;
+  host.querySelectorAll('.an-export-card').forEach(b => b.addEventListener('click', () =>
+    _anExportModal(AN_EXPORTS.find(x => x.key === b.dataset.key))));
+}
+
+function _anExportModal(x) {
+  const today = new Date();
+  const from = _anYmd(_anAddDays(today, -29)), to = _anYmd(today);
+  const rangeHTML = x.range ? `
+    ${x.rangeOptional ? `<label class="an-check an-check-inline"><input type="checkbox" id="anx-all" checked><span>All time</span></label>` : ''}
+    <div class="an-custom an-modal-range" id="anx-range"${x.rangeOptional ? ' hidden' : ''}>
+      <label>${esc(x.range)} from<input type="date" id="anx-from" value="${from}" max="${to}"></label>
+      <label>To<input type="date" id="anx-to" value="${to}" max="${to}"></label>
+    </div>` : '<p class="an-modal-note">Exports every record — no date range needed.</p>';
+  showModal(x.title, `
+    <div class="an-modal">
+      <p class="an-modal-desc">${esc(x.desc)}</p>
+      ${rangeHTML}
+      ${x.flagged ? '<label class="an-check an-check-inline"><input type="checkbox" id="anx-flagged"><span>Flagged messages only</span></label>' : ''}
+      <div class="an-modal-foot">
+        <button class="btn btn-secondary btn-sm" id="anx-cancel">Cancel</button>
+        <button class="btn btn-primary btn-sm" id="anx-go">${anIcon('download')} Download CSV</button>
+      </div>
+    </div>`);
+  const all = document.getElementById('anx-all');
+  all?.addEventListener('change', () => { document.getElementById('anx-range').hidden = all.checked; });
+  document.getElementById('anx-cancel').addEventListener('click', () => closeModal());
+  document.getElementById('anx-go').addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    const q = {};
+    if (x.range && !(all && all.checked)) {
+      const f = document.getElementById('anx-from').value, t = document.getElementById('anx-to').value;
+      if (!f || !t || f > t) return toast('Pick a valid date range', 'error');
+      q.from = _anParseYmd(f).toISOString();
+      q.to = _anAddDays(_anParseYmd(t), 1).toISOString();
+    }
+    if (x.flagged && document.getElementById('anx-flagged').checked) q.flagged_only = 'true';
+    btn.disabled = true;
+    try { await Api.exports[x.key](q); toast('Export downloaded', 'success'); closeModal(); }
+    catch (err) { toast(err.message, 'error'); }
+    finally { btn.disabled = false; }
+  });
 }
 
 // ── AI AGENT VIEW ───────────────────────────────────────────────── //
@@ -2530,13 +5998,13 @@ async function renderAutomation() {
     <div class="flex-col h-full" style="overflow-y:auto">
       <div class="section-header">
         <h2>Automation Rules</h2>
-        <div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-rule-btn">+ New Rule</button></div>
+        ${isAdmin() ? `<div class="header-actions" style="margin-left:auto"><button class="btn btn-primary btn-sm" id="new-rule-btn">+ New Rule</button></div>` : ''}
       </div>
       <div class="scroll-area" id="rules-list"><div class="loading-center"><div class="spinner"></div></div></div>
     </div>`;
 
   await loadRules();
-  document.getElementById('new-rule-btn').addEventListener('click', () => showRuleModal());
+  document.getElementById('new-rule-btn')?.addEventListener('click', () => showRuleModal());
 }
 
 async function loadRules() {
@@ -2566,11 +6034,11 @@ async function loadRules() {
         
         <div class="rule-controls" style="display:flex;align-items:center;gap:0.5rem;flex-shrink:0;margin-left:1.5rem">
           <span class="${pillClass(r.is_active ? 'active' : 'inactive')}" style="font-size:11.5px;font-weight:600">${r.is_active ? 'Active' : 'Paused'}</span>
-          <button class="btn btn-ghost btn-sm rule-toggle" data-rid="${r.id}" data-active="${r.is_active}" style="color:var(--accent);font-weight:600;font-size:12px;padding:4px 8px">${r.is_active ? 'Pause' : 'Resume'}</button>
+          ${isAdmin() ? `<button class="btn btn-ghost btn-sm rule-toggle" data-rid="${r.id}" data-active="${r.is_active}" style="color:var(--accent);font-weight:600;font-size:12px;padding:4px 8px">${r.is_active ? 'Pause' : 'Resume'}</button>
           <button class="btn btn-ghost btn-sm rule-del" data-rid="${r.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Rule">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
             Delete
-          </button>
+          </button>` : ''}
         </div>
       </div>`).join('');
 
@@ -2589,7 +6057,11 @@ async function loadRules() {
         catch(e) { toast(e.message, 'error'); }
       });
     });
-  } catch(_) {}
+  } catch(e) {
+    const el = document.getElementById('rules-list');
+    if (el) el.innerHTML = `<div class="loading-center text-muted">Could not load automation rules</div>`;
+    toast(e.message || 'Failed to load automation rules', 'error');
+  }
 }
 
 async function showRuleModal() {
@@ -2796,13 +6268,13 @@ async function loadBulkTab(tab) {
         <thead><tr><th>Name</th><th>Status</th><th>Recipients</th><th>Sent</th><th>Failed</th><th>Repeat</th><th>Runs</th><th>Next / Scheduled</th><th></th></tr></thead>
         <tbody>${jobs.map(j => `<tr>
           <td style="font-weight:600">${esc(j.name)}</td>
-          <td><span class="${pillClass(j.status==='done'?'resolved':j.status==='running'?'in_progress':j.status==='failed'||j.status==='cancelled'?'urgent':'open')}">${j.status}</span>${j.error_message ? ` <span title="${esc(j.error_message)}">⚠️</span>` : ''}</td>
+          <td><span class="${pillClass(j.status==='done'?'resolved':j.status==='running'?'in_progress':j.status==='failed'||j.status==='cancelled'?'urgent':'open')}">${esc(j.status)}</span>${j.error_message ? ` <span title="${esc(j.error_message)}">⚠️</span>` : ''}</td>
           <td>${(j.recipient_chat_ids||[]).length}</td>
           <td>${j.sent_count||0}</td>
           <td>${j.failed_count||0}</td>
-          <td style="font-size:12px">${esc(_bulkRepeatSummary(j))}${j.end_date ? `<div style="color:var(--text-3);font-size:11px">until ${new Date(j.end_date).toLocaleDateString()}</div>` : ''}</td>
+          <td style="font-size:12px">${esc(_bulkRepeatSummary(j))}${j.end_date ? `<div style="color:var(--text-3);font-size:11px">until ${parseServerDate(j.end_date).toLocaleDateString()}</div>` : ''}</td>
           <td>${j.runs_count||0}</td>
-          <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? new Date(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
+          <td style="font-size:12px;color:var(--text-3)">${j.scheduled_at ? parseServerDate(j.scheduled_at).toLocaleString() : 'Immediate'}</td>
           <td style="white-space:nowrap">
             <button class="btn btn-secondary btn-sm bulk-logs" data-jid="${j.id}">Logs</button>
             ${j.status==='pending' ? `<button class="btn btn-primary btn-sm bulk-send" data-jid="${j.id}">Send Now</button>
@@ -2929,9 +6401,9 @@ async function showBulkLogs(jobId) {
         <thead><tr><th>Chat</th><th>Status</th><th>Run</th><th>Time</th><th>Remarks</th></tr></thead>
         <tbody>${res.logs.map(r => `<tr>
           <td>${esc(displayName(r.chat_name) || ('#' + (r.chat_id || '?')))}</td>
-          <td><span class="${pillClass(r.status === 'sent' ? 'resolved' : 'urgent')}">${r.status}</span></td>
+          <td><span class="${pillClass(r.status === 'sent' ? 'resolved' : 'urgent')}">${esc(r.status)}</span></td>
           <td>${r.run}</td>
-          <td style="font-size:11.5px;color:var(--text-3)">${r.at ? new Date(r.at).toLocaleString() : ''}</td>
+          <td style="font-size:11.5px;color:var(--text-3)">${r.at ? parseServerDate(r.at).toLocaleString() : ''}</td>
           <td style="font-size:11.5px;color:var(--text-3)">${esc(r.error || '—')}</td>
         </tr>`).join('') || '<tr><td colspan="5" class="text-muted">No delivery logs yet — logs appear after the campaign runs</td></tr>'}</tbody>
       </table></div>
@@ -2943,7 +6415,7 @@ async function showBulkLogs(jobId) {
     document.getElementById('modal-title').textContent = `Logs — ${res.job.name}`;
     document.getElementById('bl-export').addEventListener('click', () => {
       const csv = ['chat,status,run,time,error'].concat(res.logs.map(r =>
-        `"${(r.chat_name || '').replace(/"/g, '""')}",${r.status},${r.run},${r.at || ''},"${(r.error || '').replace(/"/g, '""')}"`)).join('\n');
+        csvRow([r.chat_name || '', r.status, r.run, r.at || '', r.error || '']))).join('\n');
       const a = document.createElement('a');
       a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
       a.download = `campaign_${jobId}_logs.csv`;
@@ -3176,38 +6648,260 @@ async function showBulkModal() {
 }
 
 // ── SETTINGS VIEW ───────────────────────────────────────────────── //
-async function renderSettings() {
-  const main = document.getElementById('main-content');
-  main.innerHTML = `
-    <div class="flex-col h-full" style="overflow-y:auto">
-      <div class="section-header"><h2>Settings</h2></div>
-      <div class="tab-bar" id="settings-tabs">
-        <div class="tab active" data-tab="phones">WhatsApp</div>
-        <div class="tab" data-tab="labels">Labels</div>
-        <div class="tab" data-tab="quickreplies">Quick Replies</div>
-        <div class="tab" data-tab="agents">Agents</div>
-        <div class="tab" data-tab="properties">Custom Properties</div>
-        <div class="tab" data-tab="exports">Data Exports</div>
-      </div>
-      <div class="scroll-area" id="settings-content"></div>
-    </div>`;
+// Sub-routes: #settings/<page> (like #analytics/<page>). The shell renders a
+// grouped sub-nav; each page renders into a centred content column.
+// Pages owned by settings-org.js register as
+//   window.SettingsPages[key] = { title, render: async (containerEl) => {} }
+// and are rendered by this shell (neutral "Not available" when missing).
+window.SettingsPages = window.SettingsPages || {};
 
-  document.querySelectorAll('.tab').forEach(t => {
-    t.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-      t.classList.add('active');
-      loadSettingsTab(t.dataset.tab);
-    });
-  });
+// Settings icons: Font Awesome Free 6.7.2 (CC BY 4.0) — [viewBox width, path]
+const ST_ICONS = {
+  user: [448, 'M224 256A128 128 0 1 0 224 0a128 128 0 1 0 0 256zm-45.7 48C79.8 304 0 383.8 0 482.3C0 498.7 13.3 512 29.7 512l388.6 0c16.4 0 29.7-13.3 29.7-29.7C448 383.8 368.2 304 269.7 304l-91.4 0z'],
+  sliders: [512, 'M0 416c0 17.7 14.3 32 32 32l54.7 0c12.3 28.3 40.5 48 73.3 48s61-19.7 73.3-48L480 448c17.7 0 32-14.3 32-32s-14.3-32-32-32l-246.7 0c-12.3-28.3-40.5-48-73.3-48s-61 19.7-73.3 48L32 384c-17.7 0-32 14.3-32 32zm128 0a32 32 0 1 1 64 0 32 32 0 1 1 -64 0zM320 256a32 32 0 1 1 64 0 32 32 0 1 1 -64 0zm32-80c-32.8 0-61 19.7-73.3 48L32 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l246.7 0c12.3 28.3 40.5 48 73.3 48s61-19.7 73.3-48l54.7 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-54.7 0c-12.3-28.3-40.5-48-73.3-48zM192 128a32 32 0 1 1 0-64 32 32 0 1 1 0 64zm73.3-64C253 35.7 224.8 16 192 16s-61 19.7-73.3 48L32 64C14.3 64 0 78.3 0 96s14.3 32 32 32l86.7 0c12.3 28.3 40.5 48 73.3 48s61-19.7 73.3-48L480 128c17.7 0 32-14.3 32-32s-14.3-32-32-32L265.3 64z'],
+  clock: [512, 'M256 0a256 256 0 1 1 0 512A256 256 0 1 1 256 0zM232 120l0 136c0 8 4 15.5 10.7 20l96 64c11 7.4 25.9 4.4 33.3-6.7s4.4-25.9-6.7-33.3L280 243.2 280 120c0-13.3-10.7-24-24-24s-24 10.7-24 24z'],
+  bell: [448, 'M224 0c-17.7 0-32 14.3-32 32l0 19.2C119 66 64 130.6 64 208l0 18.8c0 47-17.3 92.4-48.5 127.6l-7.4 8.3c-8.4 9.4-10.4 22.9-5.3 34.4S19.4 416 32 416l384 0c12.6 0 24-7.4 29.2-18.9s3.1-25-5.3-34.4l-7.4-8.3C401.3 319.2 384 273.9 384 226.8l0-18.8c0-77.4-55-142-128-156.8L256 32c0-17.7-14.3-32-32-32zm45.3 493.3c12-12 18.7-28.3 18.7-45.3l-64 0-64 0c0 17 6.7 33.3 18.7 45.3s28.3 18.7 45.3 18.7s33.3-6.7 45.3-18.7z'],
+  building: [384, 'M48 0C21.5 0 0 21.5 0 48L0 464c0 26.5 21.5 48 48 48l96 0 0-80c0-26.5 21.5-48 48-48s48 21.5 48 48l0 80 96 0c26.5 0 48-21.5 48-48l0-416c0-26.5-21.5-48-48-48L48 0zM64 240c0-8.8 7.2-16 16-16l32 0c8.8 0 16 7.2 16 16l0 32c0 8.8-7.2 16-16 16l-32 0c-8.8 0-16-7.2-16-16l0-32zm112-16l32 0c8.8 0 16 7.2 16 16l0 32c0 8.8-7.2 16-16 16l-32 0c-8.8 0-16-7.2-16-16l0-32c0-8.8 7.2-16 16-16zm80 16c0-8.8 7.2-16 16-16l32 0c8.8 0 16 7.2 16 16l0 32c0 8.8-7.2 16-16 16l-32 0c-8.8 0-16-7.2-16-16l0-32zM80 96l32 0c8.8 0 16 7.2 16 16l0 32c0 8.8-7.2 16-16 16l-32 0c-8.8 0-16-7.2-16-16l0-32c0-8.8 7.2-16 16-16zm80 16c0-8.8 7.2-16 16-16l32 0c8.8 0 16 7.2 16 16l0 32c0 8.8-7.2 16-16 16l-32 0c-8.8 0-16-7.2-16-16l0-32zM272 96l32 0c8.8 0 16 7.2 16 16l0 32c0 8.8-7.2 16-16 16l-32 0c-8.8 0-16-7.2-16-16l0-32c0-8.8 7.2-16 16-16z'],
+  gear: [512, 'M495.9 166.6c3.2 8.7 .5 18.4-6.4 24.6l-43.3 39.4c1.1 8.3 1.7 16.8 1.7 25.4s-.6 17.1-1.7 25.4l43.3 39.4c6.9 6.2 9.6 15.9 6.4 24.6c-4.4 11.9-9.7 23.3-15.8 34.3l-4.7 8.1c-6.6 11-14 21.4-22.1 31.2c-5.9 7.2-15.7 9.6-24.5 6.8l-55.7-17.7c-13.4 10.3-28.2 18.9-44 25.4l-12.5 57.1c-2 9.1-9 16.3-18.2 17.8c-13.8 2.3-28 3.5-42.5 3.5s-28.7-1.2-42.5-3.5c-9.2-1.5-16.2-8.7-18.2-17.8l-12.5-57.1c-15.8-6.5-30.6-15.1-44-25.4L83.1 425.9c-8.8 2.8-18.6 .3-24.5-6.8c-8.1-9.8-15.5-20.2-22.1-31.2l-4.7-8.1c-6.1-11-11.4-22.4-15.8-34.3c-3.2-8.7-.5-18.4 6.4-24.6l43.3-39.4C64.6 273.1 64 264.6 64 256s.6-17.1 1.7-25.4L22.4 191.2c-6.9-6.2-9.6-15.9-6.4-24.6c4.4-11.9 9.7-23.3 15.8-34.3l4.7-8.1c6.6-11 14-21.4 22.1-31.2c5.9-7.2 15.7-9.6 24.5-6.8l55.7 17.7c13.4-10.3 28.2-18.9 44-25.4l12.5-57.1c2-9.1 9-16.3 18.2-17.8C227.3 1.2 241.5 0 256 0s28.7 1.2 42.5 3.5c9.2 1.5 16.2 8.7 18.2 17.8l12.5 57.1c15.8 6.5 30.6 15.1 44 25.4l55.7-17.7c8.8-2.8 18.6-.3 24.5 6.8c8.1 9.8 15.5 20.2 22.1 31.2l4.7 8.1c6.1 11 11.4 22.4 15.8 34.3zM256 336a80 80 0 1 0 0-160 80 80 0 1 0 0 160z'],
+  shield: [512, 'M256 0c4.6 0 9.2 1 13.4 2.9L457.7 82.8c22 9.3 38.4 31 38.3 57.2c-.5 99.2-41.3 280.7-213.6 363.2c-16.7 8-36.1 8-52.8 0C57.3 420.7 16.5 239.2 16 140c-.1-26.2 16.3-47.9 38.3-57.2L242.7 2.9C246.8 1 251.4 0 256 0zm0 66.8l0 378.1C394 378 431.1 230.1 432 141.4L256 66.8s0 0 0 0z'],
+  phone: [384, 'M16 64C16 28.7 44.7 0 80 0L304 0c35.3 0 64 28.7 64 64l0 384c0 35.3-28.7 64-64 64L80 512c-35.3 0-64-28.7-64-64L16 64zM224 448a32 32 0 1 0 -64 0 32 32 0 1 0 64 0zM304 64L80 64l0 320 224 0 0-320z'],
+  users: [640, 'M144 0a80 80 0 1 1 0 160A80 80 0 1 1 144 0zM512 0a80 80 0 1 1 0 160A80 80 0 1 1 512 0zM0 298.7C0 239.8 47.8 192 106.7 192l42.7 0c15.9 0 31 3.5 44.6 9.7c-1.3 7.2-1.9 14.7-1.9 22.3c0 38.2 16.8 72.5 43.3 96c-.2 0-.4 0-.7 0L21.3 320C9.6 320 0 310.4 0 298.7zM405.3 320c-.2 0-.4 0-.7 0c26.6-23.5 43.3-57.8 43.3-96c0-7.6-.7-15-1.9-22.3c13.6-6.3 28.7-9.7 44.6-9.7l42.7 0C592.2 192 640 239.8 640 298.7c0 11.8-9.6 21.3-21.3 21.3l-213.3 0zM224 224a96 96 0 1 1 192 0 96 96 0 1 1 -192 0zM128 485.3C128 411.7 187.7 352 261.3 352l117.3 0C452.3 352 512 411.7 512 485.3c0 14.7-11.9 26.7-26.7 26.7l-330.7 0c-14.7 0-26.7-11.9-26.7-26.7z'],
+  tag: [448, 'M0 80L0 229.5c0 17 6.7 33.3 18.7 45.3l176 176c25 25 65.5 25 90.5 0L418.7 317.3c25-25 25-65.5 0-90.5l-176-176c-12-12-28.3-18.7-45.3-18.7L48 32C21.5 32 0 53.5 0 80zm112 32a32 32 0 1 1 0 64 32 32 0 1 1 0-64z'],
+  ticket: [576, 'M64 64C28.7 64 0 92.7 0 128l0 64c0 8.8 7.4 15.7 15.7 18.6C34.5 217.1 48 235 48 256s-13.5 38.9-32.3 45.4C7.4 304.3 0 311.2 0 320l0 64c0 35.3 28.7 64 64 64l448 0c35.3 0 64-28.7 64-64l0-64c0-8.8-7.4-15.7-15.7-18.6C541.5 294.9 528 277 528 256s13.5-38.9 32.3-45.4c8.3-2.9 15.7-9.8 15.7-18.6l0-64c0-35.3-28.7-64-64-64L64 64zm64 112l0 160c0 8.8 7.2 16 16 16l288 0c8.8 0 16-7.2 16-16l0-160c0-8.8-7.2-16-16-16l-288 0c-8.8 0-16 7.2-16 16zM96 160c0-17.7 14.3-32 32-32l320 0c17.7 0 32 14.3 32 32l0 192c0 17.7-14.3 32-32 32l-320 0c-17.7 0-32-14.3-32-32l0-192z'],
+  bolt: [448, 'M349.4 44.6c5.9-13.7 1.5-29.7-10.6-38.5s-28.6-8-39.9 1.8l-256 224c-10 8.8-13.6 22.9-8.9 35.3S50.7 288 64 288l111.5 0L98.6 467.4c-5.9 13.7-1.5 29.7 10.6 38.5s28.6 8 39.9-1.8l256-224c10-8.8 13.6-22.9 8.9-35.3s-16.6-20.7-30-20.7l-111.5 0L349.4 44.6z'],
+  list: [512, 'M152.1 38.2c9.9 8.9 10.7 24 1.8 33.9l-72 80c-4.4 4.9-10.6 7.8-17.2 7.9s-12.9-2.4-17.6-7L7 113C-2.3 103.6-2.3 88.4 7 79s24.6-9.4 33.9 0l22.1 22.1 55.1-61.2c8.9-9.9 24-10.7 33.9-1.8zm0 160c9.9 8.9 10.7 24 1.8 33.9l-72 80c-4.4 4.9-10.6 7.8-17.2 7.9s-12.9-2.4-17.6-7L7 273c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l22.1 22.1 55.1-61.2c8.9-9.9 24-10.7 33.9-1.8zM224 96c0-17.7 14.3-32 32-32l224 0c17.7 0 32 14.3 32 32s-14.3 32-32 32l-224 0c-17.7 0-32-14.3-32-32zm0 160c0-17.7 14.3-32 32-32l224 0c17.7 0 32 14.3 32 32s-14.3 32-32 32l-224 0c-17.7 0-32-14.3-32-32zM160 416c0-17.7 14.3-32 32-32l288 0c17.7 0 32 14.3 32 32s-14.3 32-32 32l-288 0c-17.7 0-32-14.3-32-32zM48 368a48 48 0 1 1 0 96 48 48 0 1 1 0-96z'],
+  images: [576, 'M160 32c-35.3 0-64 28.7-64 64l0 224c0 35.3 28.7 64 64 64l352 0c35.3 0 64-28.7 64-64l0-224c0-35.3-28.7-64-64-64L160 32zM396 138.7l96 144c4.9 7.4 5.4 16.8 1.2 24.6S480.9 320 472 320l-144 0-48 0-80 0c-9.2 0-17.6-5.3-21.6-13.6s-2.9-18.2 2.9-25.4l64-80c4.6-5.7 11.4-9 18.7-9s14.2 3.3 18.7 9l17.3 21.6 56-84C360.5 132 368 128 376 128s15.5 4 20 10.7zM192 128a32 32 0 1 1 64 0 32 32 0 1 1 -64 0zM48 120c0-13.3-10.7-24-24-24S0 106.7 0 120L0 344c0 75.1 60.9 136 136 136l320 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-320 0c-48.6 0-88-39.4-88-88l0-224z'],
+  group: [640, 'M72 88a56 56 0 1 1 112 0A56 56 0 1 1 72 88zM64 245.7C54 256.9 48 271.8 48 288s6 31.1 16 42.3l0-84.7zm144.4-49.3C178.7 222.7 160 261.2 160 304c0 34.3 12 65.8 32 90.5l0 21.5c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32l0-26.8C26.2 371.2 0 332.7 0 288c0-61.9 50.1-112 112-112l32 0c24 0 46.2 7.5 64.4 20.3zM448 416l0-21.5c20-24.7 32-56.2 32-90.5c0-42.8-18.7-81.3-48.4-107.7C449.8 183.5 472 176 496 176l32 0c61.9 0 112 50.1 112 112c0 44.7-26.2 83.2-64 101.2l0 26.8c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32zm8-328a56 56 0 1 1 112 0A56 56 0 1 1 456 88zM576 245.7l0 84.7c10-11.3 16-26.1 16-42.3s-6-31.1-16-42.3zM320 32a64 64 0 1 1 0 128 64 64 0 1 1 0-128zM240 304c0 16.2 6 31 16 42.3l0-84.7c-10 11.3-16 26.1-16 42.3zm144-42.3l0 84.7c10-11.3 16-26.1 16-42.3s-6-31.1-16-42.3zM448 304c0 44.7-26.2 83.2-64 101.2l0 42.8c0 17.7-14.3 32-32 32l-64 0c-17.7 0-32-14.3-32-32l0-42.8c-37.8-18-64-56.5-64-101.2c0-61.9 50.1-112 112-112l32 0c61.9 0 112 50.1 112 112z'],
+  plug: [384, 'M96 0C78.3 0 64 14.3 64 32l0 96 64 0 0-96c0-17.7-14.3-32-32-32zM288 0c-17.7 0-32 14.3-32 32l0 96 64 0 0-96c0-17.7-14.3-32-32-32zM32 160c-17.7 0-32 14.3-32 32s14.3 32 32 32l0 32c0 77.4 55 142 128 156.8l0 67.2c0 17.7 14.3 32 32 32s32-14.3 32-32l0-67.2C297 398 352 333.4 352 256l0-32c17.7 0 32-14.3 32-32s-14.3-32-32-32L32 160z'],
+  code: [640, 'M392.8 1.2c-17-4.9-34.7 5-39.6 22l-128 448c-4.9 17 5 34.7 22 39.6s34.7-5 39.6-22l128-448c4.9-17-5-34.7-22-39.6zm80.6 120.1c-12.5 12.5-12.5 32.8 0 45.3L562.7 256l-89.4 89.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0l112-112c12.5-12.5 12.5-32.8 0-45.3l-112-112c-12.5-12.5-32.8-12.5-45.3 0zm-306.7 0c-12.5-12.5-32.8-12.5-45.3 0l-112 112c-12.5 12.5-12.5 32.8 0 45.3l112 112c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L77.3 256l89.4-89.4c12.5-12.5 12.5-32.8 0-45.3z'],
+  webhook: [640, 'M579.8 267.7c56.5-56.5 56.5-148 0-204.5c-50-50-128.8-56.5-186.3-15.4l-1.6 1.1c-14.4 10.3-17.7 30.3-7.4 44.6s30.3 17.7 44.6 7.4l1.6-1.1c32.1-22.9 76-19.3 103.8 8.6c31.5 31.5 31.5 82.5 0 114L422.3 334.8c-31.5 31.5-82.5 31.5-114 0c-27.9-27.9-31.5-71.8-8.6-103.8l1.1-1.6c10.3-14.4 6.9-34.4-7.4-44.6s-34.4-6.9-44.6 7.4l-1.1 1.6C206.5 251.2 213 330 263 380c56.5 56.5 148 56.5 204.5 0L579.8 267.7zM60.2 244.3c-56.5 56.5-56.5 148 0 204.5c50 50 128.8 56.5 186.3 15.4l1.6-1.1c14.4-10.3 17.7-30.3 7.4-44.6s-30.3-17.7-44.6-7.4l-1.6 1.1c-32.1 22.9-76 19.3-103.8-8.6C74 372 74 321 105.5 289.5L217.7 177.2c31.5-31.5 82.5-31.5 114 0c27.9 27.9 31.5 71.8 8.6 103.9l-1.1 1.6c-10.3 14.4-6.9 34.4 7.4 44.6s34.4 6.9 44.6-7.4l1.1-1.6C433.5 260.8 427 182 377 132c-56.5-56.5-148-56.5-204.5 0L60.2 244.3z'],
+  sun: [512, 'M361.5 1.2c5 2.1 8.6 6.6 9.6 11.9L391 121l107.9 19.8c5.3 1 9.8 4.6 11.9 9.6s1.5 10.7-1.6 15.2L446.9 256l62.3 90.3c3.1 4.5 3.7 10.2 1.6 15.2s-6.6 8.6-11.9 9.6L391 391 371.1 498.9c-1 5.3-4.6 9.8-9.6 11.9s-10.7 1.5-15.2-1.6L256 446.9l-90.3 62.3c-4.5 3.1-10.2 3.7-15.2 1.6s-8.6-6.6-9.6-11.9L121 391 13.1 371.1c-5.3-1-9.8-4.6-11.9-9.6s-1.5-10.7 1.6-15.2L65.1 256 2.8 165.7c-3.1-4.5-3.7-10.2-1.6-15.2s6.6-8.6 11.9-9.6L121 121 140.9 13.1c1-5.3 4.6-9.8 9.6-11.9s10.7-1.5 15.2 1.6L256 65.1 346.3 2.8c4.5-3.1 10.2-3.7 15.2-1.6zM160 256a96 96 0 1 1 192 0 96 96 0 1 1 -192 0zm224 0a128 128 0 1 0 -256 0 128 128 0 1 0 256 0z'],
+  moon: [384, 'M223.5 32C100 32 0 132.3 0 256S100 480 223.5 480c60.6 0 115.5-24.2 155.8-63.4c5-4.9 6.3-12.5 3.1-18.7s-10.1-9.7-17-8.5c-9.8 1.7-19.8 2.6-30.1 2.6c-96.9 0-175.5-78.8-175.5-176c0-65.8 36-123.1 89.3-153.3c6.1-3.5 9.2-10.5 7.7-17.3s-7.3-11.9-14.3-12.5c-6.3-.5-12.6-.8-19-.8z'],
+  copy: [448, 'M384 336l-192 0c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l140.1 0L400 115.9 400 320c0 8.8-7.2 16-16 16zM192 384l192 0c35.3 0 64-28.7 64-64l0-204.1c0-12.7-5.1-24.9-14.1-33.9L366.1 14.1c-9-9-21.2-14.1-33.9-14.1L192 0c-35.3 0-64 28.7-64 64l0 256c0 35.3 28.7 64 64 64zM64 128c-35.3 0-64 28.7-64 64L0 448c0 35.3 28.7 64 64 64l192 0c35.3 0 64-28.7 64-64l0-32-48 0 0 32c0 8.8-7.2 16-16 16L64 464c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l32 0 0-48-32 0z'],
+  trash: [448, 'M135.2 17.7C140.6 6.8 151.7 0 163.8 0L284.2 0c12.1 0 23.2 6.8 28.6 17.7L320 32l96 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 96C14.3 96 0 81.7 0 64S14.3 32 32 32l96 0 7.2-14.3zM32 128l384 0 0 320c0 35.3-28.7 64-64 64L96 512c-35.3 0-64-28.7-64-64l0-320zm96 64c-8.8 0-16 7.2-16 16l0 224c0 8.8 7.2 16 16 16s16-7.2 16-16l0-224c0-8.8-7.2-16-16-16zm96 0c-8.8 0-16 7.2-16 16l0 224c0 8.8 7.2 16 16 16s16-7.2 16-16l0-224c0-8.8-7.2-16-16-16zm96 0c-8.8 0-16 7.2-16 16l0 224c0 8.8 7.2 16 16 16s16-7.2 16-16l0-224c0-8.8-7.2-16-16-16z'],
+  pen: [512, 'M362.7 19.3L314.3 67.7 444.3 197.7l48.4-48.4c25-25 25-65.5 0-90.5L453.3 19.3c-25-25-65.5-25-90.5 0zm-71 71L58.6 323.5c-10.4 10.4-18 23.3-22.2 37.4L1 481.2C-1.5 489.7 .8 498.8 7 505s15.3 8.5 23.7 6.1l120.3-35.4c14.1-4.2 27-11.8 37.4-22.2L421.7 220.3 291.7 90.3z'],
+  plus: [448, 'M256 80c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 144L48 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l144 0 0 144c0 17.7 14.3 32 32 32s32-14.3 32-32l0-144 144 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-144 0 0-144z'],
+  more: [448, 'M8 256a56 56 0 1 1 112 0A56 56 0 1 1 8 256zm160 0a56 56 0 1 1 112 0 56 56 0 1 1 -112 0zm216-56a56 56 0 1 1 0 112 56 56 0 1 1 0-112z'],
+  search: [512, 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
+  filter: [512, 'M3.9 54.9C10.5 40.9 24.5 32 40 32l432 0c15.5 0 29.5 8.9 36.1 22.9s4.6 30.5-5.2 42.5L320 320.9 320 448c0 12.1-6.8 23.2-17.7 28.6s-23.8 4.3-33.5-3l-64-48c-8.1-6-12.8-15.5-12.8-25.6l0-79.1L9 97.3C-.7 85.4-2.8 68.8 3.9 54.9z'],
+  key: [512, 'M336 352c97.2 0 176-78.8 176-176S433.2 0 336 0S160 78.8 160 176c0 18.7 2.9 36.8 8.3 53.7L7 391c-4.5 4.5-7 10.6-7 17l0 80c0 13.3 10.7 24 24 24l80 0c13.3 0 24-10.7 24-24l0-40 40 0c13.3 0 24-10.7 24-24l0-40 40 0c6.4 0 12.5-2.5 17-7l33.3-33.3c16.9 5.4 35 8.3 53.7 8.3zM376 96a40 40 0 1 1 0 80 40 40 0 1 1 0-80z'],
+  signout: [512, 'M377.9 105.9L500.7 228.7c7.2 7.2 11.3 17.1 11.3 27.3s-4.1 20.1-11.3 27.3L377.9 406.1c-6.4 6.4-15 9.9-24 9.9c-18.7 0-33.9-15.2-33.9-33.9l0-62.1-128 0c-17.7 0-32-14.3-32-32l0-64c0-17.7 14.3-32 32-32l128 0 0-62.1c0-18.7 15.2-33.9 33.9-33.9c9 0 17.6 3.6 24 9.9zM160 96L96 96c-17.7 0-32 14.3-32 32l0 256c0 17.7 14.3 32 32 32l64 0c17.7 0 32 14.3 32 32s-14.3 32-32 32l-64 0c-53 0-96-43-96-96L0 128C0 75 43 32 96 32l64 0c17.7 0 32 14.3 32 32s-14.3 32-32 32z'],
+  broom: [576, 'M566.6 54.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-192 192-34.7-34.7c-4.2-4.2-10-6.6-16-6.6c-12.5 0-22.6 10.1-22.6 22.6l0 29.1L364.3 320l29.1 0c12.5 0 22.6-10.1 22.6-22.6c0-6-2.4-11.8-6.6-16l-34.7-34.7 192-192zM341.1 353.4L222.6 234.9c-42.7-3.7-85.2 11.7-115.8 42.3l-8 8C76.5 307.5 64 337.7 64 369.2c0 6.8 7.1 11.2 13.2 8.2l51.1-25.5c5-2.5 9.5 4.1 5.4 7.9L7.3 473.4C2.7 477.6 0 483.6 0 489.9C0 502.1 9.9 512 22.1 512l173.3 0c38.8 0 75.9-15.4 103.4-42.8c30.6-30.6 45.9-73.1 42.3-115.8z'],
+  userpen: [640, 'M224 256A128 128 0 1 0 224 0a128 128 0 1 0 0 256zm-45.7 48C79.8 304 0 383.8 0 482.3C0 498.7 13.3 512 29.7 512l293.1 0c-3.1-8.8-3.7-18.4-1.4-27.8l15-60.1c2.8-11.3 8.6-21.5 16.8-29.7l40.3-40.3c-32.1-31-75.7-50.1-123.9-50.1l-91.4 0zm435.5-68.3c-15.6-15.6-40.9-15.6-56.6 0l-29.4 29.4 71 71 29.4-29.4c15.6-15.6 15.6-40.9 0-56.6l-14.4-14.4zM375.9 417c-4.1 4.1-7 9.2-8.4 14.9l-15 60.1c-1.4 5.5 .2 11.2 4.2 15.2s9.7 5.6 15.2 4.2l60.1-15c5.6-1.4 10.8-4.3 14.9-8.4L576.1 358.7l-71-71L375.9 417z'],
+  lock: [448, 'M144 144l0 48 160 0 0-48c0-44.2-35.8-80-80-80s-80 35.8-80 80zM80 192l0-48C80 64.5 144.5 0 224 0s144 64.5 144 144l0 48 16 0c35.3 0 64 28.7 64 64l0 192c0 35.3-28.7 64-64 64L64 512c-35.3 0-64-28.7-64-64L0 256c0-35.3 28.7-64 64-64l16 0z'],
+  layout: [512, 'M0 96C0 60.7 28.7 32 64 32l384 0c35.3 0 64 28.7 64 64l0 320c0 35.3-28.7 64-64 64L64 480c-35.3 0-64-28.7-64-64L0 96zm64 64l0 256 160 0 0-256L64 160zm384 0l-160 0 0 256 160 0 0-256z'],
+  chat: [640, 'M208 352c114.9 0 208-78.8 208-176S322.9 0 208 0S0 78.8 0 176c0 38.6 14.7 74.3 39.6 103.4c-3.5 9.4-8.7 17.7-14.2 24.7c-4.8 6.2-9.7 11-13.3 14.3c-1.8 1.6-3.3 2.9-4.3 3.7c-.5 .4-.9 .7-1.1 .8l-.2 .2s0 0 0 0s0 0 0 0C1 327.2-1.4 334.4 .8 340.9S9.1 352 16 352c21.8 0 43.8-5.6 62.1-12.5c9.2-3.5 17.8-7.4 25.2-11.4C134.1 343.3 169.8 352 208 352zM448 176c0 112.3-99.1 196.9-216.5 207C255.8 457.4 336.4 512 432 512c38.2 0 73.9-8.7 104.7-23.9c7.5 4 16 7.9 25.2 11.4c18.3 6.9 40.3 12.5 62.1 12.5c6.9 0 13.1-4.5 15.2-11.1c2.1-6.6-.2-13.8-5.8-17.9c0 0 0 0 0 0s0 0 0 0l-.2-.2c-.2-.2-.6-.4-1.1-.8c-1-.8-2.5-2-4.3-3.7c-3.6-3.3-8.5-8.1-13.3-14.3c-5.5-7-10.7-15.4-14.2-24.7c24.9-29 39.6-64.7 39.6-103.4c0-92.8-84.9-168.9-192.6-175.5c.4 5.1 .6 10.3 .6 15.5z'],
+  idcard: [576, 'M528 160l0 256c0 8.8-7.2 16-16 16l-192 0c0-44.2-35.8-80-80-80l-64 0c-44.2 0-80 35.8-80 80l-32 0c-8.8 0-16-7.2-16-16l0-256 480 0zM64 32C28.7 32 0 60.7 0 96L0 416c0 35.3 28.7 64 64 64l448 0c35.3 0 64-28.7 64-64l0-320c0-35.3-28.7-64-64-64L64 32zM272 256a64 64 0 1 0 -128 0 64 64 0 1 0 128 0zm104-48c-13.3 0-24 10.7-24 24s10.7 24 24 24l80 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-80 0zm0 96c-13.3 0-24 10.7-24 24s10.7 24 24 24l80 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-80 0z'],
+  image: [512, 'M0 96C0 60.7 28.7 32 64 32l384 0c35.3 0 64 28.7 64 64l0 320c0 35.3-28.7 64-64 64L64 480c-35.3 0-64-28.7-64-64L0 96zM323.8 202.5c-4.5-6.6-11.9-10.5-19.8-10.5s-15.4 3.9-19.8 10.5l-87 127.6L170.7 297c-4.6-5.7-11.5-9-18.7-9s-14.2 3.3-18.7 9l-64 80c-5.8 7.2-6.9 17.1-2.9 25.4s12.4 13.6 21.6 13.6l96 0 32 0 208 0c8.9 0 17.1-4.9 21.2-12.8s3.6-17.4-1.4-24.7l-120-176zM112 192a48 48 0 1 0 0-96 48 48 0 1 0 0 96z'],
+  refresh: [512, 'M142.9 142.9c-17.5 17.5-30.1 38-37.8 59.8c-5.9 16.7-24.2 25.4-40.8 19.5s-25.4-24.2-19.5-40.8C55.6 150.7 73.2 122 97.6 97.6c87.2-87.2 228.3-87.5 315.8-1L455 55c6.9-6.9 17.2-8.9 26.2-5.2s14.8 12.5 14.8 22.2l0 128c0 13.3-10.7 24-24 24l-8.4 0c0 0 0 0 0 0L344 224c-9.7 0-18.5-5.8-22.2-14.8s-1.7-19.3 5.2-26.2l41.1-41.1c-62.6-61.5-163.1-61.2-225.3 1zM16 312c0-13.3 10.7-24 24-24l7.6 0 .7 0L168 288c9.7 0 18.5 5.8 22.2 14.8s1.7 19.3-5.2 26.2l-41.1 41.1c62.6 61.5 163.1 61.2 225.3-1c17.5-17.5 30.1-38 37.8-59.8c5.9-16.7 24.2-25.4 40.8-19.5s25.4 24.2 19.5 40.8c-10.8 30.6-28.4 59.3-52.9 83.8c-87.2 87.2-228.3 87.5-315.8 1L57 457c-6.9 6.9-17.2 8.9-26.2 5.2S16 449.7 16 440l0-119.6 0-.7 0-7.6z'],
+  phonecall: [512, 'M164.9 24.6c-7.7-18.6-28-28.5-47.4-23.2l-88 24C12.1 30.2 0 46 0 64C0 311.4 200.6 512 448 512c18 0 33.8-12.1 38.6-29.5l24-88c5.3-19.4-4.6-39.7-23.2-47.4l-96-40c-16.3-6.8-35.2-2.1-46.3 11.6L304.7 368C234.3 334.7 177.3 277.7 144 207.3L193.3 167c13.7-11.2 18.4-30 11.6-46.3l-40-96z'],
+  upload: [512, 'M288 109.3L288 352c0 17.7-14.3 32-32 32s-32-14.3-32-32l0-242.7-73.4 73.4c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3l128-128c12.5-12.5 32.8-12.5 45.3 0l128 128c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L288 109.3zM64 352l128 0c0 35.3 28.7 64 64 64s64-28.7 64-64l128 0c35.3 0 64 28.7 64 64l0 32c0 35.3-28.7 64-64 64L64 512c-35.3 0-64-28.7-64-64l0-32c0-35.3 28.7-64 64-64zM432 456a24 24 0 1 0 0-48 24 24 0 1 0 0 48z'],
+  check: [448, 'M438.6 105.4c12.5 12.5 12.5 32.8 0 45.3l-256 256c-12.5 12.5-32.8 12.5-45.3 0l-128-128c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0L160 338.7 393.4 105.4c12.5-12.5 32.8-12.5 45.3 0z'],
+  xmark: [384, 'M342.6 150.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L192 210.7 86.6 105.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L146.7 256 41.4 361.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 301.3 297.4 406.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L237.3 256 342.6 150.6z'],
+  down: [512, 'M233.4 406.6c12.5 12.5 32.8 12.5 45.3 0l192-192c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L256 338.7 86.6 169.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l192 192z'],
+  info: [512, 'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM216 336l24 0 0-64-24 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l48 0c13.3 0 24 10.7 24 24l0 88 8 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-80 0c-13.3 0-24-10.7-24-24s10.7-24 24-24zm40-208a32 32 0 1 1 0 64 32 32 0 1 1 0-64z'],
+  paper: [512, 'M498.1 5.6c10.1 7 15.4 19.1 13.5 31.2l-64 416c-1.5 9.7-7.4 18.2-16 23s-18.9 5.4-28 1.6L284 427.7l-68.5 74.1c-8.9 9.7-22.9 12.9-35.2 8.1S160 493.2 160 480l0-83.6c0-4 1.5-7.8 4.2-10.8L331.8 202.8c5.8-6.3 5.6-16-.4-22s-15.7-6.4-22-.7L106 360.8 17.7 316.6C7.1 311.3 .3 300.7 0 288.9s5.9-22.8 16.1-28.7l448-256c10.7-6.1 23.9-5.5 34 1.4z'],
+  qr: [448, 'M0 80C0 53.5 21.5 32 48 32l96 0c26.5 0 48 21.5 48 48l0 96c0 26.5-21.5 48-48 48l-96 0c-26.5 0-48-21.5-48-48L0 80zM64 96l0 64 64 0 0-64L64 96zM0 336c0-26.5 21.5-48 48-48l96 0c26.5 0 48 21.5 48 48l0 96c0 26.5-21.5 48-48 48l-96 0c-26.5 0-48-21.5-48-48l0-96zm64 16l0 64 64 0 0-64-64 0zM304 32l96 0c26.5 0 48 21.5 48 48l0 96c0 26.5-21.5 48-48 48l-96 0c-26.5 0-48-21.5-48-48l0-96c0-26.5 21.5-48 48-48zm80 64l-64 0 0 64 64 0 0-64zM256 304c0-8.8 7.2-16 16-16l64 0c8.8 0 16 7.2 16 16s7.2 16 16 16l32 0c8.8 0 16-7.2 16-16s7.2-16 16-16s16 7.2 16 16l0 96c0 8.8-7.2 16-16 16l-64 0c-8.8 0-16-7.2-16-16s-7.2-16-16-16s-16 7.2-16 16l0 64c0 8.8-7.2 16-16 16l-32 0c-8.8 0-16-7.2-16-16l0-160zM368 480a16 16 0 1 1 0-32 16 16 0 1 1 0 32zm64 0a16 16 0 1 1 0-32 16 16 0 1 1 0 32z'],
+  whatsapp: [448, 'M380.9 97.1C339 55.1 283.2 32 223.9 32c-122.4 0-222 99.6-222 222 0 39.1 10.2 77.3 29.6 111L0 480l117.7-30.9c32.4 17.7 68.9 27 106.1 27h.1c122.3 0 224.1-99.6 224.1-222 0-59.3-25.2-115-67.1-157zm-157 341.6c-33.2 0-65.7-8.9-94-25.7l-6.7-4-69.8 18.3L72 359.2l-4.4-7c-18.5-29.4-28.2-63.3-28.2-98.2 0-101.7 82.8-184.5 184.6-184.5 49.3 0 95.6 19.2 130.4 54.1 34.8 34.9 56.2 81.2 56.1 130.5 0 101.8-84.9 184.6-186.6 184.6zm101.2-138.2c-5.5-2.8-32.8-16.2-37.9-18-5.1-1.9-8.8-2.8-12.5 2.8-3.7 5.6-14.3 18-17.6 21.8-3.2 3.7-6.5 4.2-12 1.4-32.6-16.3-54-29.1-75.5-66-5.7-9.8 5.7-9.1 16.3-30.3 1.8-3.7.9-6.9-.5-9.7-1.4-2.8-12.5-30.1-17.1-41.2-4.5-10.8-9.1-9.3-12.5-9.5-3.2-.2-6.9-.2-10.6-.2-3.7 0-9.7 1.4-14.8 6.9-5.1 5.6-19.4 19-19.4 46.3 0 27.3 19.9 53.7 22.6 57.4 2.8 3.7 39.1 59.7 94.8 83.8 35.2 15.2 49 16.5 66.6 13.9 10.7-1.6 32.8-13.4 37.4-26.4 4.6-13 4.6-24.1 3.2-26.4-1.3-2.5-5-3.9-10.5-6.6z'],
+  userplus: [640, 'M96 128a128 128 0 1 1 256 0A128 128 0 1 1 96 128zM0 482.3C0 383.8 79.8 304 178.3 304l91.4 0C368.2 304 448 383.8 448 482.3c0 16.4-13.3 29.7-29.7 29.7L29.7 512C13.3 512 0 498.7 0 482.3zM504 312l0-64-64 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l64 0 0-64c0-13.3 10.7-24 24-24s24 10.7 24 24l0 64 64 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-64 0 0 64c0 13.3-10.7 24-24 24s-24-10.7-24-24z'],
+  flask: [448, 'M288 0L160 0 128 0C110.3 0 96 14.3 96 32s14.3 32 32 32l0 132.8c0 11.8-3.3 23.5-9.5 33.5L10.3 406.2C3.6 417.2 0 429.7 0 442.6C0 480.9 31.1 512 69.4 512l309.2 0c38.3 0 69.4-31.1 69.4-69.4c0-12.8-3.6-25.4-10.3-36.4L329.5 230.4c-6.2-10.1-9.5-21.7-9.5-33.5L320 64c17.7 0 32-14.3 32-32s-14.3-32-32-32L288 0zM192 196.8L192 64l64 0 0 132.8c0 23.7 6.6 46.9 19 67.1L309.5 320l-171 0L173 263.9c12.4-20.2 19-43.4 19-67.1z'],
+  eye: [576, 'M288 80c-65.2 0-118.8 29.6-159.9 67.7C89.6 183.5 63 226 49.4 256c13.6 30 40.2 72.5 78.6 108.3C169.2 402.4 222.8 432 288 432s118.8-29.6 159.9-67.7C486.4 328.5 513 286 526.6 256c-13.6-30-40.2-72.5-78.6-108.3C406.8 109.6 353.2 80 288 80zM95.4 112.6C142.5 68.8 207.2 32 288 32s145.5 36.8 192.6 80.6c46.8 43.5 78.1 95.4 93 131.1c3.3 7.9 3.3 16.7 0 24.6c-14.9 35.7-46.2 87.7-93 131.1C433.5 443.2 368.8 480 288 480s-145.5-36.8-192.6-80.6C48.6 356 17.3 304 2.5 268.3c-3.3-7.9-3.3-16.7 0-24.6C17.3 208 48.6 156 95.4 112.6zM288 336c44.2 0 80-35.8 80-80s-35.8-80-80-80c-.7 0-1.3 0-2 0c1.3 5.1 2 10.5 2 16c0 35.3-28.7 64-64 64c-5.5 0-10.9-.7-16-2c0 .7 0 1.3 0 2c0 44.2 35.8 80 80 80zm0-208a128 128 0 1 1 0 256 128 128 0 1 1 0-256z'],
+  circle: [512, 'M448 256c0-106-86-192-192-192l0 384c106 0 192-86 192-192zM0 256a256 256 0 1 1 512 0A256 256 0 1 1 0 256z'],
+};
 
-  loadSettingsTab('phones');
+function stIcon(name, cls = '') {
+  const ic = ST_ICONS[name] || AN_ICONS[name];
+  if (!ic) return '';
+  return `<svg class="an-ic st-ic ${cls}" viewBox="0 0 ${ic[0]} 512" fill="currentColor" aria-hidden="true"><path d="${ic[1]}"/></svg>`;
 }
+
+// screen: key in GET /org/permissions → screens (non-admins may be denied)
+// admin:  admin-only page (hidden for everyone else)
+// ext:    page provided by settings-org.js through window.SettingsPages
+// wide:   content column wider than the default 620px
+const ST_PAGES = {
+  preferences:         { nav: 'Preferences', icon: 'sliders', title: 'Preferences',
+                         sub: 'Personalise how Hyperscope looks and behaves for you.' },
+  scheduled:           { nav: 'Scheduled Messages', icon: 'clock', title: 'Scheduled Messages', wide: true,
+                         sub: 'Messages queued to go out later. Recurring messages keep sending until they end.' },
+  notifications:       { nav: 'Alerts & Notifications', icon: 'bell', title: 'Alerts & Notifications',
+                         sub: 'Choose how and when Hyperscope alerts you. The bell in the top bar shows the same settings.' },
+  general:             { nav: 'General', icon: 'building', title: 'General',
+                         sub: 'Your organization’s name, ID and logo.' },
+  config:              { nav: 'Config', icon: 'gear', title: 'Config', ext: true },
+  permissions:         { nav: 'Permissions', icon: 'shield', title: 'Permissions', ext: true },
+  phones:              { nav: 'Phones', icon: 'phone', title: 'Phones', screen: 'phones', wide: true,
+                         sub: 'WhatsApp numbers connected to this workspace.' },
+  team:                { nav: 'Team', icon: 'users', title: 'Team', wide: true,
+                         sub: 'Invite teammates, set their role and choose which numbers they can use.' },
+  labels:              { nav: 'Labels', icon: 'tag', title: 'Labels', screen: 'labels',
+                         sub: 'Colour-coded labels to organise chats, tickets and phones.' },
+  tickets:             { nav: 'Tickets', icon: 'ticket', title: 'Tickets', ext: true, screen: 'tickets' },
+  'quick-replies':     { nav: 'Quick Replies', icon: 'bolt', title: 'Quick Replies', screen: 'quick_replies',
+                         sub: 'Type / in the composer to insert one of these messages.' },
+  'custom-properties': { nav: 'Custom Properties', icon: 'list', title: 'Custom Properties', screen: 'custom_properties', wide: true,
+                         sub: 'Extra fields on chats and tickets, such as plan, renewal date or account owner.' },
+  'media-library':     { nav: 'Media Library', icon: 'images', title: 'Media Library', ext: true, screen: 'media_library' },
+  'group-settings':    { nav: 'Group Settings', icon: 'group', title: 'Group Settings', ext: true, screen: 'group_templates' },
+  api:                 { nav: 'API', icon: 'code', title: 'API', admin: true, screen: 'integrations',
+                         sub: 'Programmatic access to Hyperscope with API keys.' },
+  webhooks:            { nav: 'Webhooks', icon: 'webhook', title: 'Webhooks', admin: true, screen: 'integrations',
+                         sub: 'Hyperscope POSTs events to these URLs as they happen.' },
+};
+const ST_GROUPS = [
+  { label: 'User', icon: 'user', pages: ['preferences', 'scheduled', 'notifications'] },
+  { label: 'Organization', icon: 'building', pages: ['general', 'config', 'permissions', 'phones', 'team', 'labels',
+    'tickets', 'quick-replies', 'custom-properties', 'media-library', 'group-settings'] },
+  { label: 'Integrations', icon: 'plug', pages: ['api', 'webhooks'] },
+];
+const ST = { sub: 'preferences', seq: 0 };
+
+function _stPageDef(key) {
+  if (ST_PAGES[key]) return ST_PAGES[key];
+  const ext = window.SettingsPages[key];
+  return ext ? { nav: ext.title || key, title: ext.title || key, icon: ext.icon || 'gear', ext: true } : null;
+}
+// settings-org pages that aren't in the fixed list go at the end of Organization
+function _stExtraPages() {
+  return Object.keys(window.SettingsPages).filter(k => !ST_PAGES[k] && /^[a-z0-9-]+$/.test(k));
+}
+function _stAllowed(key) {
+  const p = _stPageDef(key);
+  if (!p) return false;
+  if (p.admin && !isAdmin()) return false;
+  return !p.screen || Perms.screen(p.screen);
+}
+function stIsPage(key) { return !!_stPageDef(key); }
+
+// ── Shared building blocks (also exposed to settings-org.js) ── //
+function stHead(title, sub, actions = '') {
+  return `<div class="st-head">
+    <div class="st-head-text"><h1 class="st-title">${esc(title)}</h1>${sub ? `<p class="st-sub">${esc(sub)}</p>` : ''}</div>
+    ${actions ? `<div class="st-head-actions">${actions}</div>` : ''}
+  </div>`;
+}
+function stCard(title, icon, body, opts = {}) {
+  return `<section class="st-card${opts.cls ? ' ' + opts.cls : ''}"${opts.id ? ` id="${opts.id}"` : ''}>
+    <div class="st-card-head"><h2>${esc(title)}</h2>${opts.actions || ''}<span class="st-card-ic" aria-hidden="true">${stIcon(icon)}</span></div>
+    <div class="st-card-body">${body}</div>
+  </section>`;
+}
+// label / desc are plain text; control is HTML
+function stRow(label, desc, control, opts = {}) {
+  return `<div class="st-row${opts.cls ? ' ' + opts.cls : ''}">
+    <div class="st-row-text"><div class="st-row-label"${opts.labelId ? ` id="${opts.labelId}"` : ''}>${esc(label)}</div>${desc ? `<div class="st-row-desc">${esc(desc)}</div>` : ''}</div>
+    <div class="st-row-ctl">${control}</div>
+  </div>`;
+}
+function stToggle(attrs, on, label) {
+  return `<label class="st-switch"><input type="checkbox" role="switch" ${attrs} ${on ? 'checked' : ''} aria-label="${esc(label)}"><span class="st-track" aria-hidden="true"></span></label>`;
+}
+function stEmpty(text, icon = 'info') {
+  return `<div class="st-empty">${stIcon(icon)}<span>${esc(text)}</span></div>`;
+}
+function stLoading() { return '<div class="loading-center"><div class="spinner"></div></div>'; }
+function stSearch(placeholder, value = '') {
+  return `<label class="st-search">${stIcon('search')}<input type="search" placeholder="${esc(placeholder)}" value="${esc(value)}" aria-label="${esc(placeholder)}"></label>`;
+}
+function stCopy(text, msg = 'Copied') {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(() => toast(msg, 'success'), () => toast(text));
+  } else toast(text);
+}
+// ⋯ menus: items = [{ label, icon, danger, fn }]
+function stMenu(anchor, items) {
+  const pop = cxPopover(anchor, items.map((it, i) =>
+    `<button class="cx-pop-item st-menu-item${it.danger ? ' danger' : ''}" data-i="${i}">${it.icon ? stIcon(it.icon) : ''}<span>${esc(it.label)}</span></button>`).join(''),
+    { alignRight: true, cls: 'st-pop' });
+  pop.querySelectorAll('[data-i]').forEach(b => b.addEventListener('click', e => {
+    e.stopPropagation();
+    cxClosePop();
+    items[+b.dataset.i].fn?.();
+  }));
+  pop.querySelector('button')?.focus();
+}
+window.SettingsUI = { head: stHead, card: stCard, row: stRow, toggle: stToggle, empty: stEmpty, icon: stIcon, search: stSearch, menu: stMenu, copy: stCopy };
+
+// ── Shell ── //
+function _stShellHTML() {
+  const item = key => {
+    const p = _stPageDef(key);
+    return `<a href="#settings/${key}" class="an-nav-item" data-st="${key}">${stIcon(p.icon)}<span>${esc(p.nav)}</span></a>`;
+  };
+  const groups = ST_GROUPS.map((g, gi) => {
+    const keys = g.pages.concat(g.label === 'Organization' ? _stExtraPages() : []).filter(_stAllowed);
+    if (!keys.length) return '';
+    return `<div class="an-nav-group${gi ? ' an-nav-group-2' : ''}">${stIcon(g.icon)}<span>${esc(g.label)}</span></div>${keys.map(item).join('')}`;
+  }).join('');
+  return `<div class="an-shell st-shell" id="st-shell">
+      <nav class="an-nav st-nav" aria-label="Settings">${groups}</nav>
+      <div class="st-main" id="st-main"></div>
+    </div>`;
+}
+
+function _stSyncRoute(sub) {
+  const route = 'settings/' + sub;
+  State.currentRoute = route;
+  if (location.hash !== '#' + route) history.replaceState(null, '', '#' + route);
+  const bc = document.getElementById('app-breadcrumb');
+  if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS.settings)}</strong><span class="bc-sep" aria-hidden="true">&gt;</span><strong>${esc(sub.replace(/-/g, ' '))}</strong>`;
+}
+
+async function renderSettings(sub) {
+  if (!stIsPage(sub)) sub = ST.sub && stIsPage(ST.sub) ? ST.sub : 'preferences';
+  ST.sub = sub;
+  _stSyncRoute(sub);
+  _stopAllPhoneQrFlows();
+  cxClosePop();
+  const main = document.getElementById('main-content');
+  if (!document.getElementById('st-shell') || ST.navFor !== _stNavKey()) {
+    main.innerHTML = _stShellHTML();
+    ST.navFor = _stNavKey();
+    main.querySelectorAll('.st-nav .an-nav-item').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      navigateTo('settings/' + a.dataset.st);
+    }));
+  }
+  main.querySelectorAll('.st-nav .an-nav-item').forEach(a => {
+    const on = a.dataset.st === sub;
+    a.classList.toggle('active', on);
+    on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current');
+  });
+  const p = _stPageDef(sub);
+  const host = document.getElementById('st-main');
+  host.scrollTop = 0;
+  host.innerHTML = `<div class="st-page${p.wide ? ' st-page-wide' : ''}" data-page="${esc(sub)}"></div>`;
+  const page = host.firstElementChild;
+  const seq = ++ST.seq;
+  if (!_stAllowed(sub)) {
+    page.innerHTML = stHead(p.title) + stEmpty('You don’t have access to this page. Ask an admin if you need it.', 'lock');
+    return;
+  }
+  try {
+    if (p.ext) {
+      const ext = window.SettingsPages[sub];
+      if (ext && typeof ext.render === 'function') await ext.render(page);
+      else page.innerHTML = stHead(p.title) + stEmpty('Not available.');
+    } else {
+      page.innerHTML = stLoading();
+      await ST_RENDER[sub](page, () => seq !== ST.seq || !page.isConnected);
+    }
+  } catch (e) {
+    if (seq !== ST.seq) return;
+    page.innerHTML = stHead(p.title) + stEmpty(`Could not load this page: ${e.message || e}`);
+  }
+}
+// Rebuild the sub-nav when what it can show changes (role, permissions, registered pages)
+function _stNavKey() {
+  return [State.agent?.id, State.agent?.role, Perms.version, Object.keys(window.SettingsPages).join(',')].join('|');
+}
+function stReload() { if (State.currentView === 'settings') renderSettings(ST.sub); }
 
 function showAddPhoneModal() {
   showModal('Connect WhatsApp', `
     <div class="form-group">
-      <label>Display Name *</label>
-      <input type="text" id="add-ph-name" placeholder="e.g. Sales, Support" autofocus>
+      <label for="add-ph-name">Display name *</label>
+      <input type="text" id="add-ph-name" placeholder="e.g. Sales, Support" maxlength="100" autofocus>
       <small class="text-muted">Uses the WAHA session configured in your server environment</small>
     </div>
     <div class="modal-footer">
@@ -3215,24 +6909,21 @@ function showAddPhoneModal() {
       <button class="btn btn-primary" id="add-ph-save">Connect</button>
     </div>
   `);
-
   document.getElementById('add-ph-save').addEventListener('click', async () => {
     const name = document.getElementById('add-ph-name').value.trim();
     if (!name) return toast('Display name is required', 'error');
-
     const btn = document.getElementById('add-ph-save');
     btn.disabled = true;
     btn.textContent = 'Connecting…';
-
     try {
       const res = await Api.phones.connect(name);
       closeModal();
-      toast(`Connecting — scan the QR code to link WhatsApp`, 'success');
-      await loadSettingsTab('phones');
+      toast('Connecting — scan the QR code to link WhatsApp', 'success');
       loadPhones();
-      const connectBtn = document.querySelector(`.phone-btn-connect[data-pid="${res.phone_id}"]`);
-      if (connectBtn) connectBtn.click();
-    } catch(e) {
+      if (State.currentRoute === 'settings/phones') await renderSettings('phones');
+      else await navigateTo('settings/phones');
+      document.querySelector(`.phone-btn-connect[data-pid="${res.phone_id}"]`)?.click();
+    } catch (e) {
       toast(e.message, 'error');
       btn.disabled = false;
       btn.textContent = 'Connect';
@@ -3240,558 +6931,1323 @@ function showAddPhoneModal() {
   });
 }
 
-async function loadSettingsTab(tab) {
-  const el = document.getElementById('settings-content');
-  if (!el) return;
-  el.innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+// Phones page QR flows: interval handles keyed by phone id
+const _phoneQrFlows = {};
+function _stopPhoneQrFlow(phoneId) {
+  const f = _phoneQrFlows[phoneId];
+  if (!f) return;
+  clearInterval(f.poll); clearInterval(f.sync);
+  delete _phoneQrFlows[phoneId];
+}
+function _stopAllPhoneQrFlows() {
+  Object.keys(_phoneQrFlows).forEach(_stopPhoneQrFlow);
+}
 
-  if (tab === 'phones') {
+async function _stPhoneConnected(phoneId) {
+  _stopPhoneQrFlow(phoneId);
+  await Api.phones.syncNumber(phoneId).catch(() => {});
+  toast('WhatsApp connected! Syncing chats…', 'success');
+  if (State.currentRoute === 'settings/phones') renderSettings('phones');
+  loadPhones();
+  _chatAutoSynced = false;
+  try { await Api.inbox.sync(phoneId); } catch (_) {}
+  if (State.currentView === 'inbox') loadChats();
+}
+
+async function _stStartQrFlow(phoneId) {
+  const area = document.getElementById(`phone-qr-area-${phoneId}`);
+  if (!area) return;
+  area.hidden = false;
+  area.innerHTML = `<div class="spinner" style="margin:.5rem auto"></div>`;
+  // One flow per phone: clear timers from an earlier Connect click first
+  _stopPhoneQrFlow(phoneId);
+  const flow = { poll: null, sync: null };
+  _phoneQrFlows[phoneId] = flow;
+  async function pollQr() {
+    if (_phoneQrFlows[phoneId] !== flow) return;
+    if (!area.isConnected) { _stopPhoneQrFlow(phoneId); return; }
     try {
-      const phones = await Api.phones.list();
-      // Silently resolve any WORKING phone still showing "pending" number —
-      // happens when app restarted before sync-number completed after QR scan
-      phones.filter(p => p.waha_status === 'WORKING' && (p.phone_number || '').startsWith('pending'))
-            .forEach(p => Api.phones.syncNumber(p.id).catch(() => {}));
-      
-      let html = `
-        <div class="flex-col gap-4">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid var(--border-light)">
-            <div>
-              <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">WhatsApp Session</h3>
-              <p style="margin:0;font-size:12.5px;color:var(--text-3)">Connect your WhatsApp number to Hyperscope</p>
-            </div>
-            ${!phones.length ? `<button class="btn btn-primary btn-sm" id="btn-add-phone">+ Connect WhatsApp</button>` : ''}
-          </div>
-          
-          <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:1rem">
-      `;
-      
-      if (!phones.length) {
-        html += `
-          <div class="content-card" style="grid-column:1/-1;padding:3rem 1.5rem;text-align:center;color:var(--text-3)">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin:0 auto 1rem;opacity:0.5"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
-            <div style="font-weight:600;font-size:14px;color:var(--text-2)">No WhatsApp Sessions Configured</div>
-            <p style="font-size:12px;margin:0.25rem 0 1.25rem">Get started by adding your first WhatsApp number connection.</p>
-          </div>
-        `;
+      const r = await Api.phones.qr(phoneId);
+      if (_phoneQrFlows[phoneId] !== flow) return;
+      if (r && r.qr) {
+        area.innerHTML = `
+          <img class="st-qr-img" src="${safeImgSrc(r.qr)}" alt="WhatsApp QR code">
+          <p class="st-qr-help">Open WhatsApp → Linked Devices → Link a Device → Scan</p>`;
+        if (!flow.sync) {
+          flow.sync = setInterval(async () => {
+            try {
+              const s = await Api.phones.status(phoneId);
+              if (s.status === 'WORKING') _stPhoneConnected(phoneId);
+            } catch (_) {}
+          }, 4000);
+        }
       } else {
-        html += phones.map(p => {
-          const connected = p.waha_status === 'WORKING';
-          const statusText = p.waha_status || 'STOPPED';
-          let statusColor = '#ef4444'; // Red
-          let statusBg = '#fef2f2';
-          if (connected) {
-            statusColor = '#10b981'; // Green
-            statusBg = '#f0fdf4';
-          } else if (p.waha_status === 'SCAN_QR_CODE') {
-            statusColor = '#f59e0b'; // Orange
-            statusBg = '#fffbeb';
-          }
-          
-          return `
-            <div class="content-card" style="padding:1.25rem;display:flex;flex-direction:column;justify-content:space-between;border:1px solid ${connected ? '#bbf7d0' : 'var(--border)'}">
-              <div>
-                <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.75rem">
-                  <div>
-                    <h4 style="margin:0;font-size:14px;font-weight:600">${esc(p.name)}</h4>
-                    <span style="font-size:11px;color:var(--text-3);font-family:monospace">session: ${esc(p.session_name)}</span>
-                  </div>
-                  <span class="pill" style="background:${statusBg};color:${statusColor};border:1px solid ${statusColor}33;padding:1px 6px;font-size:10px">${statusText}</span>
-                </div>
-                
-                <div style="margin-bottom:0.75rem">
-                  <div style="font-size:12px;color:var(--text-3)">Phone Number:</div>
-                  <div style="font-size:14px;font-weight:500;color:var(--text)">
-                    ${p.phone_number && !p.phone_number.startsWith('pending') ? '+' + p.phone_number : '<span style="color:#d97706;font-size:12px">⚠️ Pending connection</span>'}
-                  </div>
-                </div>
-
-                <div id="phone-qr-area-${p.id}" style="margin-bottom:1rem"></div>
-              </div>
-
-              <div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center">
-                ${connected
-                  ? `<button class="btn btn-secondary btn-sm phone-btn-reconnect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Reconnect / QR</button>
-                     <button class="btn btn-danger btn-sm phone-btn-disconnect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Disconnect</button>
-                     <button class="btn btn-ghost btn-sm phone-btn-clear" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px;color:#be123c" title="Delete all chats/messages for this phone from DB">Clear Data</button>`
-                  : `<button class="btn btn-primary btn-sm phone-btn-connect" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px">Connect</button>`
-                }
-                <button class="btn btn-ghost btn-sm phone-btn-delete" data-pid="${p.id}" style="font-size:11.5px;padding:5px 9px;margin-left:auto;color:var(--danger)" title="Remove phone session from Hyperscope">Delete</button>
-              </div>
-            </div>
-          `;
-        }).join('');
-      }
-      
-      html += `
-          </div>
-        </div>
-      `;
-      
-      el.innerHTML = html;
-
-      async function startQrFlow(phoneId) {
-        const area = document.getElementById(`phone-qr-area-${phoneId}`);
-        if (!area) return;
-        area.innerHTML = `<div class="spinner" style="margin:.5rem auto"></div>`;
-        let _syncTimer = null;
-        let _pollTimer = null;
-        let attempt = 0;
-        async function pollQr() {
-          if (!document.getElementById(`phone-qr-area-${phoneId}`)) { clearInterval(_pollTimer); clearInterval(_syncTimer); return; }
-          try {
-            const r = await Api.phones.qr(phoneId);
-            if (r && r.qr) {
-              area.innerHTML = `
-                <img src="${r.qr}" style="max-width:200px;border-radius:8px;border:1px solid var(--border);display:block;margin:0 auto">
-                <p style="font-size:11px;color:var(--text-2);margin:.6rem 0 0;text-align:center">Open WhatsApp → Linked Devices → Link a Device → Scan</p>`;
-              if (!_syncTimer) {
-                _syncTimer = setInterval(async () => {
-                  try {
-                    const s = await Api.phones.status(phoneId);
-                    if (s.status === 'WORKING') {
-                      clearInterval(_syncTimer); clearInterval(_pollTimer);
-                      await Api.phones.syncNumber(phoneId).catch(() => {});
-                      toast('WhatsApp connected! Syncing chats…', 'success');
-                      loadSettingsTab('phones'); loadPhones();
-                      _chatAutoSynced = false;
-                      try { await Api.inbox.sync(phoneId); } catch(_) {}
-                      loadChats();
-                    }
-                  } catch(_) {}
-                }, 4000);
-              }
-            } else {
-              // No QR — session may already be connected; check status
-              try {
-                const s = await Api.phones.status(phoneId);
-                if (s.status === 'WORKING') {
-                  clearInterval(_pollTimer); clearInterval(_syncTimer);
-                  await Api.phones.syncNumber(phoneId).catch(() => {});
-                  toast('WhatsApp connected! Syncing chats…', 'success');
-                  loadSettingsTab('phones'); loadPhones();
-                  _chatAutoSynced = false;
-                  try { await Api.inbox.sync(phoneId); } catch(_) {}
-                  loadChats();
-                  return;
-                }
-              } catch(_) {}
-              area.innerHTML = `<p style="font-size:12px;color:var(--text-2);text-align:center">Waiting for QR…</p>`;
-            }
-          } catch(e) { area.innerHTML = `<p style="font-size:12px;color:var(--danger);text-align:center">${esc(e.message)}</p>`; }
-          attempt++;
-        }
-        _pollTimer = setInterval(pollQr, 7000);
-        await pollQr();
-      }
-
-      async function logoutAndShowQR(phoneId, btn, originalLabel) {
-        if (btn) { btn.disabled = true; btn.textContent = 'Clearing session…'; }
+        // No QR — the session may already be connected
         try {
-          await Api.phones.logout(phoneId).catch(() => {});
-          await new Promise(r => setTimeout(r, 1500));
-          await Api.phones.start(phoneId).catch(() => {});
-          await new Promise(r => setTimeout(r, 1500));
-          if (btn) btn.textContent = 'Loading QR…';
-          await startQrFlow(phoneId);
-        } catch(err) {
-          toast(err.message, 'error');
-          if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
-        }
+          const s = await Api.phones.status(phoneId);
+          if (s.status === 'WORKING') return _stPhoneConnected(phoneId);
+        } catch (_) {}
+        area.innerHTML = `<p class="st-qr-help">Waiting for QR…</p>`;
       }
-
-      document.getElementById('btn-add-phone')?.addEventListener('click', () => {
-        showAddPhoneModal();
-      });
-
-      el.querySelectorAll('.phone-btn-connect').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const pid = parseInt(btn.dataset.pid);
-          await logoutAndShowQR(pid, btn, 'Connect');
-        });
-      });
-
-      el.querySelectorAll('.phone-btn-reconnect').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const pid = parseInt(btn.dataset.pid);
-          await logoutAndShowQR(pid, btn, 'Reconnect / QR');
-        });
-      });
-
-      el.querySelectorAll('.phone-btn-disconnect').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const pid = parseInt(btn.dataset.pid);
-          if (!confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
-          btn.disabled = true;
-          try {
-            await Api.phones.logout(pid);
-            toast('Disconnected — scan QR to reconnect', 'success');
-            loadSettingsTab('phones'); loadPhones();
-          } catch(e) { toast(e.message, 'error'); btn.disabled = false; }
-        });
-      });
-
-      el.querySelectorAll('.phone-btn-clear').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const pid = parseInt(btn.dataset.pid);
-          if (!confirm('WARNING: This will permanently delete all synced chats, messages, and associated tasks/tickets for this phone from the database. Proceed?')) return;
-          btn.disabled = true;
-          try {
-            await Api.phones.clearData(pid);
-            toast('Data cleared successfully!', 'success');
-            loadSettingsTab('phones'); loadPhones();
-          } catch(e) { toast(e.message, 'error'); btn.disabled = false; }
-        });
-      });
-
-      el.querySelectorAll('.phone-btn-delete').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const pid = parseInt(btn.dataset.pid);
-          if (!confirm('Remove this phone session from Hyperscope? This will deactivate the session.')) return;
-          btn.disabled = true;
-          try {
-            await Api.phones.del(pid);
-            toast('Phone session removed', 'success');
-            loadSettingsTab('phones'); loadPhones();
-          } catch(e) { toast(e.message, 'error'); btn.disabled = false; }
-        });
-      });
-
-
-    } catch(_) { el.innerHTML = '<div class="loading-center text-muted">Could not load WhatsApp status</div>'; }
+    } catch (e) { area.innerHTML = `<p class="st-qr-help st-danger-text">${esc(e.message)}</p>`; }
   }
+  flow.poll = setInterval(pollQr, 7000);
+  await pollQr();
+}
 
-  else if (tab === 'labels') {
+// Log out → start → poll for a fresh QR (the old WhatsApp tab's connect flow)
+async function _stLogoutAndShowQR(phoneId, btn) {
+  const label = btn?.textContent;
+  if (btn) { btn.disabled = true; btn.textContent = 'Clearing session…'; }
+  try {
+    await Api.phones.logout(phoneId).catch(() => {});
+    await new Promise(r => setTimeout(r, 1500));
+    await Api.phones.start(phoneId).catch(() => {});
+    await new Promise(r => setTimeout(r, 1500));
+    if (btn) btn.textContent = 'Loading QR…';
+    await _stStartQrFlow(phoneId);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+  if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = label; }
+}
+
+// ── Preferences ── //
+function applyAskAiVisible(visible) {
+  visible ? document.documentElement.removeAttribute('data-ask-ai')
+          : document.documentElement.setAttribute('data-ask-ai', 'hidden');
+}
+try { applyAskAiVisible(localStorage.getItem('ask_ai') !== 'hidden'); } catch (_) {}
+
+// Per-agent interface prefs: mirrored in localStorage for instant apply,
+// stored on the server (GET/PUT /auth/me/preferences) so they follow the user.
+const UiPrefs = {
+  _timer: null, _pending: {},
+  get() { return State.uiPrefs || {}; },
+  async load() {
+    const id = State.agent?.id;
     try {
-      const lbls = await Api.labels.list();
-      el.innerHTML = `
-        <div style="margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center;padding-bottom:1rem;border-bottom:1px solid var(--border-light)">
-          <div>
-            <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">Labels</h3>
-            <p style="margin:0;font-size:12.5px;color:var(--text-3)">Manage labels to categorize chats and organize your inbox</p>
-          </div>
-          <button class="btn btn-primary btn-sm" id="add-label-btn">+ New Label</button>
-        </div>
-        <div class="content-card">
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th style="width: 60px;">Color</th>
-                  <th>Label Name</th>
-                  <th style="text-align: right; width: 120px;">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${lbls.map(l => `
-                  <tr>
-                    <td>
-                      <div style="width:18px;height:18px;border-radius:4px;background:${esc(l.color)};border:1px solid rgba(0,0,0,0.15)"></div>
-                    </td>
-                    <td style="font-weight:600;font-size:13.5px;color:var(--text)">${esc(l.name)}</td>
-                    <td style="text-align: right;">
-                      <button class="btn btn-ghost btn-sm lbl-del" data-id="${l.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Label">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                        Delete
-                      </button>
-                    </td>
-                  </tr>`).join('') || `<tr><td colspan="3" class="text-muted" style="text-align:center;padding:2rem">No labels yet. Click "+ New Label" to create one.</td></tr>`}
-              </tbody>
-            </table>
-          </div>
-        </div>`;
+      const p = await Api.auth.uiPrefs();
+      if (State.agent?.id !== id) return;
+      State.uiPrefs = p || {};
+      this.apply(State.uiPrefs);
+    } catch (_) { State.uiPrefs = State.uiPrefs || {}; }
+  },
+  // Only keys the user has chosen (non-null) override this browser's state
+  apply(p) {
+    if (p.theme === 'light' || p.theme === 'dark') { applyTheme(p.theme); _store('theme', p.theme); }
+    if (typeof p.sidebar_expanded === 'boolean') {
+      applySidebarCollapsed(!p.sidebar_expanded);
+      _store('sidebar', p.sidebar_expanded ? null : 'collapsed');
+    }
+    if (typeof p.detail_panel_open === 'boolean') _store('cx-detail-open', p.detail_panel_open ? '1' : '0');
+    if (typeof p.ask_ai_visible === 'boolean') {
+      applyAskAiVisible(p.ask_ai_visible);
+      _store('ask_ai', p.ask_ai_visible ? null : 'hidden');
+    }
+  },
+  // Debounced background save (toggles fire in bursts)
+  save(patch) {
+    State.uiPrefs = { ...this.get(), ...patch };
+    Object.assign(this._pending, patch);
+    clearTimeout(this._timer);
+    this._timer = setTimeout(() => this.flush(), 400);
+  },
+  async flush() {
+    clearTimeout(this._timer);
+    const patch = this._pending;
+    this._pending = {};
+    if (!Object.keys(patch).length || !State.agent) return;
+    try { State.uiPrefs = await Api.auth.saveUiPrefs(patch); }
+    catch (e) { toast(`Couldn't save preferences: ${e.message || e}`, 'error'); }
+  },
+  async saveNow(patch) {
+    Object.assign(this._pending, patch);
+    const before = this.get();
+    State.uiPrefs = { ...before, ...patch };
+    try { await this.flush(); } catch (e) { State.uiPrefs = before; throw e; }
+  },
+};
 
-      document.getElementById('add-label-btn').addEventListener('click', () => {
-        showModal('New Label', `
-          <div class="form-group"><label>Name *</label><input type="text" id="lbl-name" placeholder="e.g. VIP, Support, Sales"></div>
-          <div class="form-group"><label>Color</label><input type="color" id="lbl-color" value="#0D8C7C"></div>
-          <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" id="lbl-save">Create</button>
-          </div>`);
-        document.getElementById('lbl-save').addEventListener('click', async () => {
-          const name = document.getElementById('lbl-name').value.trim();
-          if (!name) return toast('Name required', 'error');
-          try { await Api.labels.create({ name, color: document.getElementById('lbl-color').value }); closeModal(); toast('Label created', 'success'); loadSettingsTab('labels'); loadLabels(); }
-          catch(e) { toast(e.message, 'error'); }
-        });
-      });
-      el.querySelectorAll('.lbl-del').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          if (!confirm('Delete label?')) return;
-          try { await Api.labels.del(btn.dataset.id); toast('Deleted', 'success'); loadSettingsTab('labels'); loadLabels(); }
-          catch(e) { toast(e.message, 'error'); }
-        });
-      });
-    } catch(_) {}
-  }
+const ST_UNREAD_MODES = [
+  ['shared', 'Team count', 'Opening a chat clears its unread count in Hyperscope for the whole team. Nothing is sent to WhatsApp.'],
+  ['phone', 'Sync with phone', 'Also marks the chat read on WhatsApp: the phone’s unread badge clears and the contact sees blue ticks (if they have read receipts on).'],
+  ['personal', 'Personal count only', 'Leaves the team’s unread count and WhatsApp untouched. The chat keeps its unread badge in your list too, until a teammate using another mode opens it.'],
+];
 
-  else if (tab === 'quickreplies') {
+async function _stRenderPreferences(page) {
+  const root = document.documentElement;
+  const dark = root.getAttribute('data-theme') === 'dark';
+  const unread = UiPrefs.get().unread_sync || 'shared';
+  const tile = (act, icon, label, cls = '') =>
+    `<button class="st-tile${cls}" data-act="${act}">${stIcon(icon)}<span>${esc(label)}</span></button>`;
+  page.innerHTML = stHead('Preferences', ST_PAGES.preferences.sub)
+    + stCard('Interface', 'layout',
+        stRow('Left navigation bar', 'Show the full sidebar with labels. Off keeps a compact icon rail.',
+          stToggle('data-pref="sidebar"', root.getAttribute('data-sidebar') !== 'collapsed', 'Left navigation bar'))
+      + stRow('Right side panel', 'Open the chat details panel by default when you open a chat.',
+          stToggle('data-pref="detail"', cxDetailPref(), 'Right side panel'))
+      + stRow('Theme', 'Light or dark interface.', `
+          <div class="st-theme" role="radiogroup" aria-label="Theme">
+            <button class="st-theme-btn${dark ? '' : ' active'}" data-theme-pick="light" role="radio" aria-checked="${!dark}" title="Light">${stIcon('sun')}</button>
+            <button class="st-theme-btn${dark ? ' active' : ''}" data-theme-pick="dark" role="radio" aria-checked="${dark}" title="Dark">${stIcon('moon')}</button>
+          </div>`)
+      + stRow('Ask AI button', 'Show the Ask AI button in the top bar. Ctrl+K opens the assistant either way.',
+          stToggle('data-pref="askai"', root.getAttribute('data-ask-ai') !== 'hidden', 'Ask AI button')))
+    + stCard('Chats', 'chat', `
+        <div class="st-row st-row-stack">
+          <div class="st-row-text">
+            <div class="st-row-label" id="st-unread-label">Sync unread count with WhatsApp</div>
+            <div class="st-row-desc">What opening a chat does to its unread count. Applies to you only.</div>
+          </div>
+          <div class="st-radios" role="radiogroup" aria-labelledby="st-unread-label">
+            ${ST_UNREAD_MODES.map(([v, label, desc]) => `
+              <label class="st-radio${v === unread ? ' on' : ''}">
+                <input type="radio" name="st-unread" value="${v}" ${v === unread ? 'checked' : ''}>
+                <span><strong>${esc(label)}</strong><small>${esc(desc)}</small></span>
+              </label>`).join('')}
+          </div>
+        </div>`)
+    + stCard('Account & Security', 'lock', `
+        <div class="st-tiles">
+          ${tile('password', 'lock', 'Change Password')}
+          ${tile('profile', 'userpen', 'Edit Profile')}
+          ${tile('cache', 'broom', 'Clear Cache')}
+          ${tile('signout', 'signout', 'Sign Out', ' danger')}
+        </div>`);
+
+  page.querySelector('[data-pref="sidebar"]').addEventListener('change', e => {
+    const expanded = e.target.checked;
+    applySidebarCollapsed(!expanded);
+    _store('sidebar', expanded ? null : 'collapsed');
+    UiPrefs.save({ sidebar_expanded: expanded });
+  });
+  page.querySelector('[data-pref="detail"]').addEventListener('change', e => {
+    cxSetDetailPref(e.target.checked);   // also mirrors to the server
+  });
+  page.querySelector('[data-pref="askai"]').addEventListener('change', e => {
+    applyAskAiVisible(e.target.checked);
+    _store('ask_ai', e.target.checked ? null : 'hidden');
+    UiPrefs.save({ ask_ai_visible: e.target.checked });
+  });
+  page.querySelectorAll('[data-theme-pick]').forEach(b => b.addEventListener('click', () => {
+    const t = b.dataset.themePick;
+    applyTheme(t);
+    _store('theme', t);
+    UiPrefs.save({ theme: t });
+    page.querySelectorAll('[data-theme-pick]').forEach(x => {
+      const on = x === b;
+      x.classList.toggle('active', on);
+      x.setAttribute('aria-checked', String(on));
+    });
+  }));
+  page.querySelectorAll('input[name="st-unread"]').forEach(inp => inp.addEventListener('change', async () => {
+    page.querySelectorAll('.st-radio').forEach(l => l.classList.toggle('on', l.contains(inp)));
     try {
-      const qrs = await Api.quickReplies.list();
-      el.innerHTML = `
-        <div style="margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center;padding-bottom:1rem;border-bottom:1px solid var(--border-light)">
-          <div>
-            <h3 style="margin:0 0 .25rem;font-size:16px;font-weight:600">Quick Replies</h3>
-            <p style="margin:0;font-size:12.5px;color:var(--text-3)">Create shortcuts (starting with /) to quickly insert templates into the composer</p>
-          </div>
-          <button class="btn btn-primary btn-sm" id="add-qr-btn">+ New Quick Reply</button>
-        </div>
-        <div class="content-card">
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th style="width: 150px;">Shortcut</th>
-                  <th>Message Template</th>
-                  <th style="text-align: right; width: 120px;">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${qrs.map(q => `
-                  <tr>
-                    <td style="font-weight:700;font-size:13.5px;color:var(--accent);font-family:monospace">/${esc(q.command)}</td>
-                    <td style="font-size:13px;color:var(--text-2);word-break:break-all">${esc(q.message)}</td>
-                    <td style="text-align: right;">
-                      <button class="btn btn-ghost btn-sm qr-del" data-id="${q.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Quick Reply">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:3px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                        Delete
-                      </button>
-                    </td>
-                  </tr>`).join('') || `<tr><td colspan="3" class="text-muted" style="text-align:center;padding:2rem">No quick replies yet. Click "+ New Quick Reply" to create one.</td></tr>`}
-              </tbody>
-            </table>
-          </div>
-        </div>`;
+      await UiPrefs.saveNow({ unread_sync: inp.value });
+      toast('Unread sync updated', 'success');
+    } catch (_) { /* flush() already reported it */ }
+  }));
+  page.querySelector('.st-tiles').addEventListener('click', e => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'password') showChangePasswordModal();
+    else if (act === 'profile') _stEditProfileModal();
+    else if (act === 'cache') _stClearCache();
+    else if (act === 'signout') logoutFn();
+  });
+}
 
-      document.getElementById('add-qr-btn').addEventListener('click', () => {
-        showModal('New Quick Reply', `
-          <div class="form-group"><label>Command *</label><input type="text" id="qr-cmd" placeholder="e.g. hello (no slash)"></div>
-          <div class="form-group"><label>Message *</label><textarea id="qr-msg" placeholder="Message text to send..."></textarea></div>
-          <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" id="qr-save">Create</button>
-          </div>`);
-        document.getElementById('qr-save').addEventListener('click', async () => {
-          const cmd = document.getElementById('qr-cmd').value.trim();
-          const msg = document.getElementById('qr-msg').value.trim();
-          if (!cmd || !msg) return toast('Command and message required', 'error');
-          try { await Api.quickReplies.create({ command: cmd, message: msg }); closeModal(); toast('Created', 'success'); loadSettingsTab('quickreplies'); }
-          catch(e) { toast(e.message, 'error'); }
-        });
-      });
-      el.querySelectorAll('.qr-del').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          if (!confirm('Delete?')) return;
-          try { await Api.quickReplies.del(btn.dataset.id); toast('Deleted', 'success'); loadSettingsTab('quickreplies'); }
-          catch(e) { toast(e.message, 'error'); }
-        });
-      });
-    } catch(_) {}
-  }
+// Avatar colours (the first is the model default, which falls back to the name hash)
+const ST_AVATAR_COLORS = ['#2563EB', '#7C3AED', '#DB2777', '#D97706', '#059669', '#0F766E',
+                          '#DC2626', '#4F46E5', '#0891B2', '#65A30D', '#9333EA', '#475569'];
+const AGENT_DEFAULT_COLOR = '#0D8C7C';
+function agentColor(a) {
+  const c = a?.avatar_color;
+  return c && SAFE_COLOR_RE.test(c) && c.toUpperCase() !== AGENT_DEFAULT_COLOR ? c : avatarColor(a?.name);
+}
 
-  else if (tab === 'agents') {
+function _stEditProfileModal() {
+  const a = State.agent || {};
+  let color = agentColor(a);
+  showModal('Edit profile', `
+    <div class="st-profile-preview"><span class="agent-avatar" id="st-prof-av" style="background:${safeColor(color)}">${esc(initials(a.name))}</span>
+      <div><strong id="st-prof-name">${esc(a.name || '')}</strong><div class="text-muted" style="font-size:12.5px">${esc(a.email || '')}</div></div></div>
+    <div class="form-group">
+      <label for="st-prof-input">Name</label>
+      <input type="text" id="st-prof-input" maxlength="255" value="${esc(a.name || '')}">
+    </div>
+    <div class="form-group">
+      <label>Avatar colour</label>
+      <div class="st-swatches" role="radiogroup" aria-label="Avatar colour">
+        ${ST_AVATAR_COLORS.map(c => `<button type="button" class="st-swatch${c === color ? ' on' : ''}" data-color="${c}" role="radio" aria-checked="${c === color}" aria-label="${c}" style="background:${c}"></button>`).join('')}
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="st-prof-save">Save</button>
+    </div>`);
+  const av = document.getElementById('st-prof-av');
+  const inp = document.getElementById('st-prof-input');
+  inp.addEventListener('input', () => {
+    av.textContent = initials(inp.value.trim() || a.name);
+    document.getElementById('st-prof-name').textContent = inp.value.trim() || a.name;
+  });
+  document.querySelectorAll('.st-swatch[data-color]').forEach(b => b.addEventListener('click', () => {
+    color = b.dataset.color;
+    av.style.background = color;
+    document.querySelectorAll('.st-swatch[data-color]').forEach(x => {
+      x.classList.toggle('on', x === b);
+      x.setAttribute('aria-checked', String(x === b));
+    });
+  }));
+  document.getElementById('st-prof-save').addEventListener('click', async ev => {
+    const name = inp.value.trim();
+    if (!name) return toast('Name is required', 'error');
+    const btn = ev.currentTarget;
+    btn.disabled = true;
     try {
-      const agents = await Api.auth.agents();
-      el.innerHTML = `
-        <div style="margin-bottom:1rem;display:flex;justify-content:flex-end">
-          <button class="btn btn-primary btn-sm" id="invite-agent-btn">+ Invite Agent</button>
-        </div>
-        ${agents.map(a => `
-          <div style="display:flex;align-items:center;gap:.75rem;padding:.65rem .85rem;border-bottom:1px solid var(--border-light)">
-            <div class="agent-avatar" style="background:${avatarColor(a.name)};width:32px;height:32px;font-size:12px">${initials(a.name)}</div>
-            <div style="flex:1">
-              <div style="font-weight:600;font-size:13px">${esc(a.name)}</div>
-              <div style="font-size:11px;color:var(--text-3)">${esc(a.email)} · ${a.role}</div>
-            </div>
-            <span class="pill ${a.is_active ? 'pill-resolved' : 'pill-closed'}">${a.is_active ? 'Active' : 'Inactive'}</span>
-            <button class="btn btn-secondary btn-sm agent-numbers" data-aid="${a.id}" data-name="${esc(a.name)}">Numbers</button>
-          </div>`).join('')}`;
+      State.agent = { ...State.agent, ...(await Api.auth.updateMe({ name, avatar_color: color })) };
+      renderAgent();
+      closeModal();
+      toast('Profile updated', 'success');
+    } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+  });
+}
 
-      el.querySelectorAll('.agent-numbers').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          try {
-            const [perm, phones] = await Promise.all([
-              Api.auth.agentPhones(btn.dataset.aid), Api.phones.list(),
-            ]);
-            const allowed = new Set(perm.phone_ids);
-            showModal(`Number Access — ${btn.dataset.name}`, `
-              <p class="text-muted" style="font-size:12.5px;margin-bottom:.75rem">
-                Select which WhatsApp numbers this agent can access. No selection = access to all numbers.
-              </p>
-              ${phones.map(p => `
-                <label style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;font-size:13px">
-                  <input type="checkbox" class="perm-phone" value="${p.id}" ${allowed.has(p.id) ? 'checked' : ''}>
-                  ${esc(p.name || p.phone_number)} (${esc(p.phone_number)})
-                </label>`).join('') || '<p class="text-muted">No phones connected</p>'}
-              <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-                <button class="btn btn-primary" id="perm-save">Save</button>
-              </div>`);
-            document.getElementById('perm-save').addEventListener('click', async () => {
-              const ids = [...document.querySelectorAll('.perm-phone:checked')].map(c => parseInt(c.value));
-              try {
-                await Api.auth.setAgentPhones(btn.dataset.aid, ids);
-                closeModal(); toast('Number permissions saved', 'success');
-              } catch(e) { toast(e.message, 'error'); }
-            });
-          } catch(e) { toast(e.message, 'error'); }
-        });
-      });
+function _stClearCache() {
+  if (!confirm('Clear Hyperscope’s saved data in this browser (cached settings, drafts and view state) and reload? You stay signed in.')) return;
+  try {
+    Object.keys(localStorage).filter(k => k !== 'token').forEach(k => localStorage.removeItem(k));
+    sessionStorage.clear();
+  } catch (_) {}
+  location.reload();
+}
 
-      document.getElementById('invite-agent-btn').addEventListener('click', () => {
-        showModal('Invite Team Member', `
-          <div class="form-group"><label>Full Name *</label><input type="text" id="inv-name"></div>
-          <div class="form-group"><label>Email *</label><input type="email" id="inv-email"></div>
-          <div class="form-group"><label>Password *</label><input type="password" id="inv-pass"></div>
-          <div class="form-group"><label>Role</label>
-            <select id="inv-role"><option value="agent">Agent</option><option value="admin">Admin</option><option value="viewer">Viewer</option></select>
-          </div>
-          <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" id="inv-save">Invite</button>
-          </div>`);
-        document.getElementById('inv-save').addEventListener('click', async () => {
-          const name = document.getElementById('inv-name').value.trim();
-          const email = document.getElementById('inv-email').value.trim();
-          const pass = document.getElementById('inv-pass').value;
-          if (!name || !email || !pass) return toast('All fields required', 'error');
-          try {
-            await Api.auth.register({ name, email, password: pass, role: document.getElementById('inv-role').value });
-            closeModal(); toast('Agent created', 'success'); loadSettingsTab('agents');
-          } catch(e) { toast(e.message, 'error'); }
-        });
-      });
-    } catch(_) {}
-  }
+// ── Scheduled messages (the existing view, embedded) ── //
+async function _stRenderScheduled(page) {
+  page.innerHTML = stHead('Scheduled Messages', ST_PAGES.scheduled.sub,
+      `<button class="btn btn-primary btn-sm" id="new-sched-btn">${stIcon('plus')} Schedule message</button>`)
+    + `<div id="sched-list" class="st-embed">${stLoading()}</div>`;
+  page.querySelector('#new-sched-btn').addEventListener('click', () => showScheduleModal());
+  await loadScheduled();
+}
 
-  else if (tab === 'properties') {
-    const entity = window._propEntity || 'chat';
-    try {
-      const defs = await Api.properties.definitions(entity);
-      const sections = {};
-      defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
-      el.innerHTML = `
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-          <div class="tab-bar" style="border:none">
-            <div class="tab ${entity === 'chat' ? 'active' : ''}" data-ent="chat">Chat properties</div>
-            <div class="tab ${entity === 'ticket' ? 'active' : ''}" data-ent="ticket">Ticket properties</div>
-          </div>
-          <button class="btn btn-primary btn-sm" id="new-prop-btn">+ New Property</button>
-        </div>
-        ${Object.keys(sections).length ? Object.entries(sections).map(([sec, list]) => `
-          <div class="content-card" style="margin-bottom:.8rem">
-            <div class="card-header">${esc(sec)}</div>
-            <div class="table-wrap"><table class="data-table">
-              <thead><tr><th>Name</th><th>Type</th><th>Options</th><th>Required</th><th></th></tr></thead>
-              <tbody>${list.map(d => `<tr>
-                <td style="font-weight:600">${esc(d.name)}</td>
-                <td><span class="pill pill-open" style="font-size:11px">${esc(d.prop_type)}</span></td>
-                <td style="font-size:12px;color:var(--text-3)">${(d.options || []).map(esc).join(', ') || '—'}</td>
-                <td>${d.required ? 'Yes' : 'No'}</td>
-                <td>
-                  <button class="btn btn-ghost btn-sm prop-del" data-pid="${d.id}" style="color:var(--danger);padding:4px 8px;font-size:12px;font-weight:500" title="Delete Property">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;vertical-align:middle"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                    Delete
-                  </button>
-                </td>
-              </tr>`).join('')}</tbody>
-            </table></div>
-          </div>`).join('')
-        : `<div class="empty-state" style="padding:3rem;text-align:center">
-            <p class="text-muted" style="font-size:13px">No custom ${entity} properties yet.<br>
-            Create fields like "Plan", "Renewal date" or "Account owner" — they appear in the ${entity === 'chat' ? 'chat detail panel' : 'ticket view'}.</p>
-          </div>`}`;
-      el.querySelectorAll('.tab[data-ent]').forEach(t => t.addEventListener('click', () => {
-        window._propEntity = t.dataset.ent; loadSettingsTab('properties');
-      }));
-      el.querySelectorAll('.prop-del').forEach(btn => btn.addEventListener('click', async () => {
-        if (!confirm('Delete this property? Its values will stay stored but hidden.')) return;
-        try { await Api.properties.deleteDef(btn.dataset.pid); toast('Deleted', 'success'); loadSettingsTab('properties'); }
-        catch(e) { toast(e.message, 'error'); }
-      }));
-      document.getElementById('new-prop-btn').addEventListener('click', () => {
-        showModal('New Custom Property', `
-          <div class="form-group"><label>Entity</label><select id="pr-entity">
-            <option value="chat" ${entity === 'chat' ? 'selected' : ''}>Chat</option>
-            <option value="ticket" ${entity === 'ticket' ? 'selected' : ''}>Ticket</option>
-          </select></div>
-          <div class="form-group"><label>Section</label><input type="text" id="pr-section" value="General" placeholder="e.g. Account details"></div>
-          <div class="form-group"><label>Name *</label><input type="text" id="pr-name" placeholder="e.g. Plan"></div>
-          <div class="form-group"><label>Type</label><select id="pr-type">
-            <option value="text">Text</option>
-            <option value="number">Number</option>
-            <option value="date">Date</option>
-            <option value="single_select">Single-select dropdown</option>
-            <option value="multi_select">Multi-select dropdown</option>
-          </select></div>
-          <div class="form-group" id="pr-options-wrap" style="display:none">
-            <label>Options (comma separated) *</label>
-            <input type="text" id="pr-options" placeholder="Free, Pro, Enterprise">
-          </div>
-          <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
-            <input type="checkbox" id="pr-required" style="width:15px;height:15px"> Required (tickets)</label></div>
-          <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" id="pr-save">Create</button>
-          </div>`);
-        const typeSel = document.getElementById('pr-type');
-        typeSel.addEventListener('change', () => {
-          document.getElementById('pr-options-wrap').style.display =
-            typeSel.value.endsWith('_select') ? 'block' : 'none';
-        });
-        document.getElementById('pr-save').addEventListener('click', async () => {
-          const name = document.getElementById('pr-name').value.trim();
-          if (!name) return toast('Name required', 'error');
-          try {
-            await Api.properties.createDef({
-              entity: document.getElementById('pr-entity').value,
-              section: document.getElementById('pr-section').value.trim() || 'General',
-              name,
-              prop_type: typeSel.value,
-              options: typeSel.value.endsWith('_select')
-                ? document.getElementById('pr-options').value.split(',').map(s => s.trim()).filter(Boolean)
-                : null,
-              required: document.getElementById('pr-required').checked,
-            });
-            closeModal(); toast('Property created', 'success'); loadSettingsTab('properties');
-          } catch(e) { toast(e.message, 'error'); }
-        });
-      });
-    } catch(e) { el.innerHTML = `<div class="loading-center text-muted">${esc(e.message)}</div>`; }
-  }
+// ── Alerts & Notifications (same prefs as the bell popover) ── //
+const ST_NOTIF_SETTINGS = [
+  ['in_app', 'In-App Notifications', 'Show a pop-up inside Hyperscope when something needs your attention.'],
+  ['desktop', 'Desktop Notifications', 'Show a system notification while Hyperscope is in the background.'],
+  ['sound', 'Sound', 'Play a short chime with each notification.'],
+];
+const ST_NOTIF_TYPES = [
+  ['new_messages', 'New Messages', 'A customer sends a message in a chat you can see.'],
+  ['new_note', 'New Private Note', 'A teammate adds a private note to a chat.'],
+  ['ticket_assign', 'Ticket Assignment', 'A ticket is assigned to you.'],
+  ['task_assign', 'Task Assignment', 'A task is assigned to you.'],
+  ['chat_assign', 'Chat Assignment', 'A chat is assigned to you.'],
+  ['ticket_overdue', 'Ticket Overdue', 'A ticket assigned to you passes its due date.'],
+  ['task_overdue', 'Task Overdue', 'A task assigned to you passes its due date.'],
+];
 
+async function stEnsureDesktopPermission() {
+  if (!('Notification' in window)) return 'This browser does not support desktop notifications';
+  if (Notification.permission === 'granted') return '';
+  if (Notification.permission === 'denied') return 'Desktop notifications are blocked. Allow them for this site in your browser settings.';
+  try {
+    return (await Notification.requestPermission()) === 'granted' ? '' : 'Desktop notification permission was not granted';
+  } catch (_) { return 'Could not request desktop notification permission'; }
+}
 
-
-  else if (tab === 'exports') {
-    el.innerHTML = `
-      <div class="settings-grid">
-        ${[
-          ['Chats', 'chats', 'All chats with status, labels and assignment'],
-          ['Messages (30d)', 'messages', 'Message history for the last 30 days'],
-          ['Tickets', 'tickets', 'Tickets with status, priority and SLA info'],
-          ['Contacts', 'contacts', 'Contact book (masked numbers stay masked)'],
-          ['Audit Logs (30d)', 'logs', 'Full audit trail — admin only'],
-        ].map(([label, key, desc]) => `
-          <div class="content-card">
-            <div class="card-header">${label}</div>
-            <div class="card-body">
-              <p class="text-muted" style="font-size:12.5px;margin-bottom:.7rem">${desc}</p>
-              <button class="btn btn-secondary btn-sm export-btn" data-key="${key}">Download CSV</button>
-            </div>
-          </div>`).join('')}
-      </div>`;
-    el.querySelectorAll('.export-btn').forEach(btn => btn.addEventListener('click', async () => {
-      try { await Api.exports[btn.dataset.key](); toast('Export downloaded', 'success'); }
-      catch(e) { toast(e.message, 'error'); }
+async function _stRenderNotifications(page, stale) {
+  const paint = () => {
+    const p = NotifPrefs.get();
+    page.innerHTML = stHead('Alerts & Notifications', ST_PAGES.notifications.sub)
+      + stCard('Notification Settings', 'bell', ST_NOTIF_SETTINGS.map(([k, label, desc]) =>
+          stRow(label, desc, stToggle(`data-setting="${k}"`, p[k], label))).join(''))
+      + stCard('Notification Types', 'list', ST_NOTIF_TYPES.map(([k, label, desc]) =>
+          stRow(label, desc, stToggle(`data-type="${k}"`, p.types[k], label))).join(''));
+    page.querySelectorAll('input[data-setting], input[data-type]').forEach(inp => inp.addEventListener('change', async () => {
+      const key = inp.dataset.setting;
+      if (key === 'desktop' && inp.checked) {
+        const reason = await stEnsureDesktopPermission();
+        if (reason) { inp.checked = false; return toast(reason, 'error'); }
+      }
+      const patch = key ? { [key]: inp.checked } : { types: { [inp.dataset.type]: inp.checked } };
+      try {
+        await NotifPrefs.save(patch);
+        if (key === 'sound' && inp.checked) NotifSound.play();
+      } catch (e) {
+        inp.checked = !inp.checked;
+        toast(`Couldn't save notification settings: ${e.message || e}`, 'error');
+      }
     }));
+  };
+  paint();
+  const shown = JSON.stringify(NotifPrefs.get());
+  await loadNotifPrefs();
+  if (!stale() && JSON.stringify(NotifPrefs.get()) !== shown) paint();
+}
+// Changes made from the bell popover show up here too
+document.addEventListener('notifprefs:change', () => {
+  if (State.currentRoute !== 'settings/notifications') return;
+  const p = NotifPrefs.get();
+  document.querySelectorAll('.st-page input[data-setting]').forEach(i => { i.checked = !!p[i.dataset.setting]; });
+  document.querySelectorAll('.st-page input[data-type]').forEach(i => { i.checked = !!p.types[i.dataset.type]; });
+});
+
+// ── General (organization details + logo) ── //
+const ORG_LOGO_MAX = 512 * 1024;
+const OrgLogo = {
+  url: null, ver: null,
+  // Logo bytes need the auth header, so they're held as a blob: URL
+  async refresh() {
+    const org = State.org;
+    if (!org?.has_logo) { this.clear(); return; }
+    if (this.url && this.ver === org.logo_version) return;
+    try {
+      const blob = await Api.org.logoBlob();
+      if (!blob) { this.clear(); return; }
+      this.clear();
+      this.url = URL.createObjectURL(blob);
+      this.ver = org.logo_version;
+    } catch (_) {}
+  },
+  clear() { if (this.url) URL.revokeObjectURL(this.url); this.url = null; this.ver = null; },
+};
+function paintOrgAvatar(el, name, url = OrgLogo.url) {
+  if (!el) return;
+  if (url) {
+    el.textContent = '';
+    el.style.backgroundImage = `url("${url}")`;
+    el.classList.add('has-logo');
+  } else {
+    el.style.backgroundImage = '';
+    el.classList.remove('has-logo');
+    el.textContent = wsInitial(name);
   }
 }
 
+async function _stRenderGeneral(page, stale) {
+  if (!State.org) await loadOrg();
+  if (stale()) return;
+  const org = State.org || { name: 'Hyperscope', uid: '' };
+  const admin = isAdmin();
+  const ro = admin ? '' : 'disabled';
+  let logo = { data: null, remove: false };   // pending logo change
+  page.innerHTML = stHead('General', ST_PAGES.general.sub)
+    + stCard('Organization Details', 'building',
+        stRow('Organization Name', 'Shown in the sidebar and on the dashboard.',
+          `<input type="text" class="st-input" id="st-org-name" maxlength="120" value="${esc(org.name || '')}" ${ro} aria-label="Organization name">`)
+      + stRow('Organization ID', 'Include this when you contact support.',
+          `<span class="st-code">${esc(org.uid || '—')}</span>
+           <button class="st-icon-btn" id="st-org-uid" title="Copy organization ID" aria-label="Copy organization ID" ${org.uid ? '' : 'disabled'}>${stIcon('copy')}</button>`)
+      + stRow('Organization Logo', admin ? 'PNG or JPG, up to 512 KB. Square images look best.' : 'Shown in the sidebar and on the dashboard.',
+          `<span class="st-logo" id="st-logo-preview"></span>
+           ${admin ? `<input type="file" id="st-logo-file" accept="image/png,image/jpeg" hidden>
+             <button class="btn btn-secondary btn-sm" id="st-logo-pick">${stIcon('upload')} Upload</button>
+             <button class="btn btn-ghost btn-sm" id="st-logo-remove" title="Remove logo">Remove</button>` : ''}`))
+    + stCard('Help & Support', 'info',
+        stRow('Support email', 'Shown to your team under Help & Support.',
+          `<input type="email" class="st-input" id="st-org-email" maxlength="255" placeholder="support@yourcompany.com" value="${esc(org.support_email || '')}" ${ro} aria-label="Support email">`)
+      + stRow('Help centre URL', 'Linked from Help & Support.',
+          `<input type="url" class="st-input" id="st-org-url" maxlength="500" placeholder="https://" value="${esc(org.support_url || '')}" ${ro} aria-label="Help centre URL">`))
+    + (admin ? `<div class="st-actions"><button class="btn btn-primary" id="st-org-save" disabled>Update</button></div>`
+             : `<p class="st-note">Only admins can change organization settings.</p>`);
+
+  const $ = s => page.querySelector(s);
+  const preview = $('#st-logo-preview');
+  const hasLogo = () => logo.data ? true : logo.remove ? false : !!org.has_logo;
+  const paintPreview = () => {
+    paintOrgAvatar(preview, $('#st-org-name').value || org.name, logo.data || (logo.remove ? null : OrgLogo.url));
+    const rm = $('#st-logo-remove');
+    if (rm) rm.hidden = !hasLogo();
+  };
+  const initial = () => [org.name || '', org.support_email || '', org.support_url || ''];
+  const current = () => [$('#st-org-name').value.trim(), $('#st-org-email').value.trim(), $('#st-org-url').value.trim()];
+  const dirty = () => logo.data || logo.remove || current().some((v, i) => v !== initial()[i]);
+  const sync = () => { const b = $('#st-org-save'); if (b) b.disabled = !dirty(); };
+  await OrgLogo.refresh();
+  if (stale()) return;
+  paintPreview();
+
+  $('#st-org-uid').addEventListener('click', () => stCopy(org.uid, 'Organization ID copied'));
+  page.querySelectorAll('.st-input').forEach(i => i.addEventListener('input', () => { sync(); if (i.id === 'st-org-name') paintPreview(); }));
+  $('#st-logo-pick')?.addEventListener('click', () => $('#st-logo-file').click());
+  $('#st-logo-file')?.addEventListener('change', e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    if (!/^image\/(png|jpeg)$/.test(f.type)) return toast('Logo must be a PNG or JPG image', 'error');
+    if (f.size > ORG_LOGO_MAX) return toast('Logo must be 512 KB or smaller', 'error');
+    const reader = new FileReader();
+    reader.onload = () => { logo = { data: reader.result, remove: false }; paintPreview(); sync(); };
+    reader.onerror = () => toast('Could not read that file', 'error');
+    reader.readAsDataURL(f);
+  });
+  $('#st-logo-remove')?.addEventListener('click', () => { logo = { data: null, remove: !!org.has_logo }; paintPreview(); sync(); });
+  $('#st-org-save')?.addEventListener('click', async ev => {
+    const [name, support_email, support_url] = current();
+    if (!name) return toast('Organization name is required', 'error');
+    if (support_url && !/^https?:\/\//i.test(support_url)) return toast('Help centre URL must start with http:// or https://', 'error');
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Updating…';
+    try {
+      if (current().some((v, i) => v !== initial()[i])) State.org = await Api.org.update({ name, support_email, support_url });
+      if (logo.data) State.org = await Api.org.uploadLogo(logo.data);
+      else if (logo.remove) State.org = await Api.org.deleteLogo();
+      await OrgLogo.refresh();
+      renderOrg();
+      toast('Organization updated', 'success');
+      if (State.currentRoute === 'settings/general') renderSettings('general');
+    } catch (e) {
+      toast(e.message, 'error');
+      btn.textContent = 'Update';
+      sync();
+    }
+  });
+}
+
+// ── Phones ── //
+const ST_WA_LOGO = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="12" fill="#25D366"/><path fill="#fff" d="M17.4 14.4c-.3-.1-1.7-.8-1.9-.9-.3-.1-.4-.1-.6.1-.2.3-.7.9-.9 1.1-.2.2-.3.2-.6.1-.3-.1-1.2-.4-2.2-1.4-.8-.7-1.4-1.6-1.5-1.9-.2-.3 0-.4.1-.6l.4-.5c.1-.2.2-.3.3-.5.1-.2 0-.4 0-.5l-.9-2.1c-.2-.5-.5-.5-.6-.5h-.5c-.2 0-.5.1-.7.3-.3.3-1 .9-1 2.3s1 2.7 1.2 2.9c.1.2 2 3.1 4.9 4.3 2.4.9 2.9.8 3.4.7.5-.1 1.7-.7 1.9-1.4.2-.7.2-1.2.2-1.4-.1-.1-.3-.2-.6-.3z"/></svg>`;
+const ST_PH = { q: '', status: 'all' };
+
+async function _stRenderPhones(page, stale) {
+  const admin = isAdmin();
+  const [phones, phoneLabels] = await Promise.all([
+    Api.phones.list(),
+    Api.labels.list('phone').then(ls => (ls || []).filter(l => l.type === 'phone')).catch(() => []),
+  ]);
+  if (stale()) return;
+  State.phones = phones;
+  updatePhoneBadge();
+  // Silently resolve a WORKING phone still showing a "pending" number
+  phones.filter(p => p.waha_status === 'WORKING' && (p.phone_number || '').startsWith('pending'))
+        .forEach(p => Api.phones.syncNumber(p.id).catch(() => {}));
+  const connected = phones.filter(p => p.waha_status === 'WORKING').length;
+  page.innerHTML = stHead('Phones', ST_PAGES.phones.sub,
+      admin ? `<button class="btn btn-primary btn-sm" id="st-add-phone">Add phone ${stIcon('phonecall')}</button>` : '')
+    + `<div class="st-toolbar">
+        ${stSearch('Search phones', ST_PH.q)}
+        <label class="st-filter">${stIcon('filter')}
+          <select id="st-ph-status" aria-label="Filter by status">
+            <option value="all">All phones</option>
+            <option value="connected">Connected</option>
+            <option value="disconnected">Not connected</option>
+          </select>
+        </label>
+        <span class="st-pill ${connected ? 'ok' : 'off'}"><i></i>${connected} / ${phones.length} phone${phones.length === 1 ? '' : 's'} connected</span>
+      </div>
+      <div class="st-phones" id="st-phone-list"></div>`;
+  const list = page.querySelector('#st-phone-list');
+  const sel = page.querySelector('#st-ph-status');
+  sel.value = ST_PH.status;
+
+  const card = p => {
+    const st = _dashStatusInfo(p.waha_status);
+    const ok = p.waha_status === 'WORKING';
+    const number = _dashFmtPhone(p.phone_number);
+    const labels = Array.isArray(p.label_ids) && phoneLabels.length
+      ? `<div class="st-phone-labels">${phoneLabels.filter(l => p.label_ids.includes(l.id)).map(l =>
+          `<span class="st-chip"><i style="background:${safeColor(l.color)}"></i>${esc(l.name)}</span>`).join('')}
+          ${admin ? `<button class="st-link" data-act="label">+ Label</button>` : ''}</div>` : '';
+    return `<div class="st-phone" data-pid="${p.id}">
+      <div class="st-phone-row">
+        <span class="st-phone-logo">${ST_WA_LOGO}</span>
+        <div class="st-phone-meta">
+          <div class="st-phone-num">${number ? esc(number) : '<span class="st-muted">Pending connection</span>'}</div>
+          <div class="st-phone-name">${esc(p.name)}<span class="st-muted"> · ${esc(p.session_name || '')}</span></div>
+          ${labels}
+        </div>
+        <div class="st-phone-status">
+          <span class="dsh-status-dot ${st.cls}" aria-hidden="true"></span><span>${esc(st.label)}</span>
+          ${admin ? `<button class="st-link" data-act="restart">Restart</button>` : ''}
+        </div>
+        ${admin ? `<button class="st-icon-btn" data-act="menu" aria-haspopup="menu" title="More actions" aria-label="More actions for ${esc(p.name)}">${stIcon('more')}</button>` : ''}
+      </div>
+      ${!ok && admin ? `<div class="st-phone-cta"><span>Scan a QR code with WhatsApp to link this number.</span>
+          <button class="btn btn-primary btn-sm phone-btn-connect" data-pid="${p.id}">${stIcon('qr')} Connect</button></div>` : ''}
+      <div class="st-phone-qr" id="phone-qr-area-${p.id}" hidden></div>
+    </div>`;
+  };
+  const paint = () => {
+    const q = ST_PH.q.trim().toLowerCase();
+    const rows = phones.filter(p => {
+      const ok = p.waha_status === 'WORKING';
+      if (ST_PH.status === 'connected' && !ok) return false;
+      if (ST_PH.status === 'disconnected' && ok) return false;
+      return !q || [p.name, p.phone_number, _dashFmtPhone(p.phone_number), p.session_name].some(v => String(v || '').toLowerCase().includes(q));
+    });
+    list.innerHTML = rows.map(card).join('') || (phones.length
+      ? stEmpty('No phones match your search.', 'search')
+      : `<div class="st-empty st-empty-lg">${stIcon('phone')}<strong>No WhatsApp numbers yet</strong>
+          <span>${admin ? 'Add a phone and scan the QR code to connect your first number.' : 'Ask an admin to connect a WhatsApp number.'}</span></div>`);
+  };
+  paint();
+
+  page.querySelector('#st-add-phone')?.addEventListener('click', showAddPhoneModal);
+  page.querySelector('.st-search input').addEventListener('input', e => { ST_PH.q = e.target.value; paint(); });
+  sel.addEventListener('change', () => { ST_PH.status = sel.value; paint(); });
+  list.addEventListener('click', e => {
+    const btn = e.target.closest('button');
+    const el = btn?.closest('[data-pid]');
+    if (!btn || !el) return;
+    const pid = +el.dataset.pid;
+    const phone = phones.find(p => p.id === pid);
+    if (btn.classList.contains('phone-btn-connect')) return _stLogoutAndShowQR(pid, btn);
+    const act = btn.dataset.act;
+    if (act === 'restart') return _stPhoneAction(pid, 'restart', btn);
+    if (act === 'label') return _stPhoneLabelPicker(btn, phone, phoneLabels);
+    if (act === 'menu') {
+      e.stopPropagation();
+      const ok = phone.waha_status === 'WORKING';
+      stMenu(btn, [
+        { label: ok ? 'Reconnect / QR' : 'Scan QR to connect', icon: 'qr', fn: () => _stPhoneAction(pid, 'qr') },
+        ...(ok ? [{ label: 'Log out', icon: 'signout', fn: () => _stPhoneAction(pid, 'logout') }] : []),
+        { label: 'Clear data', icon: 'broom', danger: true, fn: () => _stPhoneAction(pid, 'clear') },
+        { label: 'Delete', icon: 'trash', danger: true, fn: () => _stPhoneAction(pid, 'delete') },
+      ]);
+    }
+  });
+}
+
+async function _stPhoneAction(pid, act, btn) {
+  const phone = State.phones.find(p => p.id === pid);
+  const reload = () => { loadPhones(); if (State.currentRoute === 'settings/phones') renderSettings('phones'); };
+  try {
+    if (act === 'restart') {
+      if (btn) { btn.disabled = true; btn.textContent = 'Restarting…'; }
+      await Api.phones.restart(pid);
+      toast('Session restarting…', 'success');
+      setTimeout(reload, 2500);
+    } else if (act === 'qr') {
+      if (phone?.waha_status === 'WORKING' &&
+          !confirm('Reconnect this number? The current session will be logged out and a new QR code shown.')) return;
+      await _stLogoutAndShowQR(pid, document.querySelector(`.st-phone[data-pid="${pid}"] .phone-btn-connect`));
+    } else if (act === 'logout') {
+      if (!confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
+      await Api.phones.logout(pid);
+      toast('Disconnected — scan QR to reconnect', 'success');
+      reload();
+    } else if (act === 'clear') {
+      if (!confirm('WARNING: This will permanently delete all synced chats, messages, and associated tasks/tickets for this phone from the database. Proceed?')) return;
+      await Api.phones.clearData(pid);
+      toast('Data cleared successfully!', 'success');
+      reload();
+    } else if (act === 'delete') {
+      if (!confirm('Remove this phone session from Hyperscope? This will deactivate the session.')) return;
+      await Api.phones.del(pid);
+      toast('Phone session removed', 'success');
+      reload();
+    }
+  } catch (e) {
+    toast(e.message, 'error');
+    if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = 'Restart'; }
+  }
+}
+
+// Phone labels: only offered when the server returns phone.label_ids
+function _stPhoneLabelPicker(anchor, phone, phoneLabels) {
+  const cur = new Set(phone.label_ids || []);
+  const pop = cxPopover(anchor, `<div class="cx-pop-title">Phone labels</div>${phoneLabels.map(l => `
+      <label class="cx-pop-check"><input type="checkbox" value="${l.id}" ${cur.has(l.id) ? 'checked' : ''}>
+        <i class="cx-dot" style="background:${safeColor(l.color)}"></i>${esc(l.name)}</label>`).join('')}`, { cls: 'st-pop' });
+  pop.addEventListener('change', async e => {
+    const id = +e.target.value;
+    e.target.checked ? cur.add(id) : cur.delete(id);
+    try {
+      await Api.phones.update(phone.id, { label_ids: [...cur] });
+      phone.label_ids = [...cur];
+    } catch (err) { e.target.checked = !e.target.checked; toast(err.message, 'error'); }
+  });
+  pop.addEventListener('click', e => e.stopPropagation());
+}
+
+// ── Team ── //
+const ST_TEAM = { q: '', selected: new Set() };
+const ST_ROLES = [['admin', 'Admin'], ['agent', 'Agent'], ['viewer', 'Viewer']];
+
+async function _stRenderTeam(page, stale) {
+  const admin = isAdmin();
+  const [agents, phones] = await Promise.all([Api.auth.team(admin), Api.phones.list().catch(() => State.phones || [])]);
+  if (stale()) return;
+  ST_TEAM.selected = new Set([...ST_TEAM.selected].filter(id => agents.some(a => a.id === id)));
+  const phoneName = id => { const p = phones.find(x => x.id === id); return p ? (p.name || _dashFmtPhone(p.phone_number)) : `#${id}`; };
+  const me = State.agent?.id;
+  page.innerHTML = stHead('Team', ST_PAGES.team.sub, `
+      <button class="btn btn-secondary btn-sm" id="st-team-refresh">${stIcon('refresh')} Refresh</button>
+      ${admin ? `<button class="btn btn-primary btn-sm" id="invite-agent-btn">${stIcon('userplus')} Invite team</button>` : ''}`)
+    + `<div class="st-toolbar">
+        ${stSearch('Search by name or email', ST_TEAM.q)}
+        <span class="st-count" id="st-team-count"></span>
+        <div class="st-bulk" id="st-team-bulk" hidden>
+          <span id="st-bulk-n"></span>
+          <button class="btn btn-secondary btn-sm" data-bulk="deactivate">Deactivate</button>
+          <button class="btn btn-secondary btn-sm" data-bulk="reactivate">Reactivate</button>
+        </div>
+      </div>
+      <div class="st-card st-table-card"><div class="table-wrap"><table class="st-table">
+        <thead><tr>
+          ${admin ? '<th class="st-col-check"><input type="checkbox" id="st-team-all" aria-label="Select all"></th>' : ''}
+          <th>User</th><th>Role</th><th>Phones</th><th class="st-col-act"><span class="sr-only">Actions</span></th>
+        </tr></thead>
+        <tbody id="st-team-body"></tbody>
+      </table></div></div>`;
+  const body = page.querySelector('#st-team-body');
+
+  const row = a => {
+    const self = a.id === me;
+    const role = String(a.role || '').toLowerCase();
+    const chips = a.phone_ids?.length
+      ? a.phone_ids.slice(0, 2).map(phoneName).map(n => `<span class="st-chip">${esc(n)}</span>`).join('') + (a.phone_ids.length > 2 ? `<span class="st-chip">+${a.phone_ids.length - 2}</span>` : '')
+      : '<span class="st-chip">All Phones</span>';
+    return `<tr data-aid="${a.id}" class="${a.is_active ? '' : 'is-inactive'}">
+      ${admin ? `<td class="st-col-check"><input type="checkbox" data-sel="${a.id}" ${ST_TEAM.selected.has(a.id) ? 'checked' : ''} ${self ? 'disabled' : ''} aria-label="Select ${esc(a.name)}"></td>` : ''}
+      <td><div class="st-user">
+        <span class="agent-avatar st-av" style="background:${safeColor(agentColor(a))}">${esc(initials(a.name))}${a.online ? '<i class="st-online" title="Online"></i>' : ''}</span>
+        <div class="st-user-meta"><div class="st-user-name">${esc(a.name)}${self ? ' <span class="st-muted">(you)</span>' : ''}${a.is_active ? '' : ' <span class="st-badge">Deactivated</span>'}</div>
+          <div class="st-user-email">${esc(a.email)}</div></div>
+      </div></td>
+      <td>${admin && !self && a.is_active
+        ? `<select class="st-select" data-role="${a.id}" aria-label="Role for ${esc(a.name)}">${ST_ROLES.map(([v, l]) => `<option value="${v}" ${v === role ? 'selected' : ''}>${l}</option>`).join('')}</select>`
+        : `<span class="st-role">${esc((ST_ROLES.find(r => r[0] === role) || [0, role])[1])}</span>`}</td>
+      <td>${admin ? `<button class="st-chips-btn" data-act="phones" title="Choose which numbers ${esc(a.name)} can use">${chips}</button>` : `<div class="st-chips-btn is-static">${chips}</div>`}</td>
+      <td class="st-col-act">${admin && !self ? `<button class="st-icon-btn" data-act="menu" aria-haspopup="menu" aria-label="Actions for ${esc(a.name)}">${stIcon('more')}</button>` : ''}</td>
+    </tr>`;
+  };
+  const visible = () => {
+    const q = ST_TEAM.q.trim().toLowerCase();
+    return agents.filter(a => !q || a.name.toLowerCase().includes(q) || a.email.toLowerCase().includes(q));
+  };
+  const syncBulk = () => {
+    const bar = page.querySelector('#st-team-bulk');
+    bar.hidden = !ST_TEAM.selected.size;
+    page.querySelector('#st-bulk-n').textContent = `${ST_TEAM.selected.size} selected`;
+    const all = page.querySelector('#st-team-all');
+    if (all) {
+      const ids = visible().filter(a => a.id !== me).map(a => a.id);
+      all.checked = ids.length > 0 && ids.every(id => ST_TEAM.selected.has(id));
+    }
+  };
+  const paint = () => {
+    const rows = visible();
+    body.innerHTML = rows.map(row).join('') || `<tr><td colspan="5">${stEmpty('No team members match your search.', 'search')}</td></tr>`;
+    const active = agents.filter(a => a.is_active).length;
+    page.querySelector('#st-team-count').textContent = `${active} member${active === 1 ? '' : 's'}${agents.length > active ? ` · ${agents.length - active} deactivated` : ''}`;
+    syncBulk();
+  };
+  paint();
+
+  const reload = () => stReload();
+  const patchAgent = async (a, b, okMsg) => {
+    try {
+      await Api.auth.updateAgent(a.id, b);
+      toast(okMsg, 'success');
+      _cxAgentMap = {};  // assignee names/colours
+      return true;
+    } catch (e) { toast(e.message, 'error'); return false; }
+  };
+  page.querySelector('#st-team-refresh').addEventListener('click', reload);
+  page.querySelector('#invite-agent-btn')?.addEventListener('click', () => _stInviteModal(reload));
+  page.querySelector('.st-search input').addEventListener('input', e => { ST_TEAM.q = e.target.value; paint(); });
+  page.querySelector('#st-team-all')?.addEventListener('change', e => {
+    visible().filter(a => a.id !== me).forEach(a => e.target.checked ? ST_TEAM.selected.add(a.id) : ST_TEAM.selected.delete(a.id));
+    paint();
+  });
+  body.addEventListener('change', async e => {
+    const t = e.target;
+    if (t.dataset.sel) { t.checked ? ST_TEAM.selected.add(+t.dataset.sel) : ST_TEAM.selected.delete(+t.dataset.sel); return syncBulk(); }
+    if (t.dataset.role) {
+      const a = agents.find(x => x.id === +t.dataset.role);
+      const prev = String(a.role).toLowerCase();
+      if (t.value === prev) return;
+      if (!confirm(`Change ${a.name}'s role to ${t.options[t.selectedIndex].text}?`)) { t.value = prev; return; }
+      t.disabled = true;
+      if (await patchAgent(a, { role: t.value }, 'Role updated')) a.role = t.value; else t.value = prev;
+      t.disabled = false;
+    }
+  });
+  body.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const a = agents.find(x => x.id === +btn.closest('[data-aid]').dataset.aid);
+    if (btn.dataset.act === 'phones') return _stAgentPhonesModal(a, phones, reload);
+    if (btn.dataset.act === 'menu') {
+      e.stopPropagation();
+      stMenu(btn, [
+        { label: 'Edit name', icon: 'pen', fn: () => _stRenameAgentModal(a, reload) },
+        { label: 'Phone access', icon: 'phone', fn: () => _stAgentPhonesModal(a, phones, reload) },
+        a.is_active
+          ? { label: 'Deactivate', icon: 'lock', danger: true, fn: async () => {
+              if (!confirm(`Deactivate ${a.name}? They are signed out and can't log in until reactivated.`)) return;
+              if (await patchAgent(a, { is_active: false }, `${a.name} deactivated`)) reload();
+            } }
+          : { label: 'Reactivate', icon: 'check', fn: async () => {
+              if (await patchAgent(a, { is_active: true }, `${a.name} reactivated`)) reload();
+            } },
+      ]);
+    }
+  });
+  page.querySelector('#st-team-bulk').addEventListener('click', async e => {
+    const act = e.target.closest('[data-bulk]')?.dataset.bulk;
+    if (!act) return;
+    const on = act === 'reactivate';
+    const targets = agents.filter(a => ST_TEAM.selected.has(a.id) && a.is_active !== on);
+    if (!targets.length) return toast(`Nothing to ${act}`, 'error');
+    if (!confirm(`${on ? 'Reactivate' : 'Deactivate'} ${targets.length} member${targets.length === 1 ? '' : 's'}?`)) return;
+    let done = 0;
+    for (const a of targets) {
+      try { await Api.auth.updateAgent(a.id, { is_active: on }); done++; }
+      catch (err) { toast(`${a.name}: ${err.message}`, 'error'); }
+    }
+    if (done) toast(`${done} member${done === 1 ? '' : 's'} ${on ? 'reactivated' : 'deactivated'}`, 'success');
+    ST_TEAM.selected.clear();
+    reload();
+  });
+}
+
+function _stAgentPhonesModal(a, phones, onSaved) {
+  const allowed = new Set(a.phone_ids || []);
+  showModal(`Phone access — ${esc(a.name)}`, `
+    <p class="text-muted" style="font-size:12.5px;margin-bottom:.75rem">
+      Choose which WhatsApp numbers ${esc(a.name)} can use. No selection = access to all numbers.
+    </p>
+    ${phones.map(p => `
+      <label class="st-check-row">
+        <input type="checkbox" class="perm-phone" value="${p.id}" ${allowed.has(p.id) ? 'checked' : ''}>
+        <span>${esc(p.name || p.phone_number)}</span><span class="st-muted">${esc(_dashFmtPhone(p.phone_number))}</span>
+      </label>`).join('') || '<p class="text-muted">No phones connected</p>'}
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="perm-save">Save</button>
+    </div>`);
+  document.getElementById('perm-save').addEventListener('click', async ev => {
+    const ids = [...document.querySelectorAll('.perm-phone:checked')].map(c => parseInt(c.value));
+    ev.currentTarget.disabled = true;
+    try {
+      await Api.auth.setAgentPhones(a.id, ids);
+      closeModal(); toast('Number permissions saved', 'success');
+      onSaved?.();
+    } catch (e) { toast(e.message, 'error'); ev.currentTarget.disabled = false; }
+  });
+}
+
+function _stRenameAgentModal(a, onSaved) {
+  showModal('Edit name', `
+    <div class="form-group"><label for="st-ren">Name</label><input type="text" id="st-ren" maxlength="255" value="${esc(a.name)}"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="st-ren-save">Save</button>
+    </div>`);
+  document.getElementById('st-ren').focus();
+  document.getElementById('st-ren-save').addEventListener('click', async ev => {
+    const name = document.getElementById('st-ren').value.trim();
+    if (!name) return toast('Name is required', 'error');
+    ev.currentTarget.disabled = true;
+    try {
+      await Api.auth.updateAgent(a.id, { name });
+      closeModal(); toast('Name updated', 'success');
+      _cxAgentMap = {};
+      onSaved?.();
+    } catch (e) { toast(e.message, 'error'); ev.currentTarget.disabled = false; }
+  });
+}
+
+function _stInviteModal(onDone) {
+  showModal('Invite team member', `
+    <div class="form-group"><label for="inv-name">Full name *</label><input type="text" id="inv-name" maxlength="255"></div>
+    <div class="form-group"><label for="inv-email">Email *</label><input type="email" id="inv-email" maxlength="255"></div>
+    <div class="form-group"><label for="inv-pass">Password * <small class="text-muted">(8–72 characters)</small></label><input type="password" id="inv-pass" minlength="8" maxlength="72" autocomplete="new-password"></div>
+    <div class="form-group"><label for="inv-role">Role</label>
+      <select id="inv-role"><option value="agent">Agent</option><option value="admin">Admin</option><option value="viewer">Viewer</option></select>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="inv-save">Invite</button>
+    </div>`);
+  document.getElementById('inv-name').focus();
+  document.getElementById('inv-save').addEventListener('click', async ev => {
+    const name = document.getElementById('inv-name').value.trim();
+    const email = document.getElementById('inv-email').value.trim();
+    const pass = document.getElementById('inv-pass').value;
+    if (!name || !email || !pass) return toast('All fields required', 'error');
+    if (pass.length < 8 || pass.length > 72) return toast('Password must be 8–72 characters', 'error');
+    ev.currentTarget.disabled = true;
+    try {
+      await Api.auth.register({ name, email, password: pass, role: document.getElementById('inv-role').value });
+      closeModal(); toast('Team member added', 'success');
+      onDone?.();
+    } catch (e) { toast(e.message, 'error'); ev.currentTarget.disabled = false; }
+  });
+}
+
+// ── Labels ── //
+const ST_LABEL_COLORS = [
+  ['Brown', '#8D6E63'], ['Olive', '#827717'], ['Teal', '#0D9488'], ['Green', '#16A34A'],
+  ['Dark teal', '#0F766E'], ['Periwinkle', '#7C8CF8'], ['Blue', '#2563EB'], ['Indigo', '#4F46E5'],
+  ['Violet', '#7C3AED'], ['Purple', '#9333EA'], ['Orange', '#EA580C'], ['Rust', '#B45309'],
+  ['Red', '#DC2626'], ['Pink', '#EC4899'], ['Magenta', '#C026D3'], ['Slate', '#64748B'],
+];
+const ST_LABEL_TYPES = [['chat', 'Chat'], ['ticket', 'Ticket'], ['phone', 'Phone']];
+const ST_LBL = { type: 'chat', q: '' };
+
+async function _stRenderLabels(page, stale) {
+  const type = ST_LBL.type;
+  const raw = await Api.labels.list(type);
+  if (stale()) return;
+  // Servers without label types return every label with no `type` → all are chat labels
+  const typed = raw.some(l => 'type' in l);
+  const lbls = typed ? raw.filter(l => (l.type || 'chat') === type) : (type === 'chat' ? raw : []);
+  const unsupported = !typed && raw.length > 0 && type !== 'chat';
+  const tname = ST_LABEL_TYPES.find(t => t[0] === type)[1];
+  page.innerHTML = stHead('Labels', ST_PAGES.labels.sub,
+      `<button class="btn btn-primary btn-sm" id="st-lbl-new" ${unsupported ? 'disabled title="Not available on this server yet"' : ''}>${stIcon('plus')} Create ${tname.toLowerCase()} label</button>`)
+    + `<div class="st-tabs" role="tablist">${ST_LABEL_TYPES.map(([v, l]) =>
+        `<button class="st-tab${v === type ? ' active' : ''}" role="tab" aria-selected="${v === type}" data-type="${v}">${l}</button>`).join('')}</div>
+      <div class="st-toolbar">${stSearch(`Search ${tname.toLowerCase()} labels`, ST_LBL.q)}<span class="st-count" id="st-lbl-count"></span></div>
+      <div class="st-card st-table-card" id="st-lbl-list"></div>`;
+  const listEl = page.querySelector('#st-lbl-list');
+  const paint = () => {
+    const q = ST_LBL.q.trim().toLowerCase();
+    const rows = lbls.filter(l => !q || l.name.toLowerCase().includes(q));
+    page.querySelector('#st-lbl-count').textContent = `${lbls.length} label${lbls.length === 1 ? '' : 's'}`;
+    listEl.innerHTML = unsupported
+      ? stEmpty(`${tname} labels aren’t available on this server yet.`)
+      : rows.length ? `<table class="st-table st-table-labels"><tbody>${rows.map(l => `
+          <tr data-id="${l.id}">
+            <td><span class="st-lbl"><i style="background:${safeColor(l.color)}"></i>${esc(l.name)}</span></td>
+            <td class="st-col-act">
+              <button class="st-icon-btn" data-act="edit" title="Edit label" aria-label="Edit ${esc(l.name)}">${stIcon('pen')}</button>
+              <button class="st-icon-btn danger" data-act="delete" title="Delete label" aria-label="Delete ${esc(l.name)}">${stIcon('trash')}</button>
+            </td>
+          </tr>`).join('')}</tbody></table>`
+      : stEmpty(lbls.length ? 'No labels match your search.' : `No ${tname.toLowerCase()} labels yet.`, lbls.length ? 'search' : 'tag');
+  };
+  paint();
+  page.querySelectorAll('.st-tab').forEach(t => t.addEventListener('click', () => {
+    if (ST_LBL.type === t.dataset.type) return;
+    ST_LBL.type = t.dataset.type; ST_LBL.q = '';
+    stReload();
+  }));
+  page.querySelector('.st-search input').addEventListener('input', e => { ST_LBL.q = e.target.value; paint(); });
+  page.querySelector('#st-lbl-new').addEventListener('click', () => _stLabelModal(null, type));
+  listEl.addEventListener('click', async e => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const l = lbls.find(x => x.id === +btn.closest('[data-id]').dataset.id);
+    if (btn.dataset.act === 'edit') return _stLabelModal(l, type);
+    if (!confirm(`Delete the label "${l.name}"? It is removed from everything it's on.`)) return;
+    try { await Api.labels.del(l.id); toast('Label deleted', 'success'); loadLabels(); stReload(); }
+    catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+function _stLabelModal(label, type) {
+  let color = label?.color && SAFE_COLOR_RE.test(label.color) ? label.color : ST_LABEL_COLORS[6][1];
+  const tname = ST_LABEL_TYPES.find(t => t[0] === type)[1].toLowerCase();
+  showModal(label ? 'Edit label' : `Create ${tname} label`, `
+    <div class="form-group">
+      <label for="st-lbl-name">Label name</label>
+      <div class="st-lbl-input"><i id="st-lbl-dot" style="background:${safeColor(color)}"></i>
+        <input type="text" id="st-lbl-name" maxlength="100" placeholder="e.g. VIP, Follow up, Billing" value="${esc(label?.name || '')}"></div>
+    </div>
+    <div class="form-group">
+      <label>Colour</label>
+      <div class="st-swatches st-swatches-8" role="radiogroup" aria-label="Label colour">
+        ${ST_LABEL_COLORS.map(([n, c]) => `<button type="button" class="st-swatch${c.toLowerCase() === color.toLowerCase() ? ' on' : ''}" data-color="${c}" role="radio" aria-checked="${c.toLowerCase() === color.toLowerCase()}" title="${n}" aria-label="${n}" style="background:${c}"></button>`).join('')}
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="st-lbl-save">Save Label</button>
+    </div>`);
+  const nameEl = document.getElementById('st-lbl-name');
+  nameEl.focus();
+  document.querySelectorAll('.st-swatch[data-color]').forEach(b => b.addEventListener('click', () => {
+    color = b.dataset.color;
+    document.getElementById('st-lbl-dot').style.background = color;
+    document.querySelectorAll('.st-swatch[data-color]').forEach(x => {
+      x.classList.toggle('on', x === b);
+      x.setAttribute('aria-checked', String(x === b));
+    });
+  }));
+  const save = async ev => {
+    const name = nameEl.value.trim();
+    if (!name) return toast('Label name is required', 'error');
+    const btn = document.getElementById('st-lbl-save');
+    btn.disabled = true;
+    try {
+      if (label) await Api.labels.update(label.id, { name, color });
+      else {
+        const res = await Api.labels.create({ name, color, type });
+        if (type !== 'chat' && res && !('type' in res)) toast('Saved as a chat label — this server has no label types yet', 'error');
+      }
+      closeModal();
+      toast(label ? 'Label updated' : 'Label created', 'success');
+      loadLabels();
+      stReload();
+    } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+  };
+  document.getElementById('st-lbl-save').addEventListener('click', save);
+  nameEl.addEventListener('keydown', e => { if (e.key === 'Enter') save(e); });
+}
+
+// ── Quick replies ── //
+const ST_QR = { q: '' };
+async function _stRenderQuickReplies(page, stale) {
+  const qrs = await Api.quickReplies.list();
+  if (stale()) return;
+  page.innerHTML = stHead('Quick Replies', ST_PAGES['quick-replies'].sub,
+      `<button class="btn btn-primary btn-sm" id="add-qr-btn">${stIcon('plus')} New quick reply</button>`)
+    + `<div class="st-toolbar">${stSearch('Search quick replies', ST_QR.q)}<span class="st-count">${qrs.length} repl${qrs.length === 1 ? 'y' : 'ies'}</span></div>
+       <div class="st-card st-table-card" id="st-qr-list"></div>`;
+  const listEl = page.querySelector('#st-qr-list');
+  const paint = () => {
+    const q = ST_QR.q.trim().toLowerCase();
+    const rows = qrs.filter(r => !q || r.command.toLowerCase().includes(q) || r.message.toLowerCase().includes(q));
+    listEl.innerHTML = rows.length ? `<table class="st-table"><tbody>${rows.map(r => `
+        <tr data-id="${r.id}">
+          <td class="st-qr-cmd">/${esc(r.command)}</td>
+          <td class="st-qr-msg">${esc(r.message)}</td>
+          <td class="st-col-act">
+            <button class="st-icon-btn" data-act="edit" title="Edit" aria-label="Edit /${esc(r.command)}">${stIcon('pen')}</button>
+            <button class="st-icon-btn danger" data-act="delete" title="Delete" aria-label="Delete /${esc(r.command)}">${stIcon('trash')}</button>
+          </td>
+        </tr>`).join('')}</tbody></table>`
+      : stEmpty(qrs.length ? 'No quick replies match your search.' : 'No quick replies yet. Create one to reuse common answers.', qrs.length ? 'search' : 'bolt');
+  };
+  paint();
+  page.querySelector('.st-search input').addEventListener('input', e => { ST_QR.q = e.target.value; paint(); });
+  page.querySelector('#add-qr-btn').addEventListener('click', () => _stQuickReplyModal(null));
+  listEl.addEventListener('click', async e => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const r = qrs.find(x => x.id === +btn.closest('[data-id]').dataset.id);
+    if (btn.dataset.act === 'edit') return _stQuickReplyModal(r);
+    if (!confirm(`Delete /${r.command}?`)) return;
+    try { await Api.quickReplies.del(r.id); toast('Deleted', 'success'); stReload(); }
+    catch (err) { toast(err.message, 'error'); }
+  });
+}
+
+function _stQuickReplyModal(r) {
+  showModal(r ? 'Edit quick reply' : 'New quick reply', `
+    <div class="form-group"><label for="qr-cmd">Shortcut *</label>
+      <div class="st-prefix-input"><span>/</span><input type="text" id="qr-cmd" maxlength="50" placeholder="hello" value="${esc(r?.command || '')}"></div></div>
+    <div class="form-group"><label for="qr-msg">Message *</label><textarea id="qr-msg" rows="5" placeholder="Message text to insert…">${esc(r?.message || '')}</textarea></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="qr-save">${r ? 'Save' : 'Create'}</button>
+    </div>`);
+  document.getElementById('qr-cmd').focus();
+  document.getElementById('qr-save').addEventListener('click', async ev => {
+    const command = document.getElementById('qr-cmd').value.trim().replace(/^\/+/, '');
+    const message = document.getElementById('qr-msg').value.trim();
+    if (!command || !message) return toast('Shortcut and message are required', 'error');
+    ev.currentTarget.disabled = true;
+    try {
+      r ? await Api.quickReplies.update(r.id, { command, message }) : await Api.quickReplies.create({ command, message });
+      closeModal(); toast(r ? 'Quick reply updated' : 'Quick reply created', 'success'); stReload();
+    } catch (e) { toast(e.message, 'error'); ev.currentTarget.disabled = false; }
+  });
+}
+
+// ── Custom properties ── //
+const ST_PROP_TYPES = { text: 'Text', number: 'Number', date: 'Date', single_select: 'Single-select', multi_select: 'Multi-select' };
+async function _stRenderProperties(page, stale) {
+  const entity = window._propEntity || 'chat';
+  const admin = isAdmin();
+  const defs = await Api.properties.definitions(entity);
+  if (stale()) return;
+  const sections = {};
+  defs.forEach(d => { (sections[d.section] = sections[d.section] || []).push(d); });
+  page.innerHTML = stHead('Custom Properties', ST_PAGES['custom-properties'].sub,
+      admin ? `<button class="btn btn-primary btn-sm" id="new-prop-btn">${stIcon('plus')} New property</button>` : '')
+    + `<div class="st-tabs" role="tablist">
+        <button class="st-tab${entity === 'chat' ? ' active' : ''}" role="tab" aria-selected="${entity === 'chat'}" data-ent="chat">Chat properties</button>
+        <button class="st-tab${entity === 'ticket' ? ' active' : ''}" role="tab" aria-selected="${entity === 'ticket'}" data-ent="ticket">Ticket properties</button>
+      </div>`
+    + (Object.keys(sections).length ? Object.entries(sections).map(([sec, list]) => stCard(sec, 'list', `
+        <table class="st-table"><thead><tr><th>Name</th><th>Type</th><th>Options</th><th>Required</th>${admin ? '<th class="st-col-act"></th>' : ''}</tr></thead>
+        <tbody>${list.map(d => `<tr>
+          <td class="st-strong">${esc(d.name)}</td>
+          <td><span class="st-chip">${esc(ST_PROP_TYPES[d.prop_type] || d.prop_type)}</span></td>
+          <td class="st-muted">${(d.options || []).map(esc).join(', ') || '—'}</td>
+          <td>${d.required ? 'Yes' : 'No'}</td>
+          ${admin ? `<td class="st-col-act"><button class="st-icon-btn danger prop-del" data-pid="${d.id}" title="Delete property" aria-label="Delete ${esc(d.name)}">${stIcon('trash')}</button></td>` : ''}
+        </tr>`).join('')}</tbody></table>`, { cls: 'st-table-card' })).join('')
+      : `<div class="st-card">${stEmpty(`No custom ${entity} properties yet. They appear in the ${entity === 'chat' ? 'chat details panel' : 'ticket view'}.`, 'list')}</div>`);
+  page.querySelectorAll('.st-tab[data-ent]').forEach(t => t.addEventListener('click', () => {
+    if (window._propEntity === t.dataset.ent) return;
+    window._propEntity = t.dataset.ent; stReload();
+  }));
+  page.querySelectorAll('.prop-del').forEach(btn => btn.addEventListener('click', async () => {
+    if (!confirm('Delete this property? Its values will stay stored but hidden.')) return;
+    try { await Api.properties.deleteDef(btn.dataset.pid); toast('Deleted', 'success'); stReload(); }
+    catch (e) { toast(e.message, 'error'); }
+  }));
+  page.querySelector('#new-prop-btn')?.addEventListener('click', () => _stPropertyModal(entity));
+}
+
+function _stPropertyModal(entity) {
+  showModal('New custom property', `
+    <div class="form-group"><label for="pr-entity">Entity</label><select id="pr-entity">
+      <option value="chat" ${entity === 'chat' ? 'selected' : ''}>Chat</option>
+      <option value="ticket" ${entity === 'ticket' ? 'selected' : ''}>Ticket</option>
+    </select></div>
+    <div class="form-group"><label for="pr-section">Section</label><input type="text" id="pr-section" value="General" placeholder="e.g. Account details" maxlength="100"></div>
+    <div class="form-group"><label for="pr-name">Name *</label><input type="text" id="pr-name" placeholder="e.g. Plan" maxlength="100"></div>
+    <div class="form-group"><label for="pr-type">Type</label><select id="pr-type">
+      ${Object.entries(ST_PROP_TYPES).map(([v, l]) => `<option value="${v}">${l}${v.endsWith('_select') ? ' dropdown' : ''}</option>`).join('')}
+    </select></div>
+    <div class="form-group" id="pr-options-wrap" style="display:none">
+      <label for="pr-options">Options (comma separated) *</label>
+      <input type="text" id="pr-options" placeholder="Free, Pro, Enterprise">
+    </div>
+    <div class="form-group"><label style="display:flex;align-items:center;gap:.4rem;font-weight:400">
+      <input type="checkbox" id="pr-required" style="width:15px;height:15px"> Required (tickets)</label></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="pr-save">Create</button>
+    </div>`);
+  const typeSel = document.getElementById('pr-type');
+  typeSel.addEventListener('change', () => {
+    document.getElementById('pr-options-wrap').style.display = typeSel.value.endsWith('_select') ? 'block' : 'none';
+  });
+  document.getElementById('pr-save').addEventListener('click', async ev => {
+    const name = document.getElementById('pr-name').value.trim();
+    if (!name) return toast('Name required', 'error');
+    ev.currentTarget.disabled = true;
+    try {
+      await Api.properties.createDef({
+        entity: document.getElementById('pr-entity').value,
+        section: document.getElementById('pr-section').value.trim() || 'General',
+        name,
+        prop_type: typeSel.value,
+        options: typeSel.value.endsWith('_select')
+          ? document.getElementById('pr-options').value.split(',').map(s => s.trim()).filter(Boolean)
+          : null,
+        required: document.getElementById('pr-required').checked,
+      });
+      closeModal(); toast('Property created', 'success'); stReload();
+    } catch (e) { toast(e.message, 'error'); ev.currentTarget.disabled = false; }
+  });
+}
+
+// ── API keys ── //
+function _stDate(ts) {
+  const d = parseServerDate(ts);
+  return d && !isNaN(d) ? d.toLocaleDateString('en', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
+}
+async function _stRenderApi(page, stale) {
+  const keys = await Api.developer.apiKeys();
+  if (stale()) return;
+  const base = `${location.origin}${BASE}/public/v1`;
+  const active = keys.filter(k => k.is_active);
+  page.innerHTML = stHead('API', ST_PAGES.api.sub,
+      `<button class="btn btn-primary btn-sm" id="st-key-new">${stIcon('key')} Create API key</button>`)
+    + stCard('API keys', 'key', keys.length ? `<table class="st-table"><thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody>
+        ${keys.map(k => `<tr data-id="${k.id}" class="${k.is_active ? '' : 'is-inactive'}">
+          <td class="st-strong">${esc(k.name)}</td>
+          <td><span class="st-code">${esc(k.key_prefix)}…</span></td>
+          <td class="st-muted">${_stDate(k.created_at)}</td>
+          <td class="st-muted">${k.last_used_at ? esc(timeAgo(k.last_used_at)) : 'Never'}</td>
+          <td class="st-col-act">${k.is_active ? `<button class="btn btn-ghost btn-sm st-danger-text" data-act="revoke">Revoke</button>` : '<span class="st-badge">Revoked</span>'}</td>
+        </tr>`).join('')}</tbody></table>` : stEmpty('No API keys yet. Create one to call the Hyperscope API from your own systems.', 'key'),
+        { cls: 'st-table-card' })
+    + stCard('Using the API', 'code', `
+        ${stRow('Base URL', 'All endpoints live under this address.', `<span class="st-code st-code-wrap">${esc(base)}</span><button class="st-icon-btn" data-copy="${esc(base)}" aria-label="Copy base URL" title="Copy">${stIcon('copy')}</button>`)}
+        ${stRow('Authentication', 'Send your key in the X-API-Key header.', '<span class="st-code">X-API-Key: psk_…</span>')}
+        <pre class="st-pre">curl ${esc(base)}/numbers \\\n  -H "X-API-Key: YOUR_API_KEY"</pre>
+        <div class="st-endpoints">
+          ${[['POST', '/messages/send', 'Send a text message'], ['GET', '/chats', 'List chats'], ['GET', '/chats/{chat_wid}/messages', 'Messages in a chat'],
+             ['POST', '/tickets', 'Create a ticket'], ['GET', '/numbers', 'Connected numbers']].map(([m, p, d]) =>
+            `<div class="st-endpoint"><span class="st-method ${m.toLowerCase()}">${m}</span><code>${esc(p)}</code><span class="st-muted">${esc(d)}</span></div>`).join('')}
+        </div>
+        <p class="st-note">${active.length} active key${active.length === 1 ? '' : 's'}. Keys have full API access — revoke any you no longer use.</p>`);
+  page.querySelector('#st-key-new').addEventListener('click', _stCreateKeyModal);
+  page.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', () => stCopy(b.dataset.copy)));
+  page.querySelectorAll('[data-act="revoke"]').forEach(b => b.addEventListener('click', async () => {
+    const k = keys.find(x => x.id === +b.closest('[data-id]').dataset.id);
+    if (!confirm(`Revoke the API key "${k.name}"? Anything using it stops working immediately.`)) return;
+    try { await Api.developer.revokeApiKey(k.id); toast('API key revoked', 'success'); stReload(); }
+    catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+function _stCreateKeyModal() {
+  showModal('Create API key', `
+    <div class="form-group"><label for="st-key-name">Name</label>
+      <input type="text" id="st-key-name" maxlength="255" placeholder="e.g. CRM sync, Zap">
+      <small class="text-muted">Helps you recognise where the key is used.</small></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="st-key-save">Create key</button>
+    </div>`);
+  const inp = document.getElementById('st-key-name');
+  inp.focus();
+  document.getElementById('st-key-save').addEventListener('click', async ev => {
+    const name = inp.value.trim();
+    if (!name) return toast('Name is required', 'error');
+    ev.currentTarget.disabled = true;
+    try {
+      const res = await Api.developer.createApiKey(name);
+      stReload();
+      showModal('API key created', `
+        <p class="st-warn">${stIcon('info')} Copy this key now — it won’t be shown again.</p>
+        <div class="st-secret"><code id="st-new-key">${esc(res.api_key)}</code>
+          <button class="btn btn-secondary btn-sm" id="st-key-copy">${stIcon('copy')} Copy</button></div>
+        <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Done</button></div>`);
+      document.getElementById('st-key-copy').addEventListener('click', () => stCopy(res.api_key, 'API key copied'));
+    } catch (e) { toast(e.message, 'error'); ev.currentTarget.disabled = false; }
+  });
+}
+
+// ── Webhooks ── //
+async function _stRenderWebhooks(page, stale) {
+  const [hooks, events] = await Promise.all([Api.developer.webhooks(), Api.developer.webhookEvents().catch(() => [])]);
+  if (stale()) return;
+  page.innerHTML = stHead('Webhooks', ST_PAGES.webhooks.sub,
+      `<button class="btn btn-primary btn-sm" id="st-hook-new">${stIcon('plus')} Add webhook</button>`)
+    + stCard('Endpoints', 'webhook', hooks.length ? hooks.map(h => `
+        <div class="st-hook" data-id="${h.id}">
+          <div class="st-hook-main">
+            <div class="st-hook-url">${esc(h.url)}</div>
+            <div class="st-hook-meta">
+              ${(h.events && h.events.length ? h.events : ['All events']).map(e => `<span class="st-chip">${esc(e)}</span>`).join('')}
+              ${h.has_secret ? `<span class="st-muted">${stIcon('lock')} Signed</span>` : ''}
+              ${h.failure_count ? `<span class="st-danger-text">${h.failure_count} failed deliver${h.failure_count === 1 ? 'y' : 'ies'}</span>` : ''}
+            </div>
+          </div>
+          <div class="st-hook-actions">
+            <button class="btn btn-secondary btn-sm" data-act="test">${stIcon('paper')} Test</button>
+            <button class="st-icon-btn danger" data-act="delete" title="Delete webhook" aria-label="Delete webhook">${stIcon('trash')}</button>
+          </div>
+        </div>`).join('') : stEmpty('No webhooks yet. Add an endpoint to receive message, chat and ticket events.', 'webhook'))
+    + stCard('Payload', 'code', `
+        <p class="st-note" style="margin-top:0">Each event is a JSON POST. With a secret set, the <span class="st-code">X-Signature</span> header carries <span class="st-code">sha256=HMAC(secret, body)</span>.</p>
+        <pre class="st-pre">{ "event": "message.received",\n  "timestamp": "2026-01-01T12:00:00Z",\n  "data": { … } }</pre>`);
+  page.querySelector('#st-hook-new').addEventListener('click', () => _stWebhookModal(events));
+  page.querySelectorAll('.st-hook').forEach(el => el.addEventListener('click', async e => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const h = hooks.find(x => x.id === +el.dataset.id);
+    if (btn.dataset.act === 'test') {
+      btn.disabled = true;
+      try {
+        const r = await Api.developer.testWebhook(h.id);
+        toast(r.ok ? `Test delivered — ${r.message}` : `Test failed — ${r.message}`, r.ok ? 'success' : 'error');
+      } catch (err) { toast(err.message, 'error'); }
+      btn.disabled = false;
+    } else {
+      if (!confirm(`Delete the webhook for ${h.url}?`)) return;
+      try { await Api.developer.deleteWebhook(h.id); toast('Webhook deleted', 'success'); stReload(); }
+      catch (err) { toast(err.message, 'error'); }
+    }
+  }));
+}
+
+function _stWebhookModal(events) {
+  showModal('Add webhook', `
+    <div class="form-group"><label for="st-hook-url">Endpoint URL *</label>
+      <input type="url" id="st-hook-url" maxlength="1000" placeholder="https://example.com/hooks/hyperscope">
+      <small class="text-muted">Must be a public http(s) address.</small></div>
+    <div class="form-group"><label for="st-hook-secret">Signing secret</label>
+      <input type="text" id="st-hook-secret" maxlength="255" placeholder="Optional" autocomplete="off"></div>
+    <div class="form-group"><label>Events</label>
+      <div class="st-event-list">${events.map(ev => `
+        <label class="st-check-row"><input type="checkbox" class="st-hook-ev" value="${esc(ev)}"><code>${esc(ev)}</code></label>`).join('')}</div>
+      <small class="text-muted">Leave all unticked to receive every event.</small></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="st-hook-save">Add webhook</button>
+    </div>`);
+  document.getElementById('st-hook-url').focus();
+  document.getElementById('st-hook-save').addEventListener('click', async ev => {
+    const url = document.getElementById('st-hook-url').value.trim();
+    if (!/^https?:\/\//i.test(url)) return toast('Enter an http:// or https:// URL', 'error');
+    const picked = [...document.querySelectorAll('.st-hook-ev:checked')].map(c => c.value);
+    ev.currentTarget.disabled = true;
+    try {
+      await Api.developer.createWebhook({ url, secret: document.getElementById('st-hook-secret').value.trim(), events: picked.length ? picked : null });
+      closeModal(); toast('Webhook added', 'success'); stReload();
+    } catch (e) { toast(e.message, 'error'); ev.currentTarget.disabled = false; }
+  });
+}
+
+const ST_RENDER = {
+  preferences: _stRenderPreferences,
+  scheduled: _stRenderScheduled,
+  notifications: _stRenderNotifications,
+  general: _stRenderGeneral,
+  phones: _stRenderPhones,
+  team: _stRenderTeam,
+  labels: _stRenderLabels,
+  'quick-replies': _stRenderQuickReplies,
+  'custom-properties': _stRenderProperties,
+  api: _stRenderApi,
+  webhooks: _stRenderWebhooks,
+};
+
+// ── Screen permissions (GET /org/permissions; admins bypass; 404 → allow all) ── //
+const SIDEBAR_SCREENS = {
+  analytics: 'analytics', bulk: 'bulk', contacts: 'contacts', media: 'media', 'ai-agent': 'ai',
+  automation: 'automation', 'chat-list': 'chat_list', logs: 'logs',
+};
+const Perms = {
+  data: null, version: 0,
+  async load() {
+    let data = null;
+    try { data = await Api.org.permissions(); } catch (_) {}
+    const changed = JSON.stringify(data) !== JSON.stringify(this.data);
+    this.data = data;
+    this.applySidebar();
+    if (!changed) return;
+    this.version++;
+    // Re-render a view the user may no longer see (or the settings sub-nav)
+    if (State.currentView === 'settings') stReload();
+    else if (!Perms.view(State.currentView)) navigateTo(State.currentRoute || State.currentView);
+  },
+  screen(key) {
+    if (isAdmin() || !this.data || !this.data.screens) return true;
+    return this.data.screens[key] !== false;
+  },
+  action(key) {
+    if (isAdmin() || !this.data || !this.data.actions) return true;
+    return this.data.actions[key] !== false;
+  },
+  view(view) { return !SIDEBAR_SCREENS[view] || this.screen(SIDEBAR_SCREENS[view]); },
+  applySidebar() {
+    document.querySelectorAll('.sidebar-nav .nav-item[data-view]').forEach(el => {
+      el.style.display = this.view(el.dataset.view) ? '' : 'none';
+    });
+  },
+  reset() { this.data = null; this.version++; this.applySidebar(); },
+};
+window.Perms = Perms;
+
 
 // ── DASHBOARD VIEW ──────────────────────────────────────────────── //
+// Show/hide the dashboard connection panel (QR / status) for one phone
+function _dashShowPanel(phoneId, show) {
+  const panel = document.getElementById('dash-waha-panel');
+  if (!panel) return;
+  panel.hidden = !show;
+  const title = document.getElementById('dash-waha-title');
+  const ph = State.phones.find(p => p.id === phoneId);
+  if (title) title.textContent = ph ? ph.name : 'WhatsApp';
+}
+
 function _stopDashWahaPoller() {
   if (_dashWahaTimer) { clearInterval(_dashWahaTimer); _dashWahaTimer = null; }
+}
+
+// pollDashQR() setTimeout chain: a token lets Cancel/navigation stop it
+let _dashQrTimer = null;
+let _dashQrToken = 0;
+function _stopDashQrPoll() {
+  _dashQrToken++;
+  clearTimeout(_dashQrTimer);
+  _dashQrTimer = null;
 }
 
 async function _updateDashWaha(phoneId) {
@@ -3809,28 +8265,20 @@ async function _updateDashWaha(phoneId) {
       status = (r.status || 'UNKNOWN').toUpperCase();
     } catch(_) { status = 'UNKNOWN'; }
 
+    _dashSetPhoneStatus(phoneId, status);
+    _dashShowPanel(phoneId, status !== 'WORKING');
+
     if (status === 'WORKING') {
-      if (_dashWahaPrevStatus !== 'WORKING') {
-        box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem">
-          <div style="width:64px;height:64px;border-radius:50%;background:#dcfce7;display:flex;align-items:center;justify-content:center">
-            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#15803d" stroke-width="2.2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-          </div>
-          <span style="font-size:12px;font-weight:600;color:#15803d;background:#dcfce7;padding:.25rem .75rem;border-radius:20px">Connected</span>
-        </div>`;
-        label.innerHTML = `<strong style="font-size:13px">WhatsApp</strong><br><span style="font-size:11px;color:var(--text-3)">Session active</span>`;
-        actions.innerHTML = `
-          <button class="btn btn-danger btn-sm" id="dash-btn-stop">Disconnect</button>
-          <button class="btn btn-primary btn-sm" id="dash-btn-restart">Restart</button>`;
-        _bindDashWahaButtons(phoneId);
-      }
+      // Connected: the phone card already shows it, so the panel is hidden
+      if (_dashWahaPrevStatus !== 'WORKING') { box.innerHTML = ''; label.innerHTML = ''; actions.innerHTML = ''; }
 
     } else if (status === 'SCAN_QR_CODE') {
       if (_dashWahaPrevStatus !== 'SCAN_QR_CODE') {
         box.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%">
-          <div style="width:28px;height:28px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+          <div style="width:28px;height:28px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
         </div>`;
         label.innerHTML = `Loading QR code…`;
-        actions.innerHTML = `<button class="btn btn-secondary btn-sm" id="dash-btn-restart">Reconnect</button>`;
+        actions.innerHTML = isAdmin() ? `<button class="btn btn-secondary btn-sm" id="dash-btn-restart">Reconnect</button>` : '';
         _bindDashWahaButtons(phoneId);
       }
       try {
@@ -3838,7 +8286,7 @@ async function _updateDashWaha(phoneId) {
         const boxNow = document.getElementById('dash-waha-box');
         const lblNow = document.getElementById('dash-waha-label');
         if (qrData && qrData.qr && boxNow) {
-          boxNow.innerHTML = `<img src="${qrData.qr}" style="width:100%;height:100%;display:block;object-fit:contain;" alt="WhatsApp QR">`;
+          boxNow.innerHTML = `<img src="${safeImgSrc(qrData.qr)}" style="width:100%;height:100%;display:block;object-fit:contain;" alt="WhatsApp QR">`;
           if (lblNow) lblNow.innerHTML = `Scan to connect WhatsApp<br><span style="font-size:11px;color:var(--text-3)">Settings → Linked Devices → Link a Device</span>`;
         }
       } catch(_) {}
@@ -3846,7 +8294,7 @@ async function _updateDashWaha(phoneId) {
     } else if (status === 'STARTING') {
       if (_dashWahaPrevStatus !== 'STARTING') {
         box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.75rem;padding:1.5rem 0">
-          <div style="width:40px;height:40px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
+          <div style="width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
           <span style="font-size:12px;color:var(--text-3)">Connecting…</span>
         </div>`;
         label.innerHTML = `Starting WhatsApp session`;
@@ -3856,26 +8304,26 @@ async function _updateDashWaha(phoneId) {
     } else if (status === 'STOPPED') {
       if (_dashWahaPrevStatus !== 'STOPPED') {
         box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
-          <div style="width:64px;height:64px;border-radius:50%;background:#fee2e2;display:flex;align-items:center;justify-content:center">
+          <div style="width:64px;height:64px;border-radius:50%;background:var(--danger-bg);display:flex;align-items:center;justify-content:center">
             <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
           </div>
-          <span style="font-size:12px;font-weight:600;color:#dc2626;background:#fee2e2;padding:.25rem .75rem;border-radius:20px">Disconnected</span>
+          <span style="font-size:12px;font-weight:600;color:#dc2626;background:var(--danger-bg);padding:.25rem .75rem;border-radius:20px">Disconnected</span>
         </div>`;
         label.innerHTML = `Session is stopped`;
-        actions.innerHTML = `<button class="btn btn-primary btn-sm" id="dash-btn-start">Scan QR to Connect</button>`;
+        actions.innerHTML = isAdmin() ? `<button class="btn btn-primary btn-sm" id="dash-btn-start">Scan QR to Connect</button>` : '';
         _bindDashWahaButtons(phoneId);
       }
 
     } else {
       if (_dashWahaPrevStatus !== status) {
         box.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 0">
-          <div style="width:64px;height:64px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center">
-            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <div style="width:64px;height:64px;border-radius:50%;background:var(--surface-3);display:flex;align-items:center;justify-content:center">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
           </div>
-          <span style="font-size:12px;color:var(--text-3)">${status}</span>
+          <span style="font-size:12px;color:var(--text-3)">${esc(status)}</span>
         </div>`;
         label.innerHTML = `Unknown state`;
-        actions.innerHTML = `<button class="btn btn-secondary btn-sm" id="dash-btn-start">Start Session</button>`;
+        actions.innerHTML = isAdmin() ? `<button class="btn btn-secondary btn-sm" id="dash-btn-start">Start Session</button>` : '';
         _bindDashWahaButtons(phoneId);
       }
     }
@@ -3890,24 +8338,33 @@ async function _dashShowQR(phoneId) {
   const box = document.getElementById('dash-waha-box');
   const lbl = document.getElementById('dash-waha-label');
   const act = document.getElementById('dash-waha-actions');
-  if (box) box.innerHTML = `<div style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>`;
+  _dashShowPanel(phoneId, true);
+  if (box) box.innerHTML = `<div style="width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>`;
   if (lbl) lbl.innerHTML = 'Clearing session…';
   if (act) act.innerHTML = '';
 
+  _stopDashQrPoll();
+  const token = _dashQrToken;
+  const cancelled = () => token !== _dashQrToken || !document.getElementById('dash-waha-box');
+
   await Api.phones.logout(phoneId).catch(() => {});
   await new Promise(r => setTimeout(r, 1500));
+  if (cancelled()) return;
   await Api.phones.start(phoneId).catch(() => {});
   await new Promise(r => setTimeout(r, 1500));
+  if (cancelled()) return;
 
   if (lbl) lbl.innerHTML = 'Loading QR…';
 
   let attempts = 0;
   async function pollDashQR() {
-    if (!document.getElementById('dash-waha-box')) return; // navigated away
+    if (cancelled()) return; // cancelled or navigated away
     try {
       const s = await Api.phones.status(phoneId);
+      if (cancelled()) return;
       const status = (s.status || '').toUpperCase();
       if (status === 'WORKING') {
+        _stopDashQrPoll();
         await Api.phones.syncNumber(phoneId).catch(() => {});
         toast('WhatsApp connected! Syncing chats…', 'success');
         // Sync chats from WAHA then refresh chat list
@@ -3915,20 +8372,23 @@ async function _dashShowQR(phoneId) {
         try { await Api.inbox.sync(phoneId); } catch(_) {}
         await loadPhones();
         if (State.currentView === 'inbox') loadChats();
+        _dashRenderPhoneCards(State.phones);
         _dashWahaPrevStatus = '';
         _startDashWahaPoller(phoneId);
         return;
       }
       const r = await Api.phones.qr(phoneId);
+      if (cancelled()) return;
       if (r && r.qr) {
         const b = document.getElementById('dash-waha-box');
         const l = document.getElementById('dash-waha-label');
         const a = document.getElementById('dash-waha-actions');
-        if (b) b.innerHTML = `<img src="${r.qr}" style="width:100%;height:100%;object-fit:contain;display:block" alt="QR">`;
+        if (b) b.innerHTML = `<img src="${safeImgSrc(r.qr)}" style="width:100%;height:100%;object-fit:contain;display:block" alt="QR">`;
         if (l) l.innerHTML = `Scan with WhatsApp<br><span style="font-size:11px;color:var(--text-3)">Settings → Linked Devices → Link a Device</span>`;
         if (a) {
           a.innerHTML = `<button class="btn btn-danger btn-sm" id="dash-btn-cancel-qr">Cancel</button>`;
           document.getElementById('dash-btn-cancel-qr')?.addEventListener('click', () => {
+            _stopDashQrPoll();
             Api.phones.stop(phoneId).catch(()=>{});
             _dashWahaPrevStatus = '';
             _startDashWahaPoller(phoneId);
@@ -3939,7 +8399,7 @@ async function _dashShowQR(phoneId) {
       }
     } catch(_) {}
     attempts++;
-    if (attempts < 30) setTimeout(pollDashQR, 5000);
+    if (attempts < 30 && !cancelled()) _dashQrTimer = setTimeout(pollDashQR, 5000);
   }
   pollDashQR();
 }
@@ -3969,6 +8429,8 @@ function _bindDashWahaButtons(phoneId) {
 }
 
 function _startDashWahaPoller(phoneId) {
+  _stopDashWahaPoller();
+  _stopDashQrPoll();
   _dashWahaPrevStatus = '';
   _dashWahaUpdating = false;
   _updateDashWaha(phoneId);
@@ -3980,167 +8442,350 @@ function _startDashWahaPoller(phoneId) {
 
 async function renderDashboard() {
   _stopDashWahaPoller();
+  _stopDashQrPoll();
   const main = document.getElementById('main-content');
+  if (!State.org) await loadOrg();
+  const org = State.org || { name: 'Hyperscope', uid: '' };
+  const admin = isAdmin();
 
-  const cards = [
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`, title: 'Bulk Messages', desc: 'Send personalized broadcast messages to multiple contacts at once.', action: 'bulk', label: 'Send Now' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>`, title: 'Manage Team', desc: 'Invite agents and assign roles to manage customer conversations.', action: 'settings', label: 'Invite Agents' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`, title: 'WhatsApp', desc: 'Connect your WhatsApp via QR code to start receiving messages.', action: 'settings', label: 'Connect' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M9 16h6M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>`, title: 'Manage Tickets', desc: 'Track and resolve customer support tickets from your inbox.', action: 'tickets', label: 'View Tickets' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>`, title: 'AI Agent', desc: 'Set up your Gemini AI agent to auto-handle conversations.', action: 'ai-agent', label: 'Configure AI' },
-    { icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`, title: 'Automation Rules', desc: 'Create rules to auto-assign, label and respond to messages.', action: 'automation', label: 'Create Rule' },
-  ];
-
-  const wsName = 'Hyperscope';
   main.innerHTML = `
-  <div class="dashboard-wrap" style="overflow-y:auto">
-    <div class="dashboard-inner" style="max-width:1240px">
-
-      <div class="dash-workspace">
-        <div class="ws-logo">H</div>
-        <div>
-          <h2>${wsName}</h2>
-          <div class="ws-sub">${esc(State.agent?.email || 'workspace')}</div>
+  <div class="dsh-wrap">
+    <div class="dsh-inner">
+      <header class="dsh-head">
+        <div class="dsh-ws-avatar" aria-hidden="true">${esc(wsInitial(org.name))}</div>
+        <div class="dsh-ws-meta">
+          <h1 class="dsh-ws-name">${esc(org.name)}</h1>
+          ${org.uid ? `<button class="dsh-ws-uid" id="dsh-ws-uid" title="Copy workspace ID">${esc(org.uid)}</button>` : ''}
         </div>
+      </header>
+
+      <div class="dsh-grid">
+        <div class="dsh-main">
+          <div class="dsh-stats">
+            <div class="dsh-card dsh-stat">
+              <div class="dsh-stat-label">${_DSH_ICONS.chat}All chats</div>
+              <div class="dsh-stat-num" id="ds-total">—</div>
+            </div>
+            <div class="dsh-card dsh-stat">
+              <div class="dsh-stat-label">${_DSH_ICONS.unread}Unread chats</div>
+              <div class="dsh-stat-num" id="ds-unread">—</div>
+            </div>
+            <div class="dsh-card dsh-stat dsh-stat-flagged">
+              <div class="dsh-stat-label">${_DSH_ICONS.flag}Flagged chats</div>
+              <div class="dsh-stat-num" id="ds-flagged">—</div>
+            </div>
+          </div>
+
+          <div class="dsh-duo">
+            <section class="dsh-card dsh-panel">
+              <div class="dsh-panel-head">${_DSH_ICONS.team}Team</div>
+              <div class="dsh-panel-body">
+                <div class="dsh-muted" id="ds-online">—</div>
+                <div class="dsh-avatars" id="ds-team-avatars"></div>
+              </div>
+            </section>
+            <section class="dsh-card dsh-panel">
+              <div class="dsh-panel-head">${_DSH_ICONS.ticket}Tickets</div>
+              <div class="dsh-panel-body dsh-ticket-cols">
+                <button class="dsh-ticket-col" data-dsh-go="tickets">
+                  <span class="dsh-ticket-label"><span class="dsh-ring" aria-hidden="true"></span>Open</span>
+                  <span class="dsh-ticket-num" id="ds-tickets">—</span>
+                </button>
+                <button class="dsh-ticket-col" data-dsh-go="tickets">
+                  <span class="dsh-ticket-label">${_DSH_ICONS.userCircle}Assigned to me</span>
+                  <span class="dsh-ticket-num" id="ds-tickets-mine">—</span>
+                </button>
+              </div>
+            </section>
+          </div>
+
+          <h2 class="dsh-section-title">Quick links</h2>
+          <div class="dsh-links">
+            ${_dashQuickLinks().map((l, i) => `
+              <div class="dsh-link">
+                <button class="dsh-link-title" data-dsh-link="${i}" data-dsh-act="0" ${l.actions[0].disabled ? 'disabled' : ''}>
+                  ${l.icon}<span>${esc(l.title)}</span>${_DSH_ICONS.arrow}
+                </button>
+                <p>${esc(l.desc)}</p>
+                <div class="dsh-link-actions">
+                  ${l.actions.map((a, j) => `<button class="dsh-btn" data-dsh-link="${i}" data-dsh-act="${j}"
+                      ${a.disabled ? `disabled title="${esc(a.why || 'Not available')}"` : ''}>${esc(a.label)}</button>`).join('')}
+                </div>
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <aside class="dsh-side">
+          <div class="dsh-side-head">
+            <h2 class="dsh-section-title">Phone status</h2>
+            ${admin ? `<button class="dsh-btn" id="dsh-add-phone">Add phone ${_DSH_ICONS.phone}</button>` : ''}
+          </div>
+          <div class="dsh-phones" id="dash-phone-cards">
+            <div class="dsh-card dsh-phone dsh-muted">Loading phones…</div>
+          </div>
+          <div class="dsh-card dsh-connect" id="dash-waha-panel" hidden>
+            <div class="dsh-connect-title" id="dash-waha-title"></div>
+            <div class="gs-qr-box dsh-qr" id="dash-waha-box"></div>
+            <div class="dsh-connect-label" id="dash-waha-label"></div>
+            <div class="dsh-connect-actions" id="dash-waha-actions"></div>
+          </div>
+        </aside>
       </div>
-
-      <div class="dash-grid">
-        <div class="dash-main">
-
-          <div class="stat-cards">
-            <div class="stat-card">
-              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>All chats</div>
-              <div class="sc-num" id="ds-total">—</div>
-            </div>
-            <div class="stat-card">
-              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Unread chats</div>
-              <div class="sc-num" id="ds-unread">—</div>
-            </div>
-            <div class="stat-card flagged">
-              <div class="sc-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>Flagged chats</div>
-              <div class="sc-num" id="ds-flagged">—</div>
-            </div>
-          </div>
-
-          <div class="dash-duo">
-            <div class="dash-panel">
-              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Team</div>
-              <div class="dp-body">
-                <div style="font-size:12.5px;color:var(--text-2);margin-bottom:.5rem"><span id="ds-online">—</span> online</div>
-                <div id="ds-team-avatars" style="display:flex;gap:.35rem"></div>
-              </div>
-            </div>
-            <div class="dash-panel">
-              <div class="dp-head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2z"/></svg>Tickets</div>
-              <div class="dp-body" style="display:flex;gap:2.5rem">
-                <div>
-                  <div style="font-size:12.5px;color:var(--text-3);display:flex;align-items:center;gap:.35rem"><span style="width:8px;height:8px;border-radius:50%;border:2px solid var(--danger);display:inline-block"></span>Open</div>
-                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets">—</div>
-                </div>
-                <div>
-                  <div style="font-size:12.5px;color:var(--text-3)">Assigned to me</div>
-                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-mine">—</div>
-                </div>
-                <div>
-                  <div style="font-size:12.5px;color:var(--text-3)">In progress</div>
-                  <div style="font-size:19px;font-weight:700;margin-top:.25rem" id="ds-tickets-prog">—</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="quick-links-title">Quick links</div>
-          <div class="quick-links">
-            ${cards.map(c => `<div class="ql-card">
-              <h3>${c.icon} ${c.title}</h3>
-              <p>${c.desc}</p>
-              <div class="ql-actions">
-                <button class="btn btn-secondary btn-sm" onclick="switchView('${c.action}')">${c.label}</button>
-              </div>
-            </div>`).join('')}
-          </div>
-
-        </div>
-
-        <div class="dash-side">
-          <div class="phone-status-head">
-            <h3>WhatsApp</h3>
-          </div>
-          <div id="dash-phone-cards"></div>
-          <div class="dash-panel" style="margin-top:.4rem">
-            <div class="dp-body" style="display:flex;flex-direction:column;align-items:center;gap:.5rem">
-              <div class="gs-qr-box" id="dash-waha-box" style="display:flex;align-items:center;justify-content:center;">
-                <div class="waha-spinner" style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite"></div>
-              </div>
-              <div class="gs-qr-label" id="dash-waha-label" style="font-size:12px;color:var(--text-3)">Checking connection…</div>
-              <div class="gs-qr-actions" id="dash-waha-actions" style="display:flex;gap:.5rem;justify-content:center"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
     </div>
   </div>`;
 
-  // Load quick stats asynchronously
-  try {
-    const phones = State.phones.length ? State.phones : await Api.phones.list().catch(() => []);
-    const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+  _bindDashboard();
+  paintOrgAvatar(document.querySelector('.dsh-ws-avatar'), org.name);
 
-    const [dash, tkt, agents] = await Promise.all([
-      Api.analytics.dashboard(),
-      Api.analytics.tickets(),
-      Api.auth.agents().catch(() => []),
-    ]);
-    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-    // Only show real chat counts when WhatsApp is connected
-    set('ds-total', phoneConnected ? (dash.total_chats ?? 0) : 0);
-    set('ds-unread', phoneConnected ? (dash.unread_chats ?? 0) : 0);
-    set('ds-flagged', phoneConnected ? (dash.flagged_chats ?? 0) : 0);
-    set('ds-tickets', tkt.open ?? 0);
-    set('ds-tickets-prog', tkt.in_progress ?? 0);
-    set('ds-tickets-mine', '-');
-    set('ds-online', `${dash.online_agents ?? agents.length} of ${agents.length || (dash.online_agents ?? 0)}`);
-    const avEl = document.getElementById('ds-team-avatars');
-    if (avEl) avEl.innerHTML = agents.slice(0, 8).map(a =>
-      `<div class="agent-avatar" title="${esc(a.name)}" style="background:${avatarColor(a.name)};width:28px;height:28px;font-size:11px">${initials(a.name)}</div>`
-    ).join('');
-    try {
-      const mine = await Api.tickets.list({ assigned_to: State.agent?.id, status: 'open' });
-      set('ds-tickets-mine', mine.length);
-    } catch(_) {}
+  let sum;
+  try { sum = await Api.analytics.summary(); }
+  catch (e) { toast(e.message || 'Could not load dashboard', 'error'); return; }
+  if (State.currentView !== 'dashboard' || !document.getElementById('ds-total')) return;
 
-  } catch(_) {}
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  const phones = sum.phones || [];
+  // Match the inbox: chats are hidden while no number is connected
+  const phoneConnected = phones.some(p => p.waha_status === 'WORKING');
+  set('ds-total', phoneConnected ? (sum.chats?.total ?? 0) : 0);
+  set('ds-unread', phoneConnected ? (sum.chats?.unread ?? 0) : 0);
+  set('ds-flagged', phoneConnected ? (sum.chats?.flagged ?? 0) : 0);
+  set('ds-tickets', sum.tickets?.open ?? 0);
+  set('ds-tickets-mine', sum.tickets?.assigned_to_me ?? 0);
 
-  // Phone status cards + live WAHA poller
-  try {
-    const phones = await Api.phones.list();
-    const cardsEl = document.getElementById('dash-phone-cards');
-    if (cardsEl) cardsEl.innerHTML = phones.map(p => {
-      const ok = p.waha_status === 'WORKING';
-      return `<div class="phone-card">
-        <div class="pc-avatar" style="background:${ok?'#dcfce7':'#f3f4f6'};color:${ok?'#15803d':'#6b7280'}">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
-        </div>
-        <div class="pc-meta">
-          <div class="pc-number">WhatsApp</div>
-        </div>
-        <div class="pc-status ${ok ? 'connected' : 'offline'}"><span class="dot"></span>${ok ? 'Connected' : esc(p.waha_status || 'Offline')}</div>
-        <button class="pc-menu-btn" title="Manage in Settings" onclick="switchView('settings')">⋯</button>
-      </div>`;
-    }).join('') || '';
+  const online = sum.team?.online || [];
+  set('ds-online', `${online.length} of ${sum.team?.total ?? 0} online`);
+  const avEl = document.getElementById('ds-team-avatars');
+  if (avEl) avEl.innerHTML = online.slice(0, 12).map(a => `
+    <span class="dsh-avatar" title="${esc(a.name)}" style="background:${esc(a.avatar_color || avatarColor(a.name))}">
+      ${esc(initials(a.name))}<span class="dsh-online-dot" aria-label="online"></span>
+    </span>`).join('') + (online.length > 12 ? `<span class="dsh-muted">+${online.length - 12}</span>` : '');
 
-    if (phones && phones.length > 0) {
-      _startDashWahaPoller(phones[0].id);
-    } else {
-      const box = document.getElementById('dash-waha-box');
-      const lbl = document.getElementById('dash-waha-label');
-      const act = document.getElementById('dash-waha-actions');
-      if (box) box.innerHTML = `<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" stroke-width="1"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="7" y="7" width="3" height="3" fill="#d1d5db" stroke="none"/><rect x="14" y="14" width="3" height="3" fill="#d1d5db" stroke="none"/></svg>`;
-      if (lbl) lbl.innerHTML = `Scan QR to connect WhatsApp`;
-      if (act) act.innerHTML = `<button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect WhatsApp</button>`;
+  State.phones = phones;
+  updatePhoneBadge();
+  _dashRenderPhoneCards(phones);
+
+  // Live connection panel for the first number that needs attention
+  const target = phones.find(p => p.waha_status !== 'WORKING') || phones[0];
+  if (target) _startDashWahaPoller(target.id);
+}
+
+const _DSH_ICONS = {
+  chat:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`,
+  unread: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12v3a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h9"/><circle cx="19" cy="5" r="3"/></svg>`,
+  flag:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`,
+  team:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+  ticket: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2z"/></svg>`,
+  userCircle: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M6.17 18.34a7 7 0 0 1 11.66 0"/></svg>`,
+  arrow:  `<svg class="dsh-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg>`,
+  phone:  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.93 3.35 2 2 0 0 1 3.98 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`,
+  send:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`,
+  plug:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22v-5"/><path d="M9 8V2M15 8V2"/><path d="M18 8v5a6 6 0 0 1-12 0V8z"/></svg>`,
+  code:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>`,
+  more:   `<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>`,
+};
+
+// Navigate to a view and, once it has rendered, click one of its buttons
+function _dashGo(view, clickId) {
+  navigateTo(view);
+  if (!clickId) return;
+  const started = Date.now();
+  (function waitFor() {
+    const b = document.getElementById(clickId);
+    if (b) return b.click();
+    if (State.currentView === view && Date.now() - started < 5000) setTimeout(waitFor, 100);
+  })();
+}
+
+function _dashGoSettings(page) {
+  navigateTo('settings/' + (page || 'preferences'));
+}
+
+function _dashAddPhone() {
+  if (!isAdmin()) return toast('Only admins can add phones', 'error');
+  // The add-phone modal continues into Settings → Phones to show the QR
+  navigateTo('settings/phones');
+  showAddPhoneModal();
+}
+
+function _dashQuickLinks() {
+  const admin = isAdmin();
+  const adminOnly = 'Only admins can do this';
+  return [
+    { icon: _DSH_ICONS.send, title: 'Bulk messages',
+      desc: 'Send personalised broadcasts to many contacts at once and track delivery.',
+      actions: [{ label: 'Open', fn: () => _dashGo('bulk') },
+                { label: 'New campaign', fn: () => _dashGo('bulk', 'new-bulk-btn') }] },
+    { icon: _DSH_ICONS.team, title: 'Manage team',
+      desc: 'Invite agents, set roles and choose which numbers each agent can use.',
+      actions: [{ label: 'Open', fn: () => _dashGoSettings('team') },
+                { label: 'Invite', fn: openInviteTeam, disabled: !admin, why: adminOnly }] },
+    { icon: _DSH_ICONS.phone, title: 'Add phones',
+      desc: 'Connect more WhatsApp numbers and manage their sessions.',
+      actions: [{ label: 'Open', fn: () => _dashGoSettings('phones') },
+                { label: 'Add phone', fn: _dashAddPhone, disabled: !admin, why: adminOnly }] },
+    { icon: _DSH_ICONS.ticket, title: 'Manage tickets',
+      desc: 'Track customer issues raised from chats through to resolution.',
+      actions: [{ label: 'Open', fn: () => _dashGo('tickets') },
+                { label: 'New ticket', fn: () => _dashGo('tickets', 'new-ticket-btn') }] },
+    { icon: _DSH_ICONS.plug, title: 'Integrate your tools',
+      desc: 'Let the AI agent answer chats and automate routing with rules.',
+      actions: [{ label: 'AI agent', fn: () => _dashGo('ai-agent') },
+                { label: 'Automation', fn: () => _dashGo('automation') }] },
+    { icon: _DSH_ICONS.code, title: 'APIs & Webhooks',
+      desc: 'Programmatic access with API keys and outbound webhooks via the developer API.',
+      actions: [{ label: 'API keys', fn: () => _dashGoSettings('api'), disabled: !admin, why: adminOnly },
+                { label: 'Webhooks', fn: () => _dashGoSettings('webhooks'), disabled: !admin, why: adminOnly }] },
+  ];
+}
+
+function _bindDashboard() {
+  const root = document.querySelector('.dsh-wrap');
+  if (!root) return;
+  const links = _dashQuickLinks();
+  root.addEventListener('click', e => {
+    const linkBtn = e.target.closest('[data-dsh-link]');
+    if (linkBtn && !linkBtn.disabled) {
+      const a = links[+linkBtn.dataset.dshLink]?.actions[+linkBtn.dataset.dshAct];
+      if (a && !a.disabled && a.fn) a.fn();
+      return;
     }
-  } catch(_) {}
+    const go = e.target.closest('[data-dsh-go]');
+    if (go) return navigateTo(go.dataset.dshGo);
+  });
+  document.getElementById('dsh-add-phone')?.addEventListener('click', _dashAddPhone);
+  document.getElementById('dsh-ws-uid')?.addEventListener('click', async () => {
+    const uid = State.org?.uid;
+    if (!uid) return;
+    try { await navigator.clipboard.writeText(uid); toast('Workspace ID copied', 'success'); }
+    catch (_) { toast(uid); }
+  });
+}
+
+// "919510715498" → "+91 95107 15498"
+function _dashFmtPhone(num) {
+  const d = String(num || '').replace(/\D/g, '');
+  if (!d || String(num).startsWith('pending')) return '';
+  if (d.length === 12 && d.startsWith('91')) return `+91 ${d.slice(2, 7)} ${d.slice(7)}`;
+  if (d.length === 11 && d.startsWith('1')) return `+1 ${d.slice(1, 4)} ${d.slice(4, 7)} ${d.slice(7)}`;
+  return '+' + d;
+}
+
+function _dashStatusInfo(status) {
+  const s = String(status || '').toUpperCase();
+  if (s === 'WORKING') return { cls: 'ok', label: 'Connected' };
+  if (s === 'STARTING') return { cls: 'wait', label: 'Connecting' };
+  if (s === 'SCAN_QR_CODE') return { cls: 'wait', label: 'Waiting for QR scan' };
+  return { cls: 'off', label: 'Disconnected' };
+}
+
+function _dashRenderPhoneCards(phones) {
+  const el = document.getElementById('dash-phone-cards');
+  if (!el) return;
+  const admin = isAdmin();
+  if (!phones.length) {
+    el.innerHTML = `<div class="dsh-card dsh-phone dsh-phone-empty">
+      <span class="dsh-muted">No WhatsApp number connected yet.</span>
+      ${admin ? `<button class="dsh-btn" id="dsh-empty-add">Add phone</button>` : ''}
+    </div>`;
+    document.getElementById('dsh-empty-add')?.addEventListener('click', _dashAddPhone);
+    return;
+  }
+  el.innerHTML = phones.map(p => {
+    const st = _dashStatusInfo(p.waha_status);
+    const number = _dashFmtPhone(p.phone_number);
+    return `<div class="dsh-card dsh-phone" data-pid="${p.id}">
+      <div class="dsh-phone-avatar" style="background:${avatarColor(p.name)}">${esc(initials(p.name))}</div>
+      <div class="dsh-phone-meta">
+        <div class="dsh-phone-num">${number ? esc(number) : '<span class="dsh-muted">Pending connection</span>'}</div>
+        <div class="dsh-phone-name">${esc(p.name)}</div>
+      </div>
+      <div class="dsh-phone-status">
+        <span class="dsh-status-dot ${st.cls}" title="${esc(st.label)}" aria-label="${esc(st.label)}"></span>
+        ${admin ? `<button class="dsh-restart" data-dsh-restart="${p.id}">Restart</button>` : ''}
+      </div>
+      ${admin ? `<div class="dsh-menu-wrap">
+        <button class="dsh-menu-btn" data-dsh-menu="${p.id}" aria-haspopup="menu" aria-expanded="false" title="More actions">${_DSH_ICONS.more}</button>
+        <div class="dsh-menu" role="menu" hidden>
+          <button role="menuitem" data-dsh-phone-act="qr">${p.waha_status === 'WORKING' ? 'Reconnect / QR' : 'Scan QR to connect'}</button>
+          <button role="menuitem" data-dsh-phone-act="logout">Log out</button>
+          <button role="menuitem" class="danger" data-dsh-phone-act="clear">Clear data</button>
+          <button role="menuitem" class="danger" data-dsh-phone-act="delete">Delete</button>
+        </div>
+      </div>` : ''}
+    </div>`;
+  }).join('');
+
+  el.querySelectorAll('[data-dsh-restart]').forEach(btn => btn.addEventListener('click', async () => {
+    const pid = +btn.dataset.dshRestart;
+    btn.disabled = true; btn.textContent = 'Restarting…';
+    try { await Api.phones.restart(pid); toast('Session restarting…', 'success'); }
+    catch (e) { toast(e.message, 'error'); }
+    _dashSetPhoneStatus(pid, 'STARTING');
+    setTimeout(() => { if (State.currentView === 'dashboard') _startDashWahaPoller(pid); }, 2000);
+  }));
+
+  el.querySelectorAll('[data-dsh-menu]').forEach(btn => btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const menu = btn.nextElementSibling;
+    const open = menu.hidden;
+    _dashCloseMenus();
+    menu.hidden = !open;
+    btn.setAttribute('aria-expanded', String(open));
+    if (open) menu.querySelector('button')?.focus();
+  }));
+
+  el.querySelectorAll('[data-dsh-phone-act]').forEach(item => item.addEventListener('click', () => {
+    const pid = +item.closest('[data-pid]').dataset.pid;
+    _dashCloseMenus();
+    _dashPhoneAction(pid, item.dataset.dshPhoneAct);
+  }));
+}
+
+function _dashCloseMenus() {
+  document.querySelectorAll('.dsh-menu').forEach(m => { m.hidden = true; });
+  document.querySelectorAll('[data-dsh-menu]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+document.addEventListener('click', e => { if (!e.target.closest?.('.dsh-menu-wrap')) _dashCloseMenus(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') _dashCloseMenus(); });
+
+async function _dashPhoneAction(pid, act) {
+  const phone = State.phones.find(p => p.id === pid);
+  const reload = () => (State.currentView === 'dashboard' ? renderDashboard() : loadPhones());
+  try {
+    if (act === 'qr') {
+      if (phone?.waha_status === 'WORKING' &&
+          !confirm('Reconnect this number? The current session will be logged out and a new QR code shown.')) return;
+      _stopDashWahaPoller();
+      await _dashShowQR(pid);
+    } else if (act === 'logout') {
+      if (!confirm('Disconnect WhatsApp? You will need to scan QR again to reconnect.')) return;
+      await Api.phones.logout(pid);
+      toast('Disconnected — scan QR to reconnect', 'success');
+      await reload();
+    } else if (act === 'clear') {
+      if (!confirm('WARNING: This will permanently delete all synced chats, messages, and associated tasks/tickets for this phone from the database. Proceed?')) return;
+      await Api.phones.clearData(pid);
+      toast('Data cleared successfully!', 'success');
+      await reload();
+    } else if (act === 'delete') {
+      if (!confirm('Remove this phone session from Hyperscope? This will deactivate the session.')) return;
+      await Api.phones.del(pid);
+      toast('Phone session removed', 'success');
+      await reload();
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// Keep a phone card's status dot in sync with the live poller
+function _dashSetPhoneStatus(pid, status) {
+  const ph = State.phones.find(p => p.id === pid);
+  if (ph && ph.waha_status !== status && status !== 'UNKNOWN') { ph.waha_status = status; updatePhoneBadge(); }
+  const dot = document.querySelector(`.dsh-phone[data-pid="${pid}"] .dsh-status-dot`);
+  if (!dot) return;
+  const st = _dashStatusInfo(status);
+  dot.className = `dsh-status-dot ${st.cls}`;
+  dot.title = st.label;
+  dot.setAttribute('aria-label', st.label);
 }
 
 // ── COMMUNITIES VIEW ────────────────────────────────────────────── //
@@ -4180,7 +8825,7 @@ async function loadGroups(search) {
         </svg>
         <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0.5rem 0 0.25rem">WhatsApp Disconnected</p>
         <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to view groups.</span>
-        <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
+        <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings/phones')">Connect WhatsApp</button>
       </div>`;
       return;
     }
@@ -4191,7 +8836,7 @@ async function loadGroups(search) {
         <p style="font-size:14px;color:var(--text-3);max-width:340px;text-align:center;line-height:1.6">
           No WhatsApp groups synced yet. Connect a phone and sync chats — group chats will appear here automatically.
         </p>
-        <button class="btn btn-primary btn-sm" onclick="switchView('settings')">Connect a Phone</button>
+        <button class="btn btn-primary btn-sm" onclick="switchView('settings/phones')">Connect a Phone</button>
       </div>`;
       return;
     }
@@ -4259,7 +8904,7 @@ async function showGroupAnalytics(gid, name) {
         <div class="stat-mini"><div class="stat-mini-num">${a.outgoing}</div><div class="stat-mini-label">Outgoing</div></div>
       </div>
       <div style="display:flex;align-items:flex-end;gap:2px;height:60px;margin-bottom:1rem">
-        ${a.daily_volume.map(d => `<div title="${d.date}: ${d.count}" style="flex:1;background:var(--accent);opacity:.75;border-radius:2px 2px 0 0;height:${Math.max(4, Math.round(d.count / maxDay * 60))}px"></div>`).join('') || '<span class="text-muted">No activity</span>'}
+        ${a.daily_volume.map(d => `<div title="${esc(d.date)}: ${+d.count || 0}" style="flex:1;background:var(--accent);opacity:.75;border-radius:2px 2px 0 0;height:${Math.max(4, Math.round(d.count / maxDay * 60))}px"></div>`).join('') || '<span class="text-muted">No activity</span>'}
       </div>
       <p style="font-size:12px;font-weight:600;margin-bottom:.35rem">Top senders</p>
       <div class="table-wrap" style="max-height:200px;overflow-y:auto"><table class="data-table">
@@ -4298,10 +8943,10 @@ async function loadScheduled() {
       <tbody>${items.map(m => `<tr>
         <td style="font-weight:600">${esc(displayName(m.chat_name) || ('#' + m.chat_id))}</td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.body)}</td>
-        <td style="font-size:12px">${new Date(m.send_at).toLocaleString()}</td>
+        <td style="font-size:12px">${parseServerDate(m.send_at).toLocaleString()}</td>
         <td style="font-size:12px">${esc(m.repeat_summary || (m.repeat === 'none' ? 'Once' : m.repeat))}</td>
-        <td style="font-size:12px;color:var(--text-3)">${m.end_date ? new Date(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
-        <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${m.status}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
+        <td style="font-size:12px;color:var(--text-3)">${m.end_date ? parseServerDate(m.end_date).toLocaleDateString() : (m.repeat !== 'none' ? 'Open-ended' : '—')}</td>
+        <td><span class="${pillClass(m.status==='sent'?'resolved':m.status==='failed'?'urgent':'open')}">${esc(m.status)}</span>${m.last_error ? ` <span title="${esc(m.last_error)}">⚠️</span>` : ''}</td>
         <td>${m.sent_count}</td>
         <td style="white-space:nowrap;text-align:right">${m.status === 'pending' ? `
           <button class="btn btn-secondary btn-sm sched-edit" data-sid="${m.id}">Edit</button>
@@ -4328,13 +8973,13 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
   const ed = editItem || {};
   const toLocalDt = (iso) => {
     if (!iso) return '';
-    const d = new Date(iso);
+    const d = parseServerDate(iso);
     if (isNaN(d.getTime())) return '';
     return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0, 16);
   };
   const toLocalDateOnly = (iso) => {
     if (!iso) return '';
-    const d = new Date(iso);
+    const d = parseServerDate(iso);
     if (isNaN(d.getTime())) return '';
     const yyyy = d.getFullYear();
     const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -4424,67 +9069,385 @@ async function showScheduleModal(prefillChatId, prefillBody, editItem) {
 }
 
 // ── LOGS VIEW ───────────────────────────────────────────────────── //
-async function renderLogs() {
+// #logs/<page>: Group / API / Webhooks / Rules / Scheduled operation logs
+// (GET /logs/operations, last 7 days) + the older Activity log at the bottom.
+// Sub-nav reuses the analytics .an-nav look; the rest is styled in css/logs.css (lg-*).
+// Icons: Font Awesome Free 6.7.2 (CC BY 4.0), regular (outline) where available.
+const LG_ICONS = {
+  'comments': [640, 'M88.2 309.1c9.8-18.3 6.8-40.8-7.5-55.8C59.4 230.9 48 204 48 176c0-63.5 63.8-128 160-128s160 64.5 160 128s-63.8 128-160 128c-13.1 0-25.8-1.3-37.8-3.6c-10.4-2-21.2-.6-30.7 4.2c-4.1 2.1-8.3 4.1-12.6 6c-16 7.2-32.9 13.5-49.9 18c2.8-4.6 5.4-9.1 7.9-13.6c1.1-1.9 2.2-3.9 3.2-5.9zM208 352c114.9 0 208-78.8 208-176S322.9 0 208 0S0 78.8 0 176c0 41.8 17.2 80.1 45.9 110.3c-.9 1.7-1.9 3.5-2.8 5.1c-10.3 18.4-22.3 36.5-36.6 52.1c-6.6 7-8.3 17.2-4.6 25.9C5.8 378.3 14.4 384 24 384c43 0 86.5-13.3 122.7-29.7c4.8-2.2 9.6-4.5 14.2-6.8c15.1 3 30.9 4.5 47.1 4.5zM432 480c16.2 0 31.9-1.6 47.1-4.5c4.6 2.3 9.4 4.6 14.2 6.8C529.5 498.7 573 512 616 512c9.6 0 18.2-5.7 22-14.5c3.8-8.8 2-19-4.6-25.9c-14.2-15.6-26.2-33.7-36.6-52.1c-.9-1.7-1.9-3.4-2.8-5.1C622.8 384.1 640 345.8 640 304c0-94.4-87.9-171.5-198.2-175.8c4.1 15.2 6.2 31.2 6.2 47.8l0 .6c87.2 6.7 144 67.5 144 127.4c0 28-11.4 54.9-32.7 77.2c-14.3 15-17.3 37.6-7.5 55.8c1.1 2 2.2 4 3.2 5.9c2.5 4.5 5.2 9 7.9 13.6c-17-4.5-33.9-10.7-49.9-18c-4.3-1.9-8.5-3.9-12.6-6c-9.5-4.8-20.3-6.2-30.7-4.2c-12.1 2.4-24.8 3.6-37.8 3.6c-61.7 0-110-26.5-136.8-62.3c-16 5.4-32.8 9.4-50 11.8C279 439.8 350 480 432 480z'],
+  'file-code': [384, 'M64 464c-8.8 0-16-7.2-16-16L48 64c0-8.8 7.2-16 16-16l160 0 0 80c0 17.7 14.3 32 32 32l80 0 0 288c0 8.8-7.2 16-16 16L64 464zM64 0C28.7 0 0 28.7 0 64L0 448c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-293.5c0-17-6.7-33.3-18.7-45.3L274.7 18.7C262.7 6.7 246.5 0 229.5 0L64 0zm97 289c9.4-9.4 9.4-24.6 0-33.9s-24.6-9.4-33.9 0L79 303c-9.4 9.4-9.4 24.6 0 33.9l48 48c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-31-31 31-31zM257 255c-9.4-9.4-24.6-9.4-33.9 0s-9.4 24.6 0 33.9l31 31-31 31c-9.4 9.4-9.4 24.6 0 33.9s24.6 9.4 33.9 0l48-48c9.4-9.4 9.4-24.6 0-33.9l-48-48z'],
+  'paper-plane': [512, 'M16.1 260.2c-22.6 12.9-20.5 47.3 3.6 57.3L160 376l0 103.3c0 18.1 14.6 32.7 32.7 32.7c9.7 0 18.9-4.3 25.1-11.8l62-74.3 123.9 51.6c18.9 7.9 40.8-4.5 43.9-24.7l64-416c1.9-12.1-3.4-24.3-13.5-31.2s-23.3-7.5-34-1.4l-448 256zm52.1 25.5L409.7 90.6 190.1 336l1.2 1L68.2 285.7zM403.3 425.4L236.7 355.9 450.8 116.6 403.3 425.4z'],
+  'lightbulb': [384, 'M297.2 248.9C311.6 228.3 320 203.2 320 176c0-70.7-57.3-128-128-128S64 105.3 64 176c0 27.2 8.4 52.3 22.8 72.9c3.7 5.3 8.1 11.3 12.8 17.7c0 0 0 0 0 0c12.9 17.7 28.3 38.9 39.8 59.8c10.4 19 15.7 38.8 18.3 57.5L109 384c-2.2-12-5.9-23.7-11.8-34.5c-9.9-18-22.2-34.9-34.5-51.8c0 0 0 0 0 0s0 0 0 0c-5.2-7.1-10.4-14.2-15.4-21.4C27.6 247.9 16 213.3 16 176C16 78.8 94.8 0 192 0s176 78.8 176 176c0 37.3-11.6 71.9-31.4 100.3c-5 7.2-10.2 14.3-15.4 21.4c0 0 0 0 0 0s0 0 0 0c-12.3 16.8-24.6 33.7-34.5 51.8c-5.9 10.8-9.6 22.5-11.8 34.5l-48.6 0c2.6-18.7 7.9-38.6 18.3-57.5c11.5-20.9 26.9-42.1 39.8-59.8c0 0 0 0 0 0s0 0 0 0s0 0 0 0c4.7-6.4 9-12.4 12.7-17.7zM192 128c-26.5 0-48 21.5-48 48c0 8.8-7.2 16-16 16s-16-7.2-16-16c0-44.2 35.8-80 80-80c8.8 0 16 7.2 16 16s-7.2 16-16 16zm0 384c-44.2 0-80-35.8-80-80l0-16 160 0 0 16c0 44.2-35.8 80-80 80z'],
+  'calendar-days': [448, 'M152 24c0-13.3-10.7-24-24-24s-24 10.7-24 24l0 40L64 64C28.7 64 0 92.7 0 128l0 16 0 48L0 448c0 35.3 28.7 64 64 64l320 0c35.3 0 64-28.7 64-64l0-256 0-48 0-16c0-35.3-28.7-64-64-64l-40 0 0-40c0-13.3-10.7-24-24-24s-24 10.7-24 24l0 40L152 64l0-40zM48 192l80 0 0 56-80 0 0-56zm0 104l80 0 0 64-80 0 0-64zm128 0l96 0 0 64-96 0 0-64zm144 0l80 0 0 64-80 0 0-64zm80-48l-80 0 0-56 80 0 0 56zm0 160l0 40c0 8.8-7.2 16-16 16l-64 0 0-56 80 0zm-128 0l0 56-96 0 0-56 96 0zm-144 0l0 56-64 0c-8.8 0-16-7.2-16-16l0-40 80 0zM272 248l-96 0 0-56 96 0 0 56z'],
+  'file-lines': [384, 'M64 464c-8.8 0-16-7.2-16-16L48 64c0-8.8 7.2-16 16-16l160 0 0 80c0 17.7 14.3 32 32 32l80 0 0 288c0 8.8-7.2 16-16 16L64 464zM64 0C28.7 0 0 28.7 0 64L0 448c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-293.5c0-17-6.7-33.3-18.7-45.3L274.7 18.7C262.7 6.7 246.5 0 229.5 0L64 0zm56 256c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0zm0 96c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0z'],
+  'bars': [448, 'M0 96C0 78.3 14.3 64 32 64l384 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 128C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32l384 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 288c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32L32 448c-17.7 0-32-14.3-32-32s14.3-32 32-32l384 0c17.7 0 32 14.3 32 32z'],
+  'arrow-left': [448, 'M9.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.2 288 416 288c17.7 0 32-14.3 32-32s-14.3-32-32-32l-306.7 0L214.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z'],
+  'arrow-right': [448, 'M438.6 278.6c12.5-12.5 12.5-32.8 0-45.3l-160-160c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L338.8 224 32 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l306.7 0L233.4 393.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0l160-160z'],
+  'magnifying-glass': [512, 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
+  'xmark': [384, 'M342.6 150.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L192 210.7 86.6 105.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L146.7 256 41.4 361.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192 301.3 297.4 406.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L237.3 256 342.6 150.6z'],
+  'copy': [448, 'M384 336l-192 0c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l140.1 0L400 115.9 400 320c0 8.8-7.2 16-16 16zM192 384l192 0c35.3 0 64-28.7 64-64l0-204.1c0-12.7-5.1-24.9-14.1-33.9L366.1 14.1c-9-9-21.2-14.1-33.9-14.1L192 0c-35.3 0-64 28.7-64 64l0 256c0 35.3 28.7 64 64 64zM64 128c-35.3 0-64 28.7-64 64L0 448c0 35.3 28.7 64 64 64l192 0c35.3 0 64-28.7 64-64l0-32-48 0 0 32c0 8.8-7.2 16-16 16L64 464c-8.8 0-16-7.2-16-16l0-256c0-8.8 7.2-16 16-16l32 0 0-48-32 0z'],
+};
+function lgIcon(name, cls = '') {
+  const ic = LG_ICONS[name];
+  if (!ic) return '';
+  return `<svg class="an-ic lg-ic ${cls}" viewBox="0 0 ${ic[0]} 512" fill="currentColor" aria-hidden="true"><path d="${ic[1]}"/></svg>`;
+}
+
+// cols: which count columns a page shows; code: show HTTP status code / duration
+const LG_PAGES = {
+  group:     { nav: 'Group logs',     icon: 'comments',      kind: 'group',     cols: ['success', 'failed', 'pending'] },
+  api:       { nav: 'API logs',       icon: 'file-code',     kind: 'api',       cols: [], code: true },
+  webhooks:  { nav: 'Webhooks logs',  icon: 'paper-plane',   kind: 'webhook',   cols: ['success', 'failed'], code: true },
+  rules:     { nav: 'Rules logs',     icon: 'lightbulb',     kind: 'rule',      cols: ['success', 'failed'] },
+  scheduled: { nav: 'Scheduled logs', icon: 'calendar-days', kind: 'scheduled', cols: ['success', 'failed', 'pending'] },
+  activity:  { nav: 'Activity logs',  icon: 'file-lines' },
+};
+const LG_PERFORMERS = [['automation', 'Automation'], ['scheduler', 'Scheduler'], ['api', 'API key'], ['system', 'System']];
+const LG = { sub: 'group', q: '', status: '', from: '', to: '', by: '', page: 1, pageSize: 50, seq: 0, agents: null, data: null };
+
+function _lgShellHTML() {
+  const item = key => `<a href="#logs/${key}" class="an-nav-item lg-nav-item" data-lg="${key}">${lgIcon(LG_PAGES[key].icon)}<span>${esc(LG_PAGES[key].nav)}</span></a>`;
+  return `<div class="an-shell lg-shell" id="lg-shell">
+      <nav class="an-nav lg-nav" aria-label="Logs">
+        ${['group', 'api', 'webhooks', 'rules', 'scheduled'].map(item).join('')}
+        <div class="lg-nav-sep" role="separator"></div>
+        ${item('activity')}
+      </nav>
+      <div class="lg-main" id="lg-main"></div>
+    </div>`;
+}
+
+function _lgSyncRoute(sub) {
+  const route = 'logs/' + sub;
+  State.currentRoute = route;
+  if (location.hash !== '#' + route) history.replaceState(null, '', '#' + route);
+  const bc = document.getElementById('app-breadcrumb');
+  if (bc) bc.innerHTML = `<strong>${esc(VIEW_LABELS.logs)}</strong><span class="bc-sep" aria-hidden="true">&gt;</span><strong>${esc(sub)}</strong>`;
+}
+
+async function renderLogs(sub) {
+  if (!LG_PAGES[sub]) sub = LG_PAGES[LG.sub] ? LG.sub : 'group';
+  if (sub !== LG.sub) Object.assign(LG, { q: '', status: '', from: '', to: '', by: '', page: 1 });
+  LG.sub = sub;
+  _lgSyncRoute(sub);
+  _lgCloseDrawer();
   const main = document.getElementById('main-content');
-  main.innerHTML = `
-    <div class="flex-col h-full" style="overflow-y:auto">
-      <div class="section-header">
-        <h2>Audit Logs</h2>
-        <div class="header-actions" style="margin-left:auto;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
-          <div style="display:flex;align-items:center;gap:.4rem">
-            <span style="font-size:12px;color:var(--text-3);font-weight:500">From:</span>
-            <input type="date" id="log-start-date" class="search-input" style="padding:4px 8px;font-size:12.5px;max-width:130px;height:30px">
-          </div>
-          <div style="display:flex;align-items:center;gap:.4rem">
-            <span style="font-size:12px;color:var(--text-3);font-weight:500">To:</span>
-            <input type="date" id="log-end-date" class="search-input" style="padding:4px 8px;font-size:12.5px;max-width:130px;height:30px">
-          </div>
-          <select id="log-action-filter" style="max-width:160px;height:30px;padding:4px 8px;font-size:12.5px;border-radius:6px;border:1px solid var(--border)"><option value="">All events</option></select>
-          <button class="btn btn-secondary btn-sm" id="log-export" style="height:30px;padding:4px 12px;font-size:12.5px">Export CSV</button>
+  if (!document.getElementById('lg-shell')) {
+    main.innerHTML = _lgShellHTML();
+    main.querySelectorAll('.lg-nav-item').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      navigateTo('logs/' + a.dataset.lg);
+    }));
+  }
+  main.querySelectorAll('.lg-nav-item').forEach(a => {
+    const on = a.dataset.lg === sub;
+    a.classList.toggle('active', on);
+    on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current');
+  });
+  const host = document.getElementById('lg-main');
+  host.scrollTop = 0;
+  if (sub === 'activity') return _lgRenderActivity(host);
+  host.innerHTML = _lgPageHTML(sub);
+  _lgBindToolbar(host);
+  _lgLoad();
+}
+
+function _lgPageHTML(sub) {
+  const p = LG_PAGES[sub];
+  const nf = [LG.status, LG.from || LG.to, LG.by].filter(Boolean).length;
+  return `<div class="lg-page" data-page="${esc(sub)}">
+      <div class="lg-toolbar">
+        <label class="lg-search">${lgIcon('magnifying-glass')}
+          <input type="search" id="lg-q" placeholder="Search by operation ID or performed by" aria-label="Search by operation ID or performed by" value="${esc(LG.q)}" autocomplete="off">
+        </label>
+        <div class="an-pop-wrap">
+          <button class="lg-btn" id="lg-filter-btn" aria-haspopup="true" aria-expanded="false">${lgIcon('bars')}<span>Filter</span>${nf ? `<span class="an-count">${nf}</span>` : ''}</button>
         </div>
+        <span class="lg-spacer"></span>
+        <span class="lg-history">Viewing 7 day log history</span>
       </div>
-      <div class="scroll-area">
-        <div class="content-card">
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th style="width: 170px;">Time</th>
-                  <th style="width: 150px;">Event</th>
-                  <th style="width: 150px;">Agent</th>
-                  <th>Details</th>
-                </tr>
-              </thead>
-              <tbody id="logs-tbody">
-                <tr><td colspan="4" style="text-align:center;padding:3rem"><div class="spinner"></div></td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
+      <div class="lg-table-wrap">
+        <table class="lg-table" aria-label="${esc(p.nav)}">
+          <thead><tr>${_lgHeadCells(p)}</tr></thead>
+          <tbody id="lg-tbody"><tr class="lg-state"><td colspan="${_lgColCount(p)}"><div class="spinner"></div></td></tr></tbody>
+        </table>
+      </div>
+      <div class="lg-pager" id="lg-pager"></div>
+    </div>`;
+}
+
+function _lgHeadCells(p) {
+  const th = (t, cls = '') => `<th scope="col"${cls ? ` class="${cls}"` : ''}>${t}</th>`;
+  const counts = { success: 'Success', failed: 'Failed', pending: 'Pending' };
+  return th('Operation', 'lg-col-op')
+    + p.cols.map(c => th(counts[c], 'lg-col-num')).join('')
+    + (p.code ? th('Status code', 'lg-col-num') + (p.kind === 'api' ? th('Duration', 'lg-col-num') : '') : '')
+    + th('Timestamp') + th('Performed by') + th('Log ID');
+}
+function _lgColCount(p) { return 4 + p.cols.length + (p.code ? (p.kind === 'api' ? 2 : 1) : 0); }
+
+function _lgWhen(ts) {
+  const d = parseServerDate(ts);
+  if (!d || isNaN(d)) return '—';
+  return d.toLocaleString(undefined, { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function _lgNum(n, tone) {
+  n = Number(n) || 0;
+  return `<span class="lg-num${n ? ' lg-' + tone : ''}">${n.toLocaleString()}</span>`;
+}
+function _lgCode(code) {
+  if (code == null) return '<span class="lg-muted">—</span>';
+  const tone = code < 300 ? 'ok' : code < 500 ? 'warn' : 'bad';
+  return `<span class="lg-code lg-code-${tone}">${esc(code)}</span>`;
+}
+function _lgOperation(it) {
+  if (it.kind === 'api') {
+    const [m, ...rest] = String(it.operation).split(' ');
+    return `<span class="lg-method lg-method-${esc(m.toLowerCase())}">${esc(m)}</span><span class="lg-path">${esc(rest.join(' '))}</span>`;
+  }
+  return esc(it.operation);
+}
+
+function _lgRowHTML(p, it) {
+  const cells = p.cols.map(c => `<td class="lg-col-num">${_lgNum(it[c + '_count'], c)}</td>`).join('');
+  const code = p.code ? `<td class="lg-col-num">${_lgCode(it.status_code)}</td>`
+    + (p.kind === 'api' ? `<td class="lg-col-num lg-muted">${it.duration_ms != null ? esc(it.duration_ms) + ' ms' : '—'}</td>` : '') : '';
+  return `<tr class="lg-row" tabindex="0" data-uid="${esc(it.uid)}" aria-label="View log ${esc(it.uid)}">
+      <td class="lg-col-op"><span class="lg-dot lg-dot-${esc(it.status)}" title="${esc(it.status)}"></span>${_lgOperation(it)}</td>
+      ${cells}${code}
+      <td class="lg-nowrap">${esc(_lgWhen(it.created_at))}</td>
+      <td>${esc(it.performed_by || 'System')}</td>
+      <td><code class="lg-uid">${esc(it.uid)}</code></td>
+    </tr>`;
+}
+
+async function _lgLoad() {
+  const p = LG_PAGES[LG.sub];
+  const tbody = document.getElementById('lg-tbody');
+  if (!p || !tbody) return;
+  const seq = ++LG.seq;
+  const q = { kind: p.kind, page: LG.page, page_size: LG.pageSize };
+  if (LG.q.trim()) q.q = LG.q.trim();
+  if (LG.status) q.status = LG.status;
+  if (LG.from) q.from = new Date(LG.from + 'T00:00:00').toISOString();
+  if (LG.to) { const e = new Date(LG.to + 'T00:00:00'); e.setDate(e.getDate() + 1); q.to = e.toISOString(); }
+  if (LG.by) q.performed_by = LG.by;
+  let data;
+  try { data = await Api.logs.operations(q); }
+  catch (e) {
+    if (seq !== LG.seq) return;
+    tbody.innerHTML = `<tr class="lg-state"><td colspan="${_lgColCount(p)}">${esc(e.message || 'Could not load logs')}</td></tr>`;
+    document.getElementById('lg-pager').innerHTML = '';
+    return;
+  }
+  if (seq !== LG.seq || !document.getElementById('lg-tbody')) return;
+  LG.data = data;
+  const filtered = LG.q.trim() || LG.status || LG.from || LG.to || LG.by;
+  tbody.innerHTML = data.items.length
+    ? data.items.map(it => _lgRowHTML(p, it)).join('')
+    : `<tr class="lg-state lg-empty"><td colspan="${_lgColCount(p)}">${filtered ? 'No logs match these filters' : 'No logs in the last 7 days'}</td></tr>`;
+  tbody.querySelectorAll('.lg-row').forEach(tr => {
+    tr.addEventListener('click', () => _lgOpenDrawer(tr.dataset.uid));
+    tr.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _lgOpenDrawer(tr.dataset.uid); } });
+  });
+  _lgRenderPager(data);
+}
+
+function _lgRenderPager(data) {
+  const el = document.getElementById('lg-pager');
+  if (!el) return;
+  const pages = Math.max(1, Math.ceil((data.total || 0) / (data.page_size || LG.pageSize)));
+  el.innerHTML = `
+    <button class="lg-page-btn" id="lg-prev" aria-label="Previous page"${LG.page <= 1 ? ' disabled' : ''}>${lgIcon('arrow-left')}</button>
+    <span class="lg-page-num" aria-live="polite" title="${pages} page${pages === 1 ? '' : 's'}, ${Number(data.total || 0).toLocaleString()} log${data.total === 1 ? '' : 's'}">${LG.page}</span>
+    <button class="lg-page-btn" id="lg-next" aria-label="Next page"${LG.page >= pages ? ' disabled' : ''}>${lgIcon('arrow-right')}</button>`;
+  el.querySelector('#lg-prev').addEventListener('click', () => { if (LG.page > 1) { LG.page--; _lgLoad(); } });
+  el.querySelector('#lg-next').addEventListener('click', () => { if (LG.page < pages) { LG.page++; _lgLoad(); } });
+}
+
+function _lgBindToolbar(host) {
+  const input = host.querySelector('#lg-q');
+  let t = null;
+  input.addEventListener('input', () => {
+    clearTimeout(t);
+    t = setTimeout(() => { LG.q = input.value; LG.page = 1; _lgLoad(); }, 300);
+  });
+  host.querySelector('#lg-filter-btn').addEventListener('click', e => { e.stopPropagation(); _lgOpenFilter(e.currentTarget); });
+}
+
+function _lgClosePop() {
+  document.querySelectorAll('.lg-pop').forEach(p => p.remove());
+  document.querySelectorAll('#lg-filter-btn[aria-expanded="true"]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+document.addEventListener('click', e => { if (!e.target.closest('.lg-pop, #lg-filter-btn')) _lgClosePop(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.querySelector('.lg-pop')) _lgClosePop(); });
+
+async function _lgOpenFilter(btn) {
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  _lgClosePop();
+  if (open) return;
+  btn.setAttribute('aria-expanded', 'true');
+  if (!LG.agents) {
+    try { LG.agents = await Api.auth.agents(); } catch (_) { LG.agents = []; }
+  }
+  if (btn.getAttribute('aria-expanded') !== 'true') return;
+  const today = new Date(), min = new Date(); min.setDate(min.getDate() - 7);
+  const statuses = [['', 'Any status'], ['success', 'Success'], ['failed', 'Failed'], ['pending', 'Pending']];
+  const pop = document.createElement('div');
+  pop.className = 'an-pop lg-pop';
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', 'Filter logs');
+  pop.innerHTML = `
+    <div class="an-pop-label">Status</div>
+    <div class="lg-seg" role="radiogroup" aria-label="Status">
+      ${statuses.map(([v, l]) => `<label class="lg-seg-opt"><input type="radio" name="lg-st" value="${v}"${LG.status === v ? ' checked' : ''}><span>${l}</span></label>`).join('')}
+    </div>
+    <div class="an-pop-sep"></div>
+    <div class="an-pop-label">Date range</div>
+    <div class="an-custom">
+      <label>From<input type="date" id="lg-from" value="${esc(LG.from)}" min="${_anYmd(min)}" max="${_anYmd(today)}"></label>
+      <label>To<input type="date" id="lg-to" value="${esc(LG.to)}" min="${_anYmd(min)}" max="${_anYmd(today)}"></label>
+    </div>
+    <div class="an-pop-sep"></div>
+    <div class="an-pop-label"><label for="lg-by">Performed by</label></div>
+    <div class="lg-pop-field">
+      <select id="lg-by">
+        <option value="">Anyone</option>
+        ${(LG.agents || []).length ? `<optgroup label="Team">${LG.agents.map(a => `<option value="${a.id}"${String(a.id) === LG.by ? ' selected' : ''}>${esc(a.name || a.email || ('#' + a.id))}</option>`).join('')}</optgroup>` : ''}
+        <optgroup label="Other">${LG_PERFORMERS.map(([v, l]) => `<option value="${v}"${v === LG.by ? ' selected' : ''}>${l}</option>`).join('')}</optgroup>
+      </select>
+    </div>
+    <div class="an-pop-foot">
+      <button class="lg-btn lg-btn-sm" id="lg-f-clear">Clear</button>
+      <button class="btn btn-primary btn-sm" id="lg-f-apply">Apply</button>
+    </div>`;
+  btn.parentElement.appendChild(pop);
+  pop.querySelector('input[name="lg-st"]:checked')?.focus();
+  pop.querySelector('#lg-f-clear').addEventListener('click', () => {
+    Object.assign(LG, { status: '', from: '', to: '', by: '', page: 1 });
+    _lgClosePop(); _lgRefreshToolbar(); _lgLoad();
+  });
+  pop.querySelector('#lg-f-apply').addEventListener('click', () => {
+    let from = pop.querySelector('#lg-from').value, to = pop.querySelector('#lg-to').value;
+    if (from && to && from > to) [from, to] = [to, from];
+    Object.assign(LG, {
+      status: pop.querySelector('input[name="lg-st"]:checked')?.value || '',
+      from, to, by: pop.querySelector('#lg-by').value, page: 1,
+    });
+    _lgClosePop(); _lgRefreshToolbar(); _lgLoad();
+  });
+}
+
+function _lgRefreshToolbar() {
+  const btn = document.getElementById('lg-filter-btn');
+  if (!btn) return;
+  const nf = [LG.status, LG.from || LG.to, LG.by].filter(Boolean).length;
+  btn.innerHTML = `${lgIcon('bars')}<span>Filter</span>${nf ? `<span class="an-count">${nf}</span>` : ''}`;
+}
+
+// ── Details drawer ── //
+function _lgCloseDrawer() {
+  const w = document.getElementById('lg-drawer-wrap');
+  if (!w) return;
+  w.remove();
+  document.removeEventListener('keydown', _lgDrawerKey);
+  document.querySelector(`.lg-row[data-uid="${CSS.escape(LG.openUid || '')}"]`)?.focus();
+  LG.openUid = null;
+}
+function _lgDrawerKey(e) { if (e.key === 'Escape') _lgCloseDrawer(); }
+
+async function _lgOpenDrawer(uid) {
+  _lgCloseDrawer();
+  LG.openUid = uid;
+  const wrap = document.createElement('div');
+  wrap.id = 'lg-drawer-wrap';
+  wrap.className = 'lg-drawer-wrap';
+  wrap.innerHTML = `<div class="lg-scrim" data-close></div>
+    <aside class="lg-drawer" role="dialog" aria-modal="true" aria-labelledby="lg-dr-title" tabindex="-1"><div class="loading-center"><div class="spinner"></div></div></aside>`;
+  document.body.appendChild(wrap);
+  document.addEventListener('keydown', _lgDrawerKey);
+  wrap.querySelector('[data-close]').addEventListener('click', _lgCloseDrawer);
+  let it;
+  try { it = await Api.logs.operation(uid); }
+  catch (e) { _lgCloseDrawer(); toast(e.message || 'Could not load log', 'error'); return; }
+  if (!wrap.isConnected) return;
+  const dr = wrap.querySelector('.lg-drawer');
+  dr.innerHTML = _lgDrawerHTML(it);
+  dr.querySelector('[data-close]').addEventListener('click', _lgCloseDrawer);
+  dr.querySelector('[data-copy]')?.addEventListener('click', () => stCopy(it.uid, 'Log ID copied'));
+  dr.focus();
+}
+
+const LG_STATUS_LABEL = { success: 'Success', failed: 'Failed', partial: 'Partly failed', pending: 'Pending' };
+
+function _lgDrawerHTML(it) {
+  const p = Object.values(LG_PAGES).find(x => x.kind === it.kind) || {};
+  const fact = (k, v) => `<div class="lg-fact"><dt>${k}</dt><dd>${v}</dd></div>`;
+  const d = it.details || {};
+  const parts = Array.isArray(d.participants) && d.participants.some(x => x && typeof x === 'object' && 'ok' in x) ? d.participants : null;
+  const deliveries = Array.isArray(d.deliveries) ? d.deliveries : null;
+  const sub = (title, rows) => `<h4 class="lg-sub">${title}</h4><table class="lg-mini">${rows}</table>`;
+  return `
+    <div class="lg-dr-head">
+      <div class="lg-dr-title">
+        <div class="lg-dr-kind">${esc(p.nav || it.kind)}</div>
+        <h3 id="lg-dr-title">${_lgOperation(it)}</h3>
+      </div>
+      <button type="button" class="lg-icon-btn" data-close aria-label="Close">${lgIcon('xmark')}</button>
+    </div>
+    <div class="lg-dr-body">
+      <dl class="lg-facts">
+        ${fact('Status', `<span class="lg-status lg-status-${esc(it.status)}">${esc(LG_STATUS_LABEL[it.status] || it.status)}</span>`)}
+        ${fact('Log ID', `<code class="lg-uid">${esc(it.uid)}</code><button type="button" class="lg-icon-btn lg-copy" data-copy aria-label="Copy log ID" title="Copy">${lgIcon('copy')}</button>`)}
+        ${it.kind !== 'api' ? fact('Success', _lgNum(it.success_count, 'success')) + fact('Failed', _lgNum(it.failed_count, 'failed'))
+          + (it.pending_count || it.kind === 'group' || it.kind === 'scheduled' ? fact('Pending', _lgNum(it.pending_count, 'pending')) : '') : ''}
+        ${it.status_code != null ? fact('Status code', _lgCode(it.status_code)) : ''}
+        ${it.duration_ms != null ? fact('Duration', `${esc(it.duration_ms)} ms`) : ''}
+        ${fact('Performed by', esc(it.performed_by || 'System'))}
+        ${fact('Timestamp', esc(_lgWhen(it.created_at)))}
+        ${it.updated_at && parseServerDate(it.updated_at) - parseServerDate(it.created_at) > 1500 ? fact('Last updated', esc(_lgWhen(it.updated_at))) : ''}
+      </dl>
+      ${d.error ? `<div class="lg-error" role="note"><strong>Error</strong><span>${esc(d.error)}</span></div>` : ''}
+      ${parts ? sub(`Participants (${parts.length})`, parts.map(x => `<tr><td><code>${esc(x.id)}</code></td><td>${x.ok ? '<span class="lg-success">Success</span>' : `<span class="lg-failed">Failed</span>${x.error ? ` <span class="lg-muted">· ${esc(x.error)}</span>` : ''}`}</td></tr>`).join('')) : ''}
+      ${deliveries ? sub(`Endpoints (${deliveries.length})`, deliveries.map(x => `<tr><td>${esc(x.host || '?')}</td><td>${_lgCode(x.status_code)}</td><td>${x.ok ? '<span class="lg-success">Delivered</span>' : `<span class="lg-failed">Failed</span>${x.error ? ` <span class="lg-muted">· ${esc(x.error)}</span>` : ''}`}</td></tr>`).join('')) : ''}
+      <h4 class="lg-sub">Payload</h4>
+      <pre class="lg-json">${esc(JSON.stringify(d, null, 2))}</pre>
+    </div>`;
+}
+
+// ── Activity logs (the original audit log) ── //
+async function _lgRenderActivity(host) {
+  host.innerHTML = `
+    <div class="lg-page lg-activity">
+      <div class="lg-toolbar">
+        <label class="lg-inline">From<input type="date" id="log-start-date" class="lg-date"></label>
+        <label class="lg-inline">To<input type="date" id="log-end-date" class="lg-date"></label>
+        <select id="log-action-filter" class="lg-select" aria-label="Event"><option value="">All events</option></select>
+        <span class="lg-spacer"></span>
+        ${isAdmin() ? '<button class="lg-btn" id="log-export">Export CSV</button>' : ''}
+      </div>
+      <div class="lg-table-wrap">
+        <table class="lg-table lg-table-activity" aria-label="Activity logs">
+          <thead><tr><th scope="col" style="width:190px">Time</th><th scope="col" style="width:170px">Event</th><th scope="col" style="width:160px">Agent</th><th scope="col">Details</th></tr></thead>
+          <tbody id="logs-tbody"><tr class="lg-state"><td colspan="4"><div class="spinner"></div></td></tr></tbody>
+        </table>
       </div>
     </div>`;
 
   const startInput = document.getElementById('log-start-date');
   const endInput = document.getElementById('log-end-date');
   const actionSel = document.getElementById('log-action-filter');
-
   function reloadWithFilters() {
-    let startVal = startInput.value;
-    let endVal = endInput.value;
-    let start_date = startVal ? `${startVal}T00:00:00.000Z` : undefined;
-    let end_date = endVal ? `${endVal}T23:59:59.999Z` : undefined;
-    loadLogsTable(actionSel.value, start_date, end_date);
+    const s = startInput.value, e = endInput.value;
+    loadLogsTable(actionSel.value, s ? `${s}T00:00:00.000Z` : undefined, e ? `${e}T23:59:59.999Z` : undefined);
   }
-
   startInput.addEventListener('change', reloadWithFilters);
   endInput.addEventListener('change', reloadWithFilters);
   actionSel.addEventListener('change', reloadWithFilters);
-
-  document.getElementById('log-export').addEventListener('click', async () => {
+  document.getElementById('log-export')?.addEventListener('click', async () => {
     try { await Api.exports.logs(30); toast('Export downloaded', 'success'); }
-    catch(e) { toast(e.message, 'error'); }
+    catch (e) { toast(e.message, 'error'); }
   });
-
   try {
     const actions = await Api.logs.actions();
     actions.forEach(a => {
@@ -4493,7 +9456,7 @@ async function renderLogs() {
       o.textContent = a.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
       actionSel.appendChild(o);
     });
-  } catch(_) {}
+  } catch (_) {}
   await loadLogsTable('');
 }
 
@@ -4547,7 +9510,7 @@ async function loadLogsTable(action, start_date, end_date) {
           </div>`;
       }
       return `<tr>
-        <td style="font-size:12.5px;color:var(--text-3);white-space:nowrap;vertical-align:top;padding-top:10px">${new Date(l.created_at).toLocaleString()}</td>
+        <td style="font-size:12.5px;color:var(--text-3);white-space:nowrap;vertical-align:top;padding-top:10px">${parseServerDate(l.created_at).toLocaleString()}</td>
         <td style="vertical-align:top;padding-top:8px">${formatLogEvent(l.action)}</td>
         <td style="font-size:13px;color:var(--text-2);vertical-align:top;padding-top:10px">${esc(l.agent_name || 'System')}</td>
         <td style="font-size:13px;vertical-align:top;padding-top:10px">${detailsHtml}</td>
@@ -4610,7 +9573,7 @@ async function renderChatListView() {
             </svg>
             <p style="font-size:15px;font-weight:600;color:var(--text-2);opacity:.8;margin:0.5rem 0 0.25rem">WhatsApp Disconnected</p>
             <span style="font-size:13px;color:var(--text-3);max-width:320px;line-height:1.4">Connect your WhatsApp to view the chat list.</span>
-            <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings')">Connect WhatsApp</button>
+            <button class="btn btn-primary btn-sm" style="margin-top:0.75rem" onclick="switchView('settings/phones')">Connect WhatsApp</button>
           </div>`;
         }
         return;
@@ -4629,7 +9592,9 @@ async function renderChatListView() {
           <td style="font-weight:600">${esc(displayName(c))}</td>
           <td>${(c.labels || []).map(id => {
             const l = State.labels.find(x => x.id === id);
-            return l ? `<span class="chat-label-mini" style="background:${l.color}22;color:${l.color};border:1px solid ${l.color}44">${esc(l.name)}</span>` : '';
+            if (!l) return '';
+            const lc = safeColor(l.color);
+            return `<span class="chat-label-mini" style="background:${lc}22;color:${lc};border:1px solid ${lc}44">${esc(l.name)}</span>`;
           }).join(' ') || '<span class="text-muted" style="font-size:11px">—</span>'}</td>
           <td style="font-size:12.5px">${agentNames[c.assigned_to] ? esc(agentNames[c.assigned_to]) : '<span class="text-muted">Unassigned</span>'}</td>
           <td style="font-size:12px;color:var(--text-3)">${c.last_message_at ? timeAgo(c.last_message_at) : '—'}</td>
@@ -4728,15 +9693,15 @@ async function renderChatListView() {
   document.getElementById('bt-export').addEventListener('click', () => {
     const picked = rows.filter(c => selected.has(c.id));
     const header = ['id', 'name', 'type', 'labels', 'unread', 'flagged', 'last_active'];
-    const csv = [header.join(',')].concat(picked.map(c => [
+    const csv = [header.join(',')].concat(picked.map(c => csvRow([
       c.id,
-      '"' + displayName(c).replace(/"/g, '""') + '"',
+      displayName(c),
       c.is_group ? 'group' : 'user',
-      '"' + (c.labels || []).map(id => State.labels.find(l => l.id === id)?.name || id).join('; ') + '"',
+      (c.labels || []).map(id => State.labels.find(l => l.id === id)?.name || id).join('; '),
       c.unread_count || 0,
       c.is_flagged ? 'yes' : 'no',
       c.last_message_at || '',
-    ].join(','))).join('\n');
+    ]))).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = 'chat_list.csv';
@@ -4774,7 +9739,7 @@ async function renderChatListView() {
             <div class="task-title">${esc(t.title)}</div>
             <div class="task-sub">
               ${t.assignee_name ? esc(t.assignee_name) : 'Unassigned'}
-              ${t.due_date ? ' · due ' + new Date(t.due_date).toLocaleDateString() : ''}
+              ${t.due_date ? ' · due ' + parseServerDate(t.due_date).toLocaleDateString() : ''}
               ${t.notes ? ' · ' + esc(t.notes.slice(0, 40)) : ''}
             </div>
           </div>
@@ -4802,22 +9767,137 @@ async function renderChatListView() {
   viewSel.addEventListener('change', loadTasks);
 
   document.getElementById('tasks-create-btn').addEventListener('click', () => {
-    // Full task modal (due date, reminder, assignee, priority, notes)
-    showTaskModal({});
-    // refresh the panel after the modal closes
-    const overlay = document.getElementById('modal-overlay');
-    const watcher = setInterval(() => {
-      if (overlay.style.display === 'none') { clearInterval(watcher); loadTasks(); }
-    }, 400);
+    // Full task modal (due date, reminder, assignee, priority, notes); refresh the panel once saved
+    showTaskModal({ onSaved: () => { if (panel.style.display !== 'none') loadTasks(); } });
   });
 })();
 
 // ══ NOTIFICATION SETTINGS (topbar bell) ═══════════════════════════ //
+// Per-agent prefs live on the server (GET/PUT /auth/me/notification-prefs);
+// localStorage only caches them so the popover and early WS events don't wait.
 const NotifPrefs = {
-  get() {
-    try { return JSON.parse(localStorage.getItem('notif_prefs')) || {}; } catch(_) { return {}; }
+  DEFAULTS: {
+    in_app: true, desktop: false, sound: false,
+    types: {
+      new_messages: true, new_note: true, ticket_assign: true, task_assign: true,
+      chat_assign: true, ticket_overdue: true, task_overdue: true,
+    },
   },
-  save(p) { localStorage.setItem('notif_prefs', JSON.stringify(p)); },
+  LEGACY_KEY: 'notif_prefs',   // pre-server flat format: {desktop, sound, new_messages, ...}
+  _prefs: null,
+  _prefsFor: null,             // agent id _prefs belongs to
+  _loadedFor: null,            // agent id the server prefs were fetched for
+  _loading: null,
+
+  _cacheKey() { return `notif_prefs_v2:${State.agent?.id || 0}`; },
+  _normalize(p) {
+    const d = this.DEFAULTS;
+    const out = { ...d, types: { ...d.types } };
+    if (!p || typeof p !== 'object') return out;
+    ['in_app', 'desktop', 'sound'].forEach(k => { if (typeof p[k] === 'boolean') out[k] = p[k]; });
+    const t = p.types && typeof p.types === 'object' ? p.types : {};
+    Object.keys(d.types).forEach(k => { if (typeof t[k] === 'boolean') out.types[k] = t[k]; });
+    return out;
+  },
+  _writeCache(p) {
+    try { localStorage.setItem(this._cacheKey(), JSON.stringify(p)); } catch (_) {}
+  },
+  // Old flat localStorage prefs → new shape (null when there are none)
+  _readLegacy() {
+    let old = null;
+    try { old = JSON.parse(localStorage.getItem(this.LEGACY_KEY)); } catch (_) {}
+    if (!old || typeof old !== 'object') return null;
+    const patch = { types: {} };
+    ['desktop', 'sound'].forEach(k => { if (typeof old[k] === 'boolean') patch[k] = old[k]; });
+    Object.keys(this.DEFAULTS.types).forEach(k => { if (typeof old[k] === 'boolean') patch.types[k] = old[k]; });
+    return patch;
+  },
+
+  get() {
+    const id = State.agent?.id || 0;
+    if (!this._prefs || this._prefsFor !== id) {   // first use, or a different agent logged in
+      let cached = null;
+      try { cached = JSON.parse(localStorage.getItem(this._cacheKey())); } catch (_) {}
+      this._prefs = this._normalize(cached || this._readLegacy());
+      this._prefsFor = id;
+    }
+    return this._prefs;
+  },
+  isLoaded() { return !!State.agent && this._loadedFor === State.agent.id; },
+
+  // Fetch from the server (once per logged-in agent); migrates legacy local prefs.
+  load() {
+    if (!State.agent || !Api.getToken?.()) return Promise.resolve(this.get());
+    if (this.isLoaded()) return Promise.resolve(this._prefs);
+    if (this._loading) return this._loading;
+    const agentId = State.agent.id;
+    this._loading = (async () => {
+      try {
+        let server = await Api.auth.notificationPrefs();
+        const legacy = this._readLegacy();
+        if (legacy) {
+          server = await Api.auth.saveNotificationPrefs(legacy);
+          try { localStorage.removeItem(this.LEGACY_KEY); } catch (_) {}
+        }
+        if (State.agent?.id === agentId) {
+          this._prefs = this._normalize(server);
+          this._prefsFor = this._loadedFor = agentId;
+          this._writeCache(this._prefs);
+        }
+      } catch (_) {
+        // Offline / server error: keep the cached copy, retry on next call
+      } finally {
+        this._loading = null;
+      }
+      return this.get();
+    })();
+    return this._loading;
+  },
+
+  // Optimistic update; reverts (and rethrows) if the server rejects it.
+  async save(patch) {
+    const before = this.get();
+    const next = this._normalize({ ...before, ...patch, types: { ...before.types, ...(patch.types || {}) } });
+    this._prefs = next;
+    this._writeCache(next);
+    try {
+      const saved = await Api.auth.saveNotificationPrefs(patch);
+      this._prefs = this._normalize(saved);
+      this._writeCache(this._prefs);
+      document.dispatchEvent(new CustomEvent('notifprefs:change'));
+      return this._prefs;
+    } catch (e) {
+      this._prefs = before;
+      this._writeCache(before);
+      throw e;
+    }
+  },
+};
+
+function loadNotifPrefs() { return NotifPrefs.load(); }
+
+// One shared AudioContext (browsers cap how many a page may create)
+const NotifSound = {
+  _ctx: null,
+  play() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!this._ctx) this._ctx = new Ctx();
+      const ctx = this._ctx;
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.setValueAtTime(1175, ctx.currentTime + 0.09);
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.24);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(); osc.stop(ctx.currentTime + 0.25);
+    } catch (_) {}
+  },
 };
 
 (() => {
@@ -4825,7 +9905,14 @@ const NotifPrefs = {
   const pop = document.getElementById('notif-popover');
   if (!bell || !pop) return;
 
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', 'Notification settings');
+  bell.setAttribute('aria-haspopup', 'dialog');
+  bell.setAttribute('aria-controls', 'notif-popover');
+  bell.setAttribute('aria-expanded', 'false');
+
   const SETTINGS = [
+    ['in_app', 'In-App Notifications'],
     ['desktop', 'Desktop Notifications'],
     ['sound', 'Sound'],
   ];
@@ -4834,58 +9921,132 @@ const NotifPrefs = {
     ['new_note', 'New Private Note'],
     ['ticket_assign', 'Ticket Assignment'],
     ['task_assign', 'Task Assignment'],
+    ['chat_assign', 'Chat Assignment'],
+    ['ticket_overdue', 'Ticket Overdue'],
+    ['task_overdue', 'Task Overdue'],
   ];
+
+  const isOpen = () => pop.style.display !== 'none';
 
   function render() {
     const p = NotifPrefs.get();
     pop.innerHTML = `
-      <div class="np-title">Notification Settings</div>
-      ${SETTINGS.map(([k, label]) => `
-        <div class="notif-row">${label}
-          <label class="np-switch"><input type="checkbox" data-k="${k}" ${p[k] ? 'checked' : ''}><span class="np-slider"></span></label>
-        </div>`).join('')}
-      <div class="np-title">Notification Types</div>
-      ${TYPES.map(([k, label]) => `
-        <div class="notif-row">${label}
-          <input type="checkbox" class="np-check" data-k="${k}" ${p[k] !== false ? 'checked' : ''}>
-        </div>`).join('')}`;
-    pop.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('change', () => {
-      const prefs = NotifPrefs.get();
-      prefs[inp.dataset.k] = inp.checked;
-      NotifPrefs.save(prefs);
-      if (inp.dataset.k === 'desktop' && inp.checked && 'Notification' in window) {
-        Notification.requestPermission();
+      <div class="np-section" role="group" aria-labelledby="np-h-settings">
+        <div class="np-heading" id="np-h-settings">Notification Settings</div>
+        ${SETTINGS.map(([k, label]) => `
+          <label class="np-row">
+            <span class="np-label">${label}</span>
+            <span class="np-toggle">
+              <input type="checkbox" role="switch" data-setting="${k}" ${p[k] ? 'checked' : ''}>
+              <span class="np-track" aria-hidden="true"></span>
+            </span>
+          </label>`).join('')}
+      </div>
+      <div class="np-divider" role="separator"></div>
+      <div class="np-section" role="group" aria-labelledby="np-h-types">
+        <div class="np-heading" id="np-h-types">Notification Types</div>
+        ${TYPES.map(([k, label]) => `
+          <label class="np-row">
+            <span class="np-label">${label}</span>
+            <input type="checkbox" class="np-checkbox" data-type="${k}" ${p.types[k] ? 'checked' : ''}>
+          </label>`).join('')}
+      </div>`;
+
+    pop.querySelectorAll('input[data-setting]').forEach(inp =>
+      inp.addEventListener('change', () => onSettingChange(inp)));
+    pop.querySelectorAll('input[data-type]').forEach(inp =>
+      inp.addEventListener('change', () => persist({ types: { [inp.dataset.type]: inp.checked } }, inp)));
+  }
+
+  async function persist(patch, inp) {
+    try {
+      await NotifPrefs.save(patch);
+    } catch (e) {
+      if (inp) inp.checked = !inp.checked;
+      toast(`Couldn't save notification settings: ${e.message || e}`, 'error');
+    }
+  }
+
+  async function onSettingChange(inp) {
+    const key = inp.dataset.setting;
+    if (key === 'desktop' && inp.checked) {
+      const reason = await ensureDesktopPermission();
+      if (reason) {
+        inp.checked = false;
+        toast(reason, 'error');
+        return;
       }
-    }));
+    }
+    await persist({ [key]: inp.checked }, inp);
+    if (key === 'sound' && inp.checked) NotifSound.play();   // preview + unlocks audio via this gesture
+  }
+
+  // Returns an error message, or '' when desktop notifications may be shown.
+  async function ensureDesktopPermission() {
+    if (!('Notification' in window)) return 'This browser does not support desktop notifications';
+    if (Notification.permission === 'granted') return '';
+    if (Notification.permission === 'denied') {
+      return 'Desktop notifications are blocked. Allow them for this site in your browser settings.';
+    }
+    try {
+      const result = await Notification.requestPermission();
+      return result === 'granted' ? '' : 'Desktop notification permission was not granted';
+    } catch (_) {
+      return 'Could not request desktop notification permission';
+    }
+  }
+
+  function open() {
+    pop.style.display = 'block';
+    bell.setAttribute('aria-expanded', 'true');
+    render();
+    pop.querySelector('input')?.focus();
+    // Refresh from the server; re-render only if it changed while open
+    const shown = JSON.stringify(NotifPrefs.get());
+    loadNotifPrefs().then(p => {
+      if (isOpen() && JSON.stringify(p) !== shown) render();
+    });
+  }
+  function close(returnFocus) {
+    if (!isOpen()) return;
+    pop.style.display = 'none';
+    bell.setAttribute('aria-expanded', 'false');
+    if (returnFocus) bell.focus();
   }
 
   bell.addEventListener('click', e => {
     e.stopPropagation();
-    const open = pop.style.display !== 'none';
-    pop.style.display = open ? 'none' : 'block';
-    if (!open) render();
+    isOpen() ? close(false) : open();
   });
+  pop.addEventListener('click', e => e.stopPropagation());
   document.addEventListener('click', e => {
-    if (!pop.contains(e.target) && e.target !== bell) pop.style.display = 'none';
+    if (isOpen() && !pop.contains(e.target) && !bell.contains(e.target)) close(false);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && isOpen()) { e.stopPropagation(); close(true); }
   });
 })();
 
-// Called from the WS handler on incoming events
-function notifyUser(type, title, bodyText) {
+// Single entry point for every notification-worthy WS event.
+// type: a NotifPrefs.DEFAULTS.types key. opts.toast=false skips the in-app
+// toast (e.g. new message in the chat already on screen).
+function notifyUser(type, title, bodyText = '', opts = {}) {
+  if (!NotifPrefs.isLoaded()) loadNotifPrefs();   // lazy; this event uses the cached copy
   const p = NotifPrefs.get();
-  if (p[type] === false) return;
-  if (p.desktop && 'Notification' in window && Notification.permission === 'granted') {
-    try { new Notification(title, { body: bodyText.slice(0, 140) }); } catch(_) {}
+  if (p.types[type] === false) return;
+  const body = String(bodyText || '');
+
+  if (p.in_app && opts.toast !== false) {
+    toast(opts.toastText || (body ? `${title}: ${body.slice(0, 80)}` : title));
   }
-  if (p.sound) {
+  if (p.desktop && 'Notification' in window && Notification.permission === 'granted'
+      && (document.hidden || !document.hasFocus())) {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ctx.createOscillator(); const gain = ctx.createGain();
-      osc.connect(gain); gain.connect(ctx.destination);
-      osc.frequency.value = 880; gain.gain.value = 0.04;
-      osc.start(); osc.stop(ctx.currentTime + 0.12);
-    } catch(_) {}
+      const n = new Notification(title, { body: body.slice(0, 140), tag: opts.tag || undefined });
+      n.onclick = () => { window.focus(); n.close(); };
+    } catch (_) {}
   }
+  if (p.sound) NotifSound.play();
 }
 
 // ══ ASK AI (Org & Chat Assistant) ═════════════════════════════════ //
@@ -4896,11 +10057,6 @@ function notifyUser(type, title, bodyText) {
   const body = document.getElementById('ai-panel-body');
   const input = document.getElementById('ai-panel-q');
   const scopeChip = document.getElementById('ai-scope');
-
-  // Show the button once logged in
-  const bootWatch = setInterval(() => {
-    if (State.agent) { fab.style.display = 'flex'; clearInterval(bootWatch); }
-  }, 800);
 
   const ORG_RECIPES = [
     ['summarize_24h', '📋 Summarize last 24 hours'],

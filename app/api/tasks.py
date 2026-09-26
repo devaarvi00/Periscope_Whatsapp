@@ -9,6 +9,8 @@ from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.task import Task
+from app.schemas.common import parse_client_datetime
+from app.services.access import accessible_chat_ids, assert_chat_id_access
 from app.services.activity_service import log_activity
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -55,13 +57,17 @@ def _agent_names(db: Session) -> dict[int, str]:
 
 
 @router.get("")
-def list_tasks(
+async def list_tasks(
     view: str = "my_open",  # my_open|all_active|all|assigned_to_me|high_priority
     chat_id: int | None = None,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
     q = db.query(Task)
+    visible = await accessible_chat_ids(db, agent)
+    if visible is not None:
+        # Restricted agents see unlinked tasks plus tasks on chats they can access
+        q = q.filter(Task.chat_id.is_(None) | Task.chat_id.in_(visible or [0]))
     if chat_id:
         q = q.filter(Task.chat_id == chat_id)
     if view == "my_open":
@@ -85,12 +91,11 @@ async def create_task(
 ):
     if not req.title.strip():
         raise HTTPException(400, "Title is required")
+    await assert_chat_id_access(db, agent, req.chat_id)
 
     def _parse(value: str | None, field: str):
-        if not value:
-            return None
         try:
-            return datetime.fromisoformat(value)
+            return parse_client_datetime(value)
         except ValueError:
             raise HTTPException(400, f"Invalid {field} (use ISO 8601)")
 
@@ -120,48 +125,74 @@ async def create_task(
     return _serialize(task, _agent_names(db))
 
 
+async def _get_accessible_task(db: Session, agent: Agent, task_id: int) -> Task:
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(404, "Task not found")
+    try:
+        await assert_chat_id_access(db, agent, task.chat_id)
+    except HTTPException:
+        raise HTTPException(404, "Task not found")
+    return task
+
+
 @router.patch("/{task_id}")
-def update_task(
+async def update_task(
     task_id: int,
     req: TaskUpdate,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if not task:
-        raise HTTPException(404, "Task not found")
-    changes = req.model_dump(exclude_none=True)
+    task = await _get_accessible_task(db, agent, task_id)
+    # exclude_unset: `null` clears assigned_to / due_date / reminder_at;
+    # an empty string also clears a date.
+    changes = req.model_dump(exclude_unset=True)
+    nullable = {"assigned_to", "due_date", "reminder_at", "notes"}
+    changes = {k: v for k, v in changes.items() if v is not None or k in nullable}
     for field in ("due_date", "reminder_at"):
         if field in changes:
             try:
-                changes[field] = datetime.fromisoformat(changes[field])
+                changes[field] = parse_client_datetime(changes[field])
             except ValueError:
                 raise HTTPException(400, f"Invalid {field}")
     if "reminder_at" in changes:
         task.reminder_sent = False   # re-arm the reminder when time changes
+    prev_assignee, prev_due = task.assigned_to, task.due_date
     for k, v in changes.items():
         if hasattr(task, k):
             setattr(task, k, v)
     if changes.get("status") == "done" and not task.completed_at:
         task.completed_at = datetime.utcnow()
+    # Re-arm the one-shot overdue notification when the deadline moves out
+    # (or is cleared), or when a new assignee takes over.
+    if task.due_date != prev_due and (task.due_date is None or task.due_date > datetime.utcnow()):
+        task.overdue_notified_at = None
+    if task.assigned_to != prev_assignee:
+        task.overdue_notified_at = None
     db.commit()
     db.refresh(task)
     log_activity(
         db, "task_updated", entity_type="task", entity_id=task.id,
         agent_id=agent.id, description=f"Task '{task.title}' updated: {', '.join(changes.keys())}",
     )
+    # Notify on an actual reassignment, never for self-assignment
+    if task.assigned_to and task.assigned_to != prev_assignee and task.assigned_to != agent.id:
+        from app.core.ws_manager import ws_manager
+        await ws_manager.send_to_agent(task.assigned_to, "task_assigned", {
+            "task_id": task.id, "title": task.title,
+            "by": agent.name, "priority": task.priority,
+            "due_date": task.due_date.isoformat() if task.due_date else None,
+        })
     return _serialize(task, _agent_names(db))
 
 
 @router.delete("/{task_id}", status_code=204)
-def delete_task(
+async def delete_task(
     task_id: int,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if not task:
-        raise HTTPException(404, "Task not found")
+    task = await _get_accessible_task(db, agent, task_id)
     db.delete(task)
     db.commit()
     log_activity(

@@ -1,5 +1,3 @@
-from datetime import datetime
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -8,6 +6,8 @@ from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.scheduled_message import ScheduledMessage
+from app.schemas.common import parse_client_datetime
+from app.services.access import accessible_chat_ids, get_accessible_chat
 from app.services.activity_service import log_activity
 from app.services.mongo_chat_service import MongoInboxService
 
@@ -92,10 +92,21 @@ def _parse_recurrence(req) -> dict:
             out["end_date"] = None
         else:
             try:
-                out["end_date"] = datetime.fromisoformat(req.end_date)
+                out["end_date"] = parse_client_datetime(req.end_date)
             except ValueError:
                 raise HTTPException(400, "Invalid end_date (use ISO 8601)")
     return out
+
+
+async def _get_accessible_scheduled(db: Session, agent: Agent, msg_id: int) -> ScheduledMessage:
+    msg = db.query(ScheduledMessage).filter(ScheduledMessage.id == msg_id).first()
+    if not msg:
+        raise HTTPException(404, "Scheduled message not found")
+    try:
+        await get_accessible_chat(db, agent, msg.chat_id)
+    except HTTPException:
+        raise HTTPException(404, "Scheduled message not found")
+    return msg
 
 
 @router.get("")
@@ -103,8 +114,12 @@ async def list_scheduled(
     chat_id: int | None = None,
     status: str | None = None,
     db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
 ):
     q = db.query(ScheduledMessage)
+    visible = await accessible_chat_ids(db, agent)
+    if visible is not None:
+        q = q.filter(ScheduledMessage.chat_id.in_(visible or [0]))
     if chat_id:
         q = q.filter(ScheduledMessage.chat_id == chat_id)
     if status:
@@ -129,14 +144,13 @@ async def create_scheduled(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(req.chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+    chat = await get_accessible_chat(db, agent, req.chat_id)
     try:
-        send_at = datetime.fromisoformat(req.send_at)
+        send_at = parse_client_datetime(req.send_at)
     except ValueError:
         raise HTTPException(400, "Invalid send_at (use ISO 8601)")
+    if send_at is None:
+        raise HTTPException(400, "send_at is required")
     if not req.body.strip():
         raise HTTPException(400, "Message body is empty")
     rec = _parse_recurrence(req)
@@ -172,9 +186,7 @@ async def update_scheduled(
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    msg = db.query(ScheduledMessage).filter(ScheduledMessage.id == msg_id).first()
-    if not msg:
-        raise HTTPException(404, "Scheduled message not found")
+    msg = await _get_accessible_scheduled(db, agent, msg_id)
     if msg.status not in ("pending",):
         raise HTTPException(400, "Only pending schedules can be edited")
     rec = _parse_recurrence(req)
@@ -184,9 +196,11 @@ async def update_scheduled(
         msg.body = req.body
     if req.send_at is not None:
         try:
-            msg.send_at = datetime.fromisoformat(req.send_at)
+            send_at = parse_client_datetime(req.send_at)
         except ValueError:
             raise HTTPException(400, "Invalid send_at")
+        if send_at is not None:
+            msg.send_at = send_at
     for k, v in rec.items():
         setattr(msg, k, v)
     db.commit()
@@ -203,14 +217,12 @@ async def update_scheduled(
 
 
 @router.delete("/{msg_id}", status_code=204)
-def cancel_scheduled(
+async def cancel_scheduled(
     msg_id: int,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    msg = db.query(ScheduledMessage).filter(ScheduledMessage.id == msg_id).first()
-    if not msg:
-        raise HTTPException(404, "Scheduled message not found")
+    msg = await _get_accessible_scheduled(db, agent, msg_id)
     msg.status = "cancelled"
     db.commit()
     log_activity(

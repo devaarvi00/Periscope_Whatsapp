@@ -1,9 +1,10 @@
-import asyncio
 import json
 import logging
 from typing import Any
 
 from fastapi import WebSocket
+
+from app.services import presence_service
 
 logger = logging.getLogger(__name__)
 
@@ -13,20 +14,38 @@ class ConnectionManager:
         # agent_id -> set of active WebSocket connections
         self._connections: dict[int, list[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket, agent_id: int) -> None:
-        await websocket.accept()
-        self._connections.setdefault(agent_id, []).append(websocket)
+    async def connect(self, websocket: WebSocket, agent_id: int, accept: bool = True) -> None:
+        # accept=False when the caller already accepted the socket (e.g. to authenticate
+        # via the first message before registering it).
+        if accept:
+            await websocket.accept()
+        conns = self._connections.setdefault(agent_id, [])
+        if not conns:
+            # First live socket for this agent: a presence span starts (User uptime)
+            presence_service.span_opened(agent_id)
+        conns.append(websocket)
         logger.info("WS connected: agent_id=%s  total_agents=%s", agent_id, len(self._connections))
         # Confirm connection to the client
         await self._send(websocket, {"type": "connected", "agent_id": agent_id})
 
+    def online_agent_ids(self) -> set[int]:
+        """Agents with at least one live socket (this process only)."""
+        return {int(a) for a, conns in self._connections.items() if conns}
+
     def disconnect(self, websocket: WebSocket, agent_id: int) -> None:
         conns = self._connections.get(agent_id, [])
-        if websocket in conns:
-            conns.remove(websocket)
+        if websocket not in conns:
+            return
+        conns.remove(websocket)
         if not conns:
             self._connections.pop(agent_id, None)
+            # Last socket gone (all tabs closed): the presence span ends
+            presence_service.span_closed(agent_id)
         logger.info("WS disconnected: agent_id=%s  total_agents=%s", agent_id, len(self._connections))
+
+    async def send(self, websocket: WebSocket, payload: dict) -> bool:
+        """Send to a single socket; returns False if the socket is dead."""
+        return await self._send(websocket, payload)
 
     # ── Internal helpers ──────────────────────────────────────────── #
 

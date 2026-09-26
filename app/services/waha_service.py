@@ -10,6 +10,10 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Events our webhook subscribes to. group.v2.participants feeds the group
+# analytics (members joined / exited); reactions feed tickets + analytics.
+WEBHOOK_EVENTS = ["message.any", "message.reaction", "message.revoked", "group.v2.participants", "session.status"]
+
 
 class WAHAError(Exception):
     def __init__(self, code: str, message: str, status_code: int | None = None) -> None:
@@ -38,12 +42,23 @@ class WAHAService:
 
     @classmethod
     def from_phone(cls, phone: object) -> "WAHAService":
-        """Build WAHAService using a Phone model's own WAHA URL/key (falls back to global settings)."""
-        return cls(
+        """Build WAHAService using a Phone model's own WAHA URL/key.
+
+        Falls back to the global settings, but the global API key is only ever
+        sent to the global WAHA base URL — a phone pointing at a different
+        server must carry its own key, otherwise requests go out keyless.
+        """
+        global_base = (settings.waha_base_url or "").strip().rstrip("/")
+        phone_base = (getattr(phone, "waha_base_url", None) or "").strip().rstrip("/")
+        phone_key = getattr(phone, "waha_api_key", None) or None
+        svc = cls(
             session_name=getattr(phone, "session_name", ""),
-            base_url=getattr(phone, "waha_base_url", None) or None,
-            api_key=getattr(phone, "waha_api_key", None) or None,
+            base_url=phone_base or None,
+            api_key=phone_key,
         )
+        if phone_base and phone_base.lower() != global_base.lower() and not phone_key:
+            svc._headers.pop("X-Api-Key", None)
+        return svc
 
     # ── Session ──────────────────────────────────────────────────────────────
 
@@ -79,7 +94,7 @@ class WAHAService:
             payload["config"] = {
                 "webhooks": [{
                     "url": webhook_url,
-                    "events": ["message.any", "message.reaction", "session.status"],
+                    "events": WEBHOOK_EVENTS,
                     "customHeaders": [{"name": "X-Webhook-Secret", "value": webhook_secret}],
                 }]
             }
@@ -167,6 +182,67 @@ class WAHAService:
             logger.warning("WAHA get_messages error: %s", exc)
         return []
 
+    async def get_message(self, chat_id: str, message_id: str, download_media: bool = True) -> dict[str, Any]:
+        """One message by id; with download_media WAHA returns `media.url`."""
+        from urllib.parse import quote
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/chats/{quote(chat_id, safe='@.')}/messages/{quote(message_id, safe='')}"
+        try:
+            resp = await get_http_client().get(
+                url, headers=self._headers,
+                params={"downloadMedia": "true" if download_media else "false"},
+            )
+            if resp.is_success:
+                data = resp.json()
+                return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.warning("WAHA get_message error: %s", exc)
+        return {}
+
+    async def get_chat_picture(self, chat_id: str) -> str | None:
+        """Profile / group picture URL (WhatsApp CDN), or None when hidden."""
+        from urllib.parse import quote
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/chats/{quote(chat_id, safe='@.')}/picture"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                data = resp.json()
+                return (data or {}).get("url") if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.warning("WAHA get_chat_picture error: %s", exc)
+        return None
+
+    def files_path(self, media_url: str) -> str | None:
+        """Path of a WAHA-served media file (`/api/files/...`), else None.
+
+        WAHA reports its own public base URL in media.url, which may differ
+        from the address we reach it on — only the path is trusted and it is
+        always fetched from this phone's configured WAHA base.
+        """
+        from urllib.parse import urlsplit
+        try:
+            path = urlsplit(media_url or "").path
+        except ValueError:
+            return None
+        if not path.startswith("/api/files/") or ".." in path:
+            return None
+        return path
+
+    async def fetch_file(self, path: str, max_bytes: int = 64 * 1024 * 1024) -> tuple[bytes, str] | None:
+        """Download a WAHA media file by path. Returns (content, content_type)."""
+        from app.core.http_client import get_http_client
+        headers = {k: v for k, v in self._headers.items() if k != "Content-Type"}
+        headers["Accept"] = "*/*"
+        try:
+            resp = await get_http_client().get(f"{self.base}{path}", headers=headers)
+        except Exception as exc:
+            logger.warning("WAHA fetch_file error: %s", exc)
+            return None
+        if not resp.is_success or len(resp.content) > max_bytes:
+            return None
+        return resp.content, resp.headers.get("content-type", "application/octet-stream")
+
     # ── Groups ────────────────────────────────────────────────────────────────
 
     async def get_group_participants_with_status(self, group_id: str) -> tuple[list[dict[str, Any]], bool]:
@@ -200,14 +276,103 @@ class WAHAService:
 
     async def get_group_info(self, group_id: str) -> dict[str, Any]:
         from app.core.http_client import get_http_client
-        url = f"{self.base}/api/{self.session}/groups/{group_id}"
+        url = f"{self.base}/api/{self.session}/groups/{self._gid(group_id)}"
         try:
             resp = await get_http_client().get(url, headers=self._headers)
             if resp.is_success:
-                return resp.json()
+                data = resp.json()
+                return data if isinstance(data, dict) else {}
         except Exception as exc:
             logger.warning("WAHA get_group_info error: %s", exc)
         return {}
+
+    async def get_group_participants_v2(self, group_id: str) -> list[dict[str, Any]] | None:
+        """`[{id, pn, role}]` — role is participant/admin/superadmin and `pn`
+        carries the phone number even in LID-addressed groups. None on error."""
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/{self.session}/groups/{self._gid(group_id)}/participants/v2"
+        try:
+            resp = await get_http_client().get(url, headers=self._headers)
+            if resp.is_success:
+                data = resp.json()
+                return data if isinstance(data, list) else None
+            logger.warning("WAHA participants/v2 returned %s for %s", resp.status_code, group_id)
+        except Exception as exc:
+            logger.warning("WAHA participants/v2 error: %s", exc)
+        return None
+
+    async def get_contact_picture(self, contact_id: str) -> str | None:
+        """Profile picture URL of any contact (WhatsApp CDN), None when hidden."""
+        from app.core.http_client import get_http_client
+        url = f"{self.base}/api/contacts/profile-picture"
+        try:
+            resp = await get_http_client().get(
+                url, headers=self._headers,
+                params={"contactId": contact_id, "session": self.session},
+            )
+            if resp.is_success:
+                data = resp.json()
+                return (data or {}).get("profilePictureURL") if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.warning("WAHA get_contact_picture error: %s", exc)
+        return None
+
+    # ── Contacts (read-only) ────────────────────────────────────────────────
+
+    async def get_all_contacts(self, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
+        """One page of the session's WhatsApp contacts (address book + known
+        users). Raises WAHAError when the session is not WORKING."""
+        from urllib.parse import urlencode
+        q = urlencode({"session": self.session, "limit": limit, "offset": offset,
+                       "sortBy": "id", "sortOrder": "asc"})
+        data = await self._request("GET", f"/api/contacts/all?{q}")
+        return data if isinstance(data, list) else []
+
+    async def get_lids(self, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
+        """One page of known LID → phone-number mappings `[{lid, pn}]`."""
+        from urllib.parse import urlencode
+        q = urlencode({"limit": limit, "offset": offset})
+        data = await self._request("GET", f"/api/{self.session}/lids?{q}")
+        return data if isinstance(data, list) else []
+
+    # Group administration — each raises WAHAError when WhatsApp refuses
+    # (e.g. our number is not an admin of the group).
+    _PARTICIPANT_ACTIONS = {
+        "add": "participants/add", "remove": "participants/remove",
+        "promote": "admin/promote", "demote": "admin/demote",
+    }
+
+    async def group_participants_action(self, group_id: str, action: str, ids: list[str]) -> dict[str, Any]:
+        path = self._PARTICIPANT_ACTIONS[action]
+        res = await self._request(
+            "POST", f"/api/{self.session}/groups/{self._gid(group_id)}/{path}",
+            {"participants": [{"id": i} for i in ids]},
+        )
+        return res if isinstance(res, dict) else {"result": res}
+
+    async def get_group_invite_code(self, group_id: str) -> str:
+        res = await self._request("GET", f"/api/{self.session}/groups/{self._gid(group_id)}/invite-code")
+        if isinstance(res, dict):
+            res = res.get("code") or res.get("inviteCode") or ""
+        return str(res or "").strip().strip('"')
+
+    async def set_group_subject(self, group_id: str, subject: str) -> None:
+        await self._request("PUT", f"/api/{self.session}/groups/{self._gid(group_id)}/subject", {"subject": subject})
+
+    async def set_group_description(self, group_id: str, description: str) -> None:
+        await self._request("PUT", f"/api/{self.session}/groups/{self._gid(group_id)}/description",
+                            {"description": description})
+
+    async def set_group_admin_only(self, group_id: str, setting: str, admins_only: bool) -> None:
+        """setting: 'messages' (who can send) or 'info' (who can edit group info)."""
+        path = {"messages": "messages-admin-only", "info": "info-admin-only"}[setting]
+        await self._request("PUT", f"/api/{self.session}/groups/{self._gid(group_id)}/settings/security/{path}",
+                            {"adminsOnly": bool(admins_only)})
+
+    @staticmethod
+    def _gid(group_id: str) -> str:
+        from urllib.parse import quote
+        return quote(group_id, safe="@.")
 
     # ── Sending ────────────────────────────────────────────────────────────────
 
@@ -269,7 +434,7 @@ class WAHAService:
             "config": {
                 "webhooks": [{
                     "url": webhook_url,
-                    "events": ["message.any", "message.reaction", "session.status"],
+                    "events": WEBHOOK_EVENTS,
                     "customHeaders": [{"name": "X-Webhook-Secret", "value": secret}],
                 }]
             }
@@ -295,6 +460,35 @@ class WAHAService:
             await self._post("/api/stopTyping", payload)
         except Exception:
             pass
+
+    async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        """JSON request that raises WAHAError on failure; returns the parsed body."""
+        from app.core.http_client import get_http_client
+        try:
+            resp = await get_http_client().request(
+                method, f"{self.base}{path}", headers=self._headers,
+                json=payload if payload is not None else None,
+            )
+        except httpx.TimeoutException as exc:
+            raise WAHAError("TIMEOUT", "WhatsApp API timed out") from exc
+        except httpx.HTTPError as exc:
+            raise WAHAError("TRANSPORT", "WhatsApp API unreachable") from exc
+        if resp.status_code == 401:
+            raise WAHAError("AUTH", "WhatsApp API auth failed", 401)
+        if not resp.is_success:
+            detail = ""
+            try:
+                body = resp.json()
+                detail = str(body.get("message") or body.get("error") or "") if isinstance(body, dict) else ""
+            except Exception:
+                detail = resp.text[:200]
+            raise WAHAError("API_ERROR", detail[:200] or f"WhatsApp API error {resp.status_code}", resp.status_code)
+        if not resp.content:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return resp.text
 
     async def _post(self, path: str, payload: dict[str, Any]) -> SendResult:
         from app.core.http_client import get_http_client

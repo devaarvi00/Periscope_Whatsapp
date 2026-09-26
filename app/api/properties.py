@@ -7,6 +7,7 @@ from app.db.session import get_db
 from app.models.agent import Agent, AgentRole
 from app.models.property_definition import PropertyDefinition
 from app.models.ticket import Ticket
+from app.services.access import assert_chat_id_access, get_accessible_chat
 from app.services.activity_service import log_activity
 from app.services.mongo_chat_service import MongoInboxService
 
@@ -156,11 +157,14 @@ def _validate_values(db: Session, entity: str, values: dict) -> dict:
 
 
 @router.put("/chat/{chat_id}")
-async def set_chat_values(chat_id: int, req: ValueUpdate, db: Session = Depends(get_db)):
+async def set_chat_values(
+    chat_id: int,
+    req: ValueUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+    chat = await get_accessible_chat(db, agent, chat_id)
     current = dict(chat.get("custom_properties") or {})
     current.update(_validate_values(db, "chat", req.values))
     new_props = {k: v for k, v in current.items() if v is not None}
@@ -169,19 +173,34 @@ async def set_chat_values(chat_id: int, req: ValueUpdate, db: Session = Depends(
 
 
 @router.get("/chat/{chat_id}")
-async def get_chat_values(chat_id: int, db: Session = Depends(get_db)):
-    inbox = MongoInboxService()
-    chat = await inbox.get_chat_by_id(chat_id)
-    if not chat:
-        raise HTTPException(404, "Chat not found")
+async def get_chat_values(
+    chat_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    chat = await get_accessible_chat(db, agent, chat_id)
     return {"chat_id": chat_id, "custom_properties": chat.get("custom_properties") or {}}
 
 
-@router.put("/ticket/{ticket_id}")
-def set_ticket_values(ticket_id: int, req: ValueUpdate, db: Session = Depends(get_db)):
+async def _accessible_ticket(db: Session, agent: Agent, ticket_id: int) -> Ticket:
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
     if not ticket:
         raise HTTPException(404, "Ticket not found")
+    try:
+        await assert_chat_id_access(db, agent, ticket.chat_id)
+    except HTTPException:
+        raise HTTPException(404, "Ticket not found")
+    return ticket
+
+
+@router.put("/ticket/{ticket_id}")
+async def set_ticket_values(
+    ticket_id: int,
+    req: ValueUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    ticket = await _accessible_ticket(db, agent, ticket_id)
     current = dict(ticket.custom_properties or {})
     current.update(_validate_values(db, "ticket", req.values))
     ticket.custom_properties = {k: v for k, v in current.items() if v is not None}
@@ -190,8 +209,10 @@ def set_ticket_values(ticket_id: int, req: ValueUpdate, db: Session = Depends(ge
 
 
 @router.get("/ticket/{ticket_id}")
-def get_ticket_values(ticket_id: int, db: Session = Depends(get_db)):
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
-    if not ticket:
-        raise HTTPException(404, "Ticket not found")
+async def get_ticket_values(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    ticket = await _accessible_ticket(db, agent, ticket_id)
     return {"ticket_id": ticket_id, "custom_properties": ticket.custom_properties or {}}

@@ -1,6 +1,10 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# Hex colour (#rgb, #rgba, #rrggbb, #rrggbbaa) — rendered straight into CSS
+LABEL_COLOR_PATTERN = r"^#[0-9a-fA-F]{3,8}$"
 
 
 class KnowledgeItemCreate(BaseModel):
@@ -54,15 +58,28 @@ class QuickReplyOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+LabelType = Literal["chat", "ticket", "phone"]
+
+
 class LabelCreate(BaseModel):
-    name: str
-    color: str = "#0D8C7C"
+    name: str = Field(min_length=1, max_length=100)
+    color: str = Field("#0D8C7C", pattern=LABEL_COLOR_PATTERN)
+    type: LabelType = "chat"
+
+
+class LabelUpdate(BaseModel):
+    """Partial update — fields left out keep their value (so older clients
+    that PATCH only name + color never reset a label's type)."""
+    name: str | None = Field(None, min_length=1, max_length=100)
+    color: str | None = Field(None, pattern=LABEL_COLOR_PATTERN)
+    type: LabelType | None = None
 
 
 class LabelOut(BaseModel):
     id: int
     name: str
     color: str
+    type: str = "chat"
 
     model_config = {"from_attributes": True}
 

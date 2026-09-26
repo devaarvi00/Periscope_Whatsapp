@@ -1,13 +1,17 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_agent
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.schemas.ticket import TicketCreate, TicketOut, TicketUpdate
+from app.services.access import accessible_chat_ids, assert_chat_id_access, require_action
 from app.services.activity_service import log_activity
 from app.services.automation_service import fire_trigger
-from app.services.ticket_service import TicketService
+from app.services.ticket_service import (
+    TicketService, send_ticket_created_message, ticket_display_id, ticket_prefix,
+)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -15,6 +19,25 @@ router = APIRouter(prefix="/tickets", tags=["tickets"])
 async def _notify_assignee(agent_id: int, payload: dict) -> None:
     from app.core.ws_manager import ws_manager
     await ws_manager.send_to_agent(agent_id, "ticket_assigned", payload)
+
+
+async def _get_accessible_ticket(db: Session, agent: Agent, ticket_id: int):
+    ticket = TicketService(db).get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    try:
+        await assert_chat_id_access(db, agent, ticket.chat_id)
+    except HTTPException:
+        raise HTTPException(404, "Ticket not found")
+    return ticket
+
+
+def _with_display_id(db: Session, tickets):
+    """Attach display_id ("AAR-12") to one ticket or a list, for TicketOut."""
+    prefix = ticket_prefix(db)
+    for t in tickets if isinstance(tickets, list) else [tickets]:
+        t.display_id = ticket_display_id(t.id, prefix)
+    return tickets
 
 
 def _trigger_context(ticket) -> dict:
@@ -29,29 +52,34 @@ def _trigger_context(ticket) -> dict:
 
 
 @router.get("", response_model=list[TicketOut])
-def list_tickets(
+async def list_tickets(
     chat_id: int | None = None,
     status: str | None = None,
     assigned_to: int | None = None,
     priority: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
 ):
-    return TicketService(db).list_tickets(
+    return _with_display_id(db, TicketService(db).list_tickets(
         chat_id=chat_id, status=status,
         assigned_to=assigned_to, priority=priority,
         limit=limit, offset=offset,
-    )
+        chat_ids=await accessible_chat_ids(db, agent),
+    ))
 
 
 @router.post("", response_model=TicketOut, status_code=201)
-def create_ticket(
+async def create_ticket(
     req: TicketCreate,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
+    await assert_chat_id_access(db, agent, req.chat_id)
+    if req.assigned_to is not None and req.assigned_to != agent.id:
+        require_action(db, agent, "assign")
     data = req.model_dump()
     data.setdefault("created_by", agent.id)
     from app.models.ticket import TicketPriority, TicketStatus
@@ -77,26 +105,52 @@ def create_ticket(
             "by": agent.name,
             "priority": ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority),
         })
-    return ticket
+    background.add_task(send_ticket_created_message, ticket.id)
+    return _with_display_id(db, ticket)
 
 
 @router.get("/{ticket_id}", response_model=TicketOut)
-def get_ticket(ticket_id: int, db: Session = Depends(get_db)):
-    ticket = TicketService(db).get_ticket(ticket_id)
-    if not ticket:
-        raise HTTPException(404, "Ticket not found")
-    return ticket
+async def get_ticket(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    return _with_display_id(db, await _get_accessible_ticket(db, agent, ticket_id))
+
+
+@router.get("/{ticket_id}/messages")
+async def ticket_messages(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Message ids that belong to the ticket: its origin plus replies attached
+    by "Enable Automatic Ticket Attachment to Messages"."""
+    ticket = await _get_accessible_ticket(db, agent, ticket_id)
+    attached = TicketService(db).attached_messages(ticket_id)
+    return {"ticket_id": ticket.id, "origin_wid": ticket.message_wid, "attached_wids": attached}
 
 
 @router.patch("/{ticket_id}", response_model=TicketOut)
-def update_ticket(
+async def update_ticket(
     ticket_id: int,
     req: TicketUpdate,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
-    changes = req.model_dump(exclude_none=True)
+    prev_assignee = (await _get_accessible_ticket(db, agent, ticket_id)).assigned_to
+    # exclude_unset: only fields the client sent; "assigned_to": null unassigns
+    changes = req.model_dump(exclude_unset=True)
+    if "assigned_to" in changes and changes["assigned_to"] != prev_assignee:
+        require_action(db, agent, "assign")
+    from app.models.ticket import TicketPriority, TicketStatus
+    for field, enum_cls in (("status", TicketStatus), ("priority", TicketPriority)):
+        if changes.get(field) is not None:
+            try:
+                changes[field] = enum_cls(str(changes[field]).lower())
+            except ValueError:
+                raise HTTPException(400, f"Invalid {field}")
     ticket = TicketService(db).update_ticket(ticket_id, **changes)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
@@ -104,26 +158,29 @@ def update_ticket(
         db, "ticket_updated", entity_type="ticket", entity_id=ticket.id,
         agent_id=agent.id,
         description=f"Ticket '{ticket.title}' updated: {', '.join(changes.keys())}",
-        metadata=changes,
+        metadata=jsonable_encoder(changes),
     )
     background.add_task(fire_trigger, "ticket_updated", _trigger_context(ticket))
     from app.services.webhook_dispatcher import dispatch_event
     background.add_task(dispatch_event, "ticket.updated", _trigger_context(ticket))
-    if changes.get("assigned_to") and changes["assigned_to"] != agent.id:
-        background.add_task(_notify_assignee, changes["assigned_to"], {
+    # Only on an actual reassignment, and never for self-assignment
+    if ticket.assigned_to and ticket.assigned_to != prev_assignee and ticket.assigned_to != agent.id:
+        background.add_task(_notify_assignee, ticket.assigned_to, {
             "ticket_id": ticket.id, "title": ticket.title,
             "by": agent.name,
             "priority": ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority),
         })
-    return ticket
+    return _with_display_id(db, ticket)
 
 
 @router.delete("/{ticket_id}", status_code=204)
-def delete_ticket(
+async def delete_ticket(
     ticket_id: int,
     db: Session = Depends(get_db),
     agent: Agent = Depends(get_current_agent),
 ):
+    await _get_accessible_ticket(db, agent, ticket_id)
+    require_action(db, agent, "delete_tickets")
     if not TicketService(db).delete_ticket(ticket_id):
         raise HTTPException(404, "Ticket not found")
     log_activity(
@@ -135,7 +192,12 @@ def delete_ticket(
 # ── Ticket labels ─────────────────────────────────────────────────────────────
 
 @router.get("/{ticket_id}/labels")
-def get_ticket_labels(ticket_id: int, db: Session = Depends(get_db)):
+async def get_ticket_labels(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    await _get_accessible_ticket(db, agent, ticket_id)
     from app.models.label import Label
     from app.models.ticket import TicketLabel
     rows = (
@@ -148,10 +210,15 @@ def get_ticket_labels(ticket_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{ticket_id}/labels/{label_id}", status_code=201)
-def add_ticket_label(ticket_id: int, label_id: int, db: Session = Depends(get_db)):
+async def add_ticket_label(
+    ticket_id: int,
+    label_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     from app.models.ticket import TicketLabel
-    if not TicketService(db).get_ticket(ticket_id):
-        raise HTTPException(404, "Ticket not found")
+    await _get_accessible_ticket(db, agent, ticket_id)
+    require_action(db, agent, "update_labels")
     exists = db.query(TicketLabel).filter(
         TicketLabel.ticket_id == ticket_id, TicketLabel.label_id == label_id
     ).first()
@@ -162,8 +229,15 @@ def add_ticket_label(ticket_id: int, label_id: int, db: Session = Depends(get_db
 
 
 @router.delete("/{ticket_id}/labels/{label_id}", status_code=204)
-def remove_ticket_label(ticket_id: int, label_id: int, db: Session = Depends(get_db)):
+async def remove_ticket_label(
+    ticket_id: int,
+    label_id: int,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
     from app.models.ticket import TicketLabel
+    await _get_accessible_ticket(db, agent, ticket_id)
+    require_action(db, agent, "update_labels")
     row = db.query(TicketLabel).filter(
         TicketLabel.ticket_id == ticket_id, TicketLabel.label_id == label_id
     ).first()

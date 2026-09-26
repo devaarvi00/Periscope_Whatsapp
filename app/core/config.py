@@ -1,7 +1,18 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Placeholder values shipped in code / example env files. Refused in production.
+_INSECURE_SECRET_DEFAULTS = {
+    "change-me-in-production-32chars!!",
+    "change-me-to-a-secure-random-32-char-string",
+    "REPLACE_WITH_64_CHAR_RANDOM_HEX",
+    "replace-webhook-secret",
+    "replace-with-strong-secret",
+    "REPLACE_WITH_STRONG_WEBHOOK_SECRET",
+}
+_MIN_PRODUCTION_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -11,7 +22,7 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     debug: bool = False
     secret_key: str = Field("change-me-in-production-32chars!!", min_length=16)
-    access_token_expire_minutes: int = 1440  # 24 hours
+    access_token_expire_minutes: int = 480  # 8 hours
 
     database_url: str = Field(
         "mysql+pymysql://root:password@localhost:3306/whatsapp_periscope",
@@ -64,6 +75,30 @@ class Settings(BaseSettings):
         if isinstance(v, str) and not v.strip():
             return None
         return v
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.strip().lower() == "production"
+
+    @model_validator(mode="after")
+    def _enforce_production_secrets(self) -> "Settings":
+        """Fail fast at startup if production is running on placeholder secrets."""
+        if not self.is_production:
+            return self
+        problems: list[str] = []
+        for name in ("secret_key", "waha_webhook_secret"):
+            value = (getattr(self, name) or "").strip()
+            if not value or value in _INSECURE_SECRET_DEFAULTS:
+                problems.append(f"{name.upper()} is empty or a known placeholder")
+            elif len(value) < _MIN_PRODUCTION_SECRET_LENGTH:
+                problems.append(
+                    f"{name.upper()} must be at least {_MIN_PRODUCTION_SECRET_LENGTH} characters"
+                )
+        if "*" in self.allowed_origins:
+            problems.append('ALLOWED_ORIGINS must not contain "*" in production')
+        if problems:
+            raise ValueError("Insecure production configuration: " + "; ".join(problems))
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

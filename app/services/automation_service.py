@@ -23,6 +23,37 @@ ACTION_TYPES = [
     "remove_label", "flag_chat", "archive_chat", "activate_ai", "send_note", "escalate",
 ]
 
+# User-supplied regexes run against every inbound message; keep them short
+# to limit catastrophic-backtracking cost.
+MAX_REGEX_LENGTH = 200
+
+
+def validate_rule_definition(criteria: Any, actions: Any) -> None:
+    """Raise ValueError if a rule's criteria/actions are unsafe or malformed."""
+    if criteria is not None and not isinstance(criteria, dict):
+        raise ValueError("criteria must be an object")
+    if actions is not None and not isinstance(actions, list):
+        raise ValueError("actions must be a list")
+    conditions = (criteria or {}).get("conditions")
+    if conditions is not None and not isinstance(conditions, list):
+        raise ValueError("criteria.conditions must be a list")
+    for cond in conditions or []:
+        if not isinstance(cond, dict):
+            raise ValueError("each condition must be an object")
+        if str(cond.get("op", "")).lower() != "regex":
+            continue
+        pattern = "" if cond.get("value") is None else str(cond.get("value"))
+        if len(pattern) > MAX_REGEX_LENGTH:
+            raise ValueError(f"regex must be at most {MAX_REGEX_LENGTH} characters")
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"invalid regex '{pattern}': {exc}") from exc
+    for action in actions or []:
+        if not isinstance(action, dict):
+            raise ValueError("each action must be an object")
+
+
 async def fire_trigger(trigger_type: str, context: dict[str, Any]) -> None:
     from app.db.session import SessionLocal
     db = SessionLocal()
@@ -32,6 +63,29 @@ async def fire_trigger(trigger_type: str, context: dict[str, Any]) -> None:
         logger.exception("Automation trigger %s failed: %s", trigger_type, exc)
     finally:
         db.close()
+
+
+def log_rule_run(rule: AutomationRule, trigger_type: str, context: dict[str, Any],
+                 taken: list[str], failures: list[str]) -> None:
+    """Logs → Rules logs: one row per rule run (never raises)."""
+    from app.services import operation_log as oplog
+    from app.services.operation_log import preview
+    configured = [a.get("type") for a in (rule.actions or []) if isinstance(a, dict)]
+    oplog.record(
+        "rule", rule.name or f"Rule #{rule.id}",
+        success=len(taken), failed=len(failures),
+        performed_by="Automation",
+        details={
+            "rule_id": rule.id, "rule": rule.name, "trigger": trigger_type,
+            "chat_id": context.get("chat_id"),
+            "chat_name": context.get("chat_name") or None,
+            "message_preview": preview(context.get("message")) or None,
+            "actions_configured": configured,
+            "actions_run": taken,
+            "actions_failed": failures,
+            "skipped": max(0, len(configured) - len(taken) - len(failures)),
+        },
+    )
 
 
 class AutomationService:
@@ -76,10 +130,12 @@ class AutomationService:
         actions_taken: list[str] = []
         for rule in rules:
             if self._matches_criteria(rule, context):
-                taken = await self._execute_actions(rule, context)
+                failures: list[str] = []
+                taken = await self._execute_actions(rule, context, failures)
                 actions_taken.extend(taken)
                 rule.runs_count = (rule.runs_count or 0) + 1
                 self.db.commit()
+                log_rule_run(rule, trigger_type, context, taken, failures)
                 if taken:
                     log_activity(
                         self.db, "automation_rule_executed",
@@ -146,15 +202,22 @@ class AutomationService:
         if op == "ends_with":
             return al.endswith(el)
         if op == "regex":
+            # Rules are validated on save; also guard legacy rows here.
+            if len(e) > MAX_REGEX_LENGTH:
+                return False
             try:
-                return re.search(e, a, re.IGNORECASE) is not None
+                return re.search(e, a[:5000], re.IGNORECASE) is not None
             except re.error:
                 return False
         return False
 
     # ── Actions ───────────────────────────────────────────────────────────
 
-    async def _execute_actions(self, rule: AutomationRule, context: dict[str, Any]) -> list[str]:
+    async def _execute_actions(
+        self, rule: AutomationRule, context: dict[str, Any], failures: list[str] | None = None,
+    ) -> list[str]:
+        """Run the rule's actions; returns what was done. Failed action types
+        are appended to `failures` when given."""
         actions_taken: list[str] = []
         for action in (rule.actions or []):
             action_type = action.get("type")
@@ -163,7 +226,12 @@ class AutomationService:
                 if result:
                     actions_taken.append(result)
             except Exception as exc:
+                # Reset the session so later commits (runs_count, other
+                # actions, the webhook's own writes) don't hit PendingRollbackError.
+                self.db.rollback()
                 logger.warning("Automation action %s failed: %s", action_type, exc)
+                if failures is not None:
+                    failures.append(f"{action_type}: {type(exc).__name__}")
         return actions_taken
 
     async def _execute_action(
@@ -204,12 +272,13 @@ class AutomationService:
                 str(action.get("title", "")) or f"Auto ticket: {context.get('message', '')[:80]}",
                 chat, context,
             )
+            assignee = await self._resolve_agent_id(action.get("agent_id"))
             ticket = Ticket(
                 chat_id=chat["id"],
                 title=title[:500] or "Automated ticket",
                 description=str(context.get("message", ""))[:2000],
                 priority=self._parse_priority(action.get("priority")),
-                assigned_to=action.get("agent_id"),
+                assigned_to=assignee,
             )
             self.db.add(ticket)
             self.db.commit()
@@ -257,7 +326,8 @@ class AutomationService:
             content = self._render_template(str(action.get("message", "")), chat, context)
             if not content:
                 return None
-            self.db.add(Note(chat_id=chat["id"], agent_id=action.get("agent_id"), content=content))
+            note_agent = await self._resolve_agent_id(action.get("agent_id"), allow_round_robin=False)
+            self.db.add(Note(chat_id=chat["id"], agent_id=note_agent, content=content))
             self.db.commit()
             return "note_added"
 
@@ -286,6 +356,19 @@ class AutomationService:
         return None
 
     # ── Helpers ───────────────────────────────────────────────────────────
+
+    async def _resolve_agent_id(self, value: Any, allow_round_robin: bool = True) -> int | None:
+        """Turn an action's agent_id ("round_robin", "", "3", 3) into a real agent id or None."""
+        if value == "round_robin":
+            return await self._round_robin_agent() if allow_round_robin else None
+        if value in (None, ""):
+            return None
+        try:
+            agent_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        exists = self.db.query(Agent.id).filter(Agent.id == agent_id).first()
+        return agent_id if exists else None
 
     async def _round_robin_agent(self) -> int | None:
         from app.services.mongo_chat_service import MongoInboxService

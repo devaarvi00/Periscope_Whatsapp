@@ -1,4 +1,7 @@
+import json
 import logging
+import threading
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -7,12 +10,75 @@ from sqlalchemy.orm import Session
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.schemas.auth import AgentCreate, AgentOut, LoginRequest, TokenResponse
+from app.schemas.auth import (
+    AgentAdminUpdate,
+    AgentCreate,
+    AgentListOut,
+    AgentOut,
+    ChangePasswordRequest,
+    LoginRequest,
+    NotificationPrefs,
+    NotificationPrefsUpdate,
+    ProfileUpdate,
+    TokenResponse,
+    UiPrefs,
+    UiPrefsUpdate,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 _bearer = HTTPBearer(auto_error=True)
+
+# ── Failed-login lockout ─────────────────────────────────────────── #
+# In-memory and per-process: correct only because the app runs a single
+# uvicorn worker. Moving to multiple workers/replicas needs a shared store
+# (e.g. Redis). State is lost on restart, which is acceptable here.
+MAX_FAILED_LOGINS = 5
+FAILED_LOGIN_WINDOW_SECONDS = 15 * 60
+LOCKOUT_SECONDS = 15 * 60
+_MAX_TRACKED_EMAILS = 10_000
+
+_login_lock = threading.Lock()
+# email -> (failure_count, first_failure_ts, locked_until_ts)
+_failed_logins: dict[str, tuple[int, float, float]] = {}
+
+
+def _lockout_remaining(email: str) -> int:
+    """Seconds left on an active lockout for this email, else 0."""
+    now = time.monotonic()
+    with _login_lock:
+        entry = _failed_logins.get(email)
+        if not entry:
+            return 0
+        count, first_ts, locked_until = entry
+        if locked_until > now:
+            return int(locked_until - now) + 1
+        if locked_until or now - first_ts > FAILED_LOGIN_WINDOW_SECONDS:
+            # Lock expired or failure window elapsed — start fresh
+            _failed_logins.pop(email, None)
+        return 0
+
+
+def _record_failed_login(email: str) -> None:
+    now = time.monotonic()
+    with _login_lock:
+        if len(_failed_logins) > _MAX_TRACKED_EMAILS:
+            # Bound memory under credential-spraying: drop stale entries
+            for key, (_, f_ts, l_until) in list(_failed_logins.items()):
+                if l_until <= now and now - f_ts > FAILED_LOGIN_WINDOW_SECONDS:
+                    del _failed_logins[key]
+        count, first_ts, _ = _failed_logins.get(email, (0, now, 0.0))
+        count += 1
+        locked_until = now + LOCKOUT_SECONDS if count >= MAX_FAILED_LOGINS else 0.0
+        _failed_logins[email] = (count, first_ts, locked_until)
+    if locked_until:
+        logger.warning("Login locked for %s after %d failed attempts", email, count)
+
+
+def _reset_failed_logins(email: str) -> None:
+    with _login_lock:
+        _failed_logins.pop(email, None)
 
 
 def get_current_agent(
@@ -35,11 +101,21 @@ def get_current_agent(
 
 @router.post("/login", response_model=TokenResponse)
 def login(req: LoginRequest, db: Session = Depends(get_db)):
+    email_key = str(req.email).strip().lower()
+    remaining = _lockout_remaining(email_key)
+    if remaining:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Try again later.",
+            headers={"Retry-After": str(remaining)},
+        )
     agent = db.query(Agent).filter(Agent.email == req.email).first()
     if not agent or not verify_password(req.password, agent.password_hash):
+        _record_failed_login(email_key)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not agent.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
+    _reset_failed_logins(email_key)
     token = create_access_token({"sub": str(agent.id), "email": agent.email, "role": agent.role.value})
     return TokenResponse(
         access_token=token,
@@ -48,6 +124,37 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
         email=agent.email,
         role=agent.role,
     )
+
+
+@router.post("/change-password", status_code=204)
+def change_password(
+    req: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    # 400 (not 401) on a wrong current password: the frontend treats 401 as
+    # "session expired" and logs the user out.
+    email_key = agent.email.strip().lower()
+    remaining = _lockout_remaining(email_key)
+    if remaining:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Try again later.",
+            headers={"Retry-After": str(remaining)},
+        )
+    if not verify_password(req.current_password, agent.password_hash):
+        _record_failed_login(email_key)
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if req.new_password == req.current_password:
+        raise HTTPException(status_code=400, detail="New password must be different")
+    try:
+        agent.password_hash = hash_password(req.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _reset_failed_logins(email_key)
+    db.commit()
+    logger.info("Password changed for agent_id=%s", agent.id)
+    return None
 
 
 @router.post("/register", response_model=AgentOut, status_code=201)
@@ -63,10 +170,14 @@ def register(
     existing = db.query(Agent).filter(Agent.email == req.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
+    try:
+        password_hash = hash_password(req.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     agent = Agent(
         email=req.email,
         name=req.name,
-        password_hash=hash_password(req.password),
+        password_hash=password_hash,
         role=req.role,
     )
     db.add(agent)
@@ -80,12 +191,198 @@ def get_me(agent: Agent = Depends(get_current_agent)):
     return agent
 
 
-@router.get("/agents", response_model=list[AgentOut])
-def list_agents(
+def load_notification_prefs(agent: Agent) -> NotificationPrefs:
+    """Stored prefs merged over defaults. Unknown keys / bad values are ignored."""
+    prefs = NotificationPrefs().model_dump()
+    try:
+        stored = json.loads(agent.notification_prefs) if agent.notification_prefs else {}
+    except (TypeError, ValueError):
+        stored = {}
+    if isinstance(stored, dict):
+        for key in ("in_app", "desktop", "sound"):
+            if isinstance(stored.get(key), bool):
+                prefs[key] = stored[key]
+        types = stored.get("types")
+        if isinstance(types, dict):
+            for key in prefs["types"]:
+                if isinstance(types.get(key), bool):
+                    prefs["types"][key] = types[key]
+    return NotificationPrefs.model_validate(prefs)
+
+
+@router.get("/me/notification-prefs", response_model=NotificationPrefs)
+def get_notification_prefs(agent: Agent = Depends(get_current_agent)):
+    return load_notification_prefs(agent)
+
+
+@router.put("/me/notification-prefs", response_model=NotificationPrefs)
+def update_notification_prefs(
+    req: NotificationPrefsUpdate,
     db: Session = Depends(get_db),
-    _agent: Agent = Depends(get_current_agent),
+    agent: Agent = Depends(get_current_agent),
 ):
-    return db.query(Agent).filter(Agent.is_active == True).all()
+    prefs = load_notification_prefs(agent).model_dump()
+    changes = req.model_dump(exclude_none=True)
+    prefs["types"].update(changes.pop("types", {}))
+    prefs.update(changes)
+    result = NotificationPrefs.model_validate(prefs)
+    agent.notification_prefs = json.dumps(result.model_dump())
+    db.commit()
+    return result
+
+
+@router.patch("/me", response_model=AgentOut)
+def update_me(
+    req: ProfileUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    """Edit your own display name / avatar colour."""
+    changes = req.model_dump(exclude_none=True)
+    if "name" in changes:
+        name = changes["name"].strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        agent.name = name
+    if "avatar_color" in changes:
+        agent.avatar_color = changes["avatar_color"]
+    db.commit()
+    db.refresh(agent)
+    return agent
+
+
+def load_ui_prefs(agent: Agent) -> UiPrefs:
+    """Stored interface prefs; keys that no longer validate are dropped."""
+    try:
+        stored = json.loads(agent.ui_prefs) if agent.ui_prefs else {}
+    except (TypeError, ValueError):
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    clean = {}
+    for key in UiPrefs.model_fields:
+        if key in stored:
+            try:
+                UiPrefs.model_validate({key: stored[key]})
+                clean[key] = stored[key]
+            except ValueError:
+                pass
+    return UiPrefs.model_validate(clean)
+
+
+@router.get("/me/preferences", response_model=UiPrefs)
+def get_ui_prefs(agent: Agent = Depends(get_current_agent)):
+    return load_ui_prefs(agent)
+
+
+@router.put("/me/preferences", response_model=UiPrefs)
+def update_ui_prefs(
+    req: UiPrefsUpdate,
+    db: Session = Depends(get_db),
+    agent: Agent = Depends(get_current_agent),
+):
+    prefs = load_ui_prefs(agent).model_dump()
+    prefs.update(req.model_dump(exclude_none=True))
+    result = UiPrefs.model_validate(prefs)
+    agent.ui_prefs = json.dumps(result.model_dump(exclude_none=True))
+    db.commit()
+    return result
+
+
+@router.get("/agents", response_model=list[AgentListOut])
+def list_agents(
+    include_inactive: bool = False,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_agent),
+):
+    """Team members with live online state and number restrictions.
+
+    include_inactive (admins only) also returns deactivated members.
+    """
+    from app.core.ws_manager import ws_manager
+    from app.models.agent import AgentRole
+    from app.models.agent_phone import AgentPhone
+
+    q = db.query(Agent)
+    if not (include_inactive and current_agent.role == AgentRole.ADMIN):
+        q = q.filter(Agent.is_active == True)
+    agents = q.order_by(Agent.id).all()
+    phones: dict[int, list[int]] = {}
+    for aid, pid in db.query(AgentPhone.agent_id, AgentPhone.phone_id).all():
+        phones.setdefault(aid, []).append(pid)
+    online = ws_manager.online_agent_ids()
+    return [
+        AgentListOut(
+            id=a.id, email=a.email, name=a.name, role=a.role, is_active=a.is_active,
+            avatar_color=a.avatar_color or "#0D8C7C",
+            online=a.id in online, phone_ids=sorted(phones.get(a.id, [])),
+        )
+        for a in agents
+    ]
+
+
+@router.patch("/agents/{agent_id}", response_model=AgentOut)
+def update_agent(
+    agent_id: int,
+    req: AgentAdminUpdate,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_agent),
+):
+    """Change a team member's role, active state or name (admin only).
+
+    Guards: you can't demote or deactivate yourself, and the workspace always
+    keeps at least one active admin.
+    """
+    from app.models.agent import AgentRole
+    from app.services.activity_service import log_activity
+
+    if current_agent.role != AgentRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only admins can manage team members")
+    target = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    changes = req.model_dump(exclude_none=True)
+    new_role = AgentRole(changes["role"]) if "role" in changes else target.role
+    new_active = changes.get("is_active", target.is_active)
+    loses_admin = target.role == AgentRole.ADMIN and target.is_active and (
+        new_role != AgentRole.ADMIN or not new_active
+    )
+    if target.id == current_agent.id and (
+        new_role != AgentRole.ADMIN or not new_active
+    ):
+        raise HTTPException(status_code=400, detail="You can't demote or deactivate yourself")
+    if loses_admin:
+        other_admins = (
+            db.query(Agent)
+            .filter(Agent.role == AgentRole.ADMIN, Agent.is_active == True, Agent.id != target.id)
+            .count()
+        )
+        if not other_admins:
+            raise HTTPException(status_code=400, detail="The workspace needs at least one active admin")
+
+    described = []
+    if "name" in changes:
+        name = changes["name"].strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        if name != target.name:
+            described.append(f"name → {name}")
+        target.name = name
+    if new_role != target.role:
+        described.append(f"role {target.role.value} → {new_role.value}")
+        target.role = new_role
+    if new_active != target.is_active:
+        described.append("reactivated" if new_active else "deactivated")
+        target.is_active = new_active
+    db.commit()
+    db.refresh(target)
+    if described:
+        log_activity(
+            db, "agent_updated", entity_type="agent", entity_id=target.id,
+            agent_id=current_agent.id,
+            description=f"Team member {target.email}: {', '.join(described)}",
+        )
+    return target
 
 
 @router.get("/agents/{agent_id}/phones")

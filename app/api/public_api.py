@@ -5,9 +5,11 @@ send messages programmatically, list chats/messages, create tickets.
 """
 import hashlib
 import logging
+import time
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -17,11 +19,70 @@ from app.models.phone import Phone
 from app.services.mongo_chat_service import MongoInboxService
 from app.services.waha_service import WAHAService
 
-router = APIRouter(prefix="/public/v1", tags=["public-api"])
 logger = logging.getLogger(__name__)
 
 
+class LoggedRoute(APIRoute):
+    """Writes one Logs → API logs row per request on this router: method,
+    route path, status code, duration and the key's name. Never the key,
+    headers, query string or body."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+        route_path = self.path_format
+
+        async def logged(request: Request):
+            started = time.perf_counter()
+            status_code = 500
+            try:
+                response = await handler(request)
+                status_code = response.status_code
+                return response
+            except HTTPException as exc:
+                status_code = exc.status_code
+                raise
+            except Exception as exc:  # RequestValidationError & co.
+                status_code = getattr(exc, "status_code", None) or (422 if type(exc).__name__ == "RequestValidationError" else 500)
+                raise
+            finally:
+                await _log_request(request, route_path, status_code,
+                                   int((time.perf_counter() - started) * 1000))
+
+        return logged
+
+
+async def _log_request(request: Request, route_path: str, status_code: int, ms: int) -> None:
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services import operation_log as oplog
+    key_id = getattr(request.state, "api_key_id", None)
+    key_name = getattr(request.state, "api_key_name", None)
+    ok = status_code < 400
+    details = {
+        "method": request.method,
+        "path": route_path,
+        "status_code": status_code,
+        "duration_ms": ms,
+    }
+    if key_id is not None:
+        details.update(api_key_id=key_id, api_key_name=key_name)
+    try:
+        await run_in_threadpool(
+            oplog.record, "api", f"{request.method} {route_path}",
+            success=1 if ok else 0, failed=0 if ok else 1,
+            status_code=status_code, duration_ms=ms,
+            performed_by=f"API key: {key_name}" if key_name else "API key (invalid)",
+            details=details,
+        )
+    except Exception:  # pragma: no cover — record() already swallows
+        pass
+
+
+router = APIRouter(prefix="/public/v1", tags=["public-api"], route_class=LoggedRoute)
+
+
 def require_api_key(
+    request: Request,
     x_api_key: str | None = Header(None),
     db: Session = Depends(get_db),
 ) -> ApiKey:
@@ -35,6 +96,8 @@ def require_api_key(
         raise HTTPException(401, "Invalid API key")
     key.last_used_at = datetime.utcnow()
     db.commit()
+    request.state.api_key_id = key.id
+    request.state.api_key_name = key.name
     return key
 
 
@@ -73,7 +136,8 @@ async def public_send_message(
     try:
         result = await waha.send_text(target, req.message)
     except Exception as exc:
-        raise HTTPException(502, f"Send failed: {exc}")
+        logger.exception("Public API send failed: %s", exc)
+        raise HTTPException(502, "Failed to send message via WhatsApp")
 
     if chat:
         try:

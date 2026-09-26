@@ -51,7 +51,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         inbox = MongoInboxService()
 
         # Dedup before any work — fast path
-        if await inbox.message_exists(msg_wid):
+        if await inbox.message_exists(msg_wid, phone.id):
             return
 
         notify_name = msg_data.get("notifyName") or msg_data.get("_data", {}).get("notifyName") or ""
@@ -102,6 +102,15 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
                 await inbox.update_chat(chat["id"], name=best_name)
                 chat["name"] = best_name
 
+        # Keep the contact book current from incoming 1:1 chats
+        if not from_me and not chat_wid.endswith("@g.us"):
+            try:
+                from app.services.contact_sync import upsert_contact_from_message
+                upsert_contact_from_message(db, chat_wid, msg_data.get("notifyName") or msg_data.get("pushName") or "")
+            except Exception as exc:
+                db.rollback()
+                logger.warning("Contact upsert from message failed for %s: %s", chat_wid, exc)
+
         body = msg_data.get("body") or msg_data.get("caption") or ""
         ts_raw = msg_data.get("timestamp")
         if isinstance(ts_raw, (int, float)):
@@ -118,14 +127,31 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             elif msg_type in _SYSTEM_LABELS:
                 body = _SYSTEM_LABELS[msg_type]
 
-        sender_name = msg_data.get("notifyName") or msg_data.get("pushName") or ""
-        from_raw = msg_data.get("from") or msg_data.get("author") or ""
-        if isinstance(from_raw, dict):
-            sender_number = str(from_raw.get("_serialized") or from_raw.get("id", "")).split("@")[0]
-        else:
-            sender_number = str(from_raw).split("@")[0]
+        # WAHA downloads media and reports where it is served (media.url);
+        # the file itself is fetched through /api/v1/media/{id}/file.
+        media = msg_data.get("media") if isinstance(msg_data.get("media"), dict) else {}
+        media_url = media.get("url") or msg_data.get("mediaUrl") or None
+        media_mimetype = str(media.get("mimetype") or "")[:100]
+        media_filename = str(media.get("filename") or "")[:255]
 
-        await inbox.upsert_message({
+        sender_name = msg_data.get("notifyName") or msg_data.get("pushName") or ""
+        def _raw_wid(v) -> str:
+            if isinstance(v, dict):
+                return str(v.get("_serialized") or v.get("id") or "")
+            return str(v or "")
+
+        # In groups `from` is the group itself (…@g.us); the person who wrote the
+        # message is `participant` (WEBJS also exposes it as `author` / _data.author).
+        from_raw = _raw_wid(msg_data.get("from"))
+        if from_raw.endswith("@g.us") or chat_wid.endswith("@g.us"):
+            _data = msg_data.get("_data") if isinstance(msg_data.get("_data"), dict) else {}
+            from_raw = (_raw_wid(msg_data.get("participant")) or _raw_wid(msg_data.get("author"))
+                        or _raw_wid(_data.get("author")) or ("" if from_me else from_raw))
+        elif not from_raw:
+            from_raw = _raw_wid(msg_data.get("author"))
+        sender_number = from_raw.split("@")[0] if not from_raw.endswith("@g.us") else ""
+
+        stored = await inbox.upsert_message({
             "chat_id": chat["id"],
             "chat_wid": chat_wid,
             "phone_id": phone.id,
@@ -136,13 +162,26 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             "body": body,
             "message_type": msg_type,
             "has_media": has_media,
+            "media_url": media_url if has_media else None,
+            "media_mimetype": media_mimetype,
+            "media_filename": media_filename,
             "timestamp": ts,
         })
+        await _org_after_message_stored(db, inbox, phone, chat, stored, msg_data, msg_type)
 
         if not from_me:
-            new_unread = (chat.get("unread_count") or 0) + 1
-            await inbox.update_chat(chat["id"], unread_count=new_unread)
-            chat["unread_count"] = new_unread
+            # Atomic increment — concurrent webhooks must not lose counts.
+            # A new inbound message also re-opens a resolved conversation.
+            from pymongo import ReturnDocument
+            updated = await inbox.db.chats.find_one_and_update(
+                {"id": chat["id"]},
+                {"$inc": {"unread_count": 1},
+                 "$set": {"status": "open", "updated_at": datetime.utcnow()}},
+                projection={"unread_count": 1},
+                return_document=ReturnDocument.AFTER,
+            )
+            chat["unread_count"] = (updated or {}).get("unread_count") or (chat.get("unread_count") or 0) + 1
+            chat["status"] = "open"
 
         from app.core.ws_manager import ws_manager
         await ws_manager.emit_new_message(
@@ -185,28 +224,34 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         }
         if chat_is_new:
             await automation.run_rules("chat_created", rule_context)
-        await automation.run_rules("message_received", rule_context)
-        if body:
-            await automation.run_rules("message_keyword", rule_context)
+        # Only inbound messages trigger message rules. Our own echoes (agent
+        # replies, AI and automation sends) arrive as from_me and must not
+        # re-trigger rules — that would loop on send_message actions.
+        if not from_me:
+            await automation.run_rules("message_received", rule_context)
+            if body:
+                await automation.run_rules("message_keyword", rule_context)
 
         # AI auto-flag
         from app.models.ai_settings import get_ai_settings as _get_ai_cfg
         _ai_cfg = _get_ai_cfg(db)
         _flag_on = settings.ai_auto_flag_enabled or _ai_cfg.flag_enabled
         _flag_criteria = _ai_cfg.flag_criteria or settings.ai_auto_flag_criteria
-        if not from_me and body and _flag_on:
+        # A chat can opt out of auto-flagging (Settings tab → "Allow AI Flagging")
+        if not from_me and body and _flag_on and chat.get("ai_flagging") is not False:
             try:
                 from app.services.gemini_service import GeminiService
                 if await GeminiService().flag_message(body, _flag_criteria):
-                    await inbox.flag_message(msg_wid, True)
+                    await inbox.flag_message(msg_wid, phone.id, True)
                     await inbox.update_chat(chat["id"], is_flagged=True)
                     from app.core.ws_manager import ws_manager as _ws
                     await _ws.emit_chat_updated(chat["id"], {"is_flagged": True})
             except Exception as exc:
                 logger.warning("AI auto-flag failed: %s", exc)
 
-        # AI agent
-        if not from_me and chat.get("ai_active") and chat.get("ai_state") != "SNOOZED":
+        # AI agent — handle_incoming_message decides about SNOOZED chats so an
+        # expired snooze is lifted (checking here would skip them forever).
+        if not from_me and chat.get("ai_active"):
             from app.services.ai_agent_service import AIAgentService
             from app.services.waha_service import WAHAService
             ai = AIAgentService(db)
@@ -252,6 +297,116 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         db.close()
 
 
+# ── Org config hooks (Settings → Config / Tickets) ──────────────────────── #
+
+def _quoted_id(msg_data: dict[str, Any]) -> str:
+    """The id of the message this one replies to, across WAHA engines."""
+    reply = msg_data.get("replyTo")
+    if isinstance(reply, dict):
+        rid = _wid(reply.get("id"))
+        if rid:
+            return rid
+    elif isinstance(reply, str) and reply:
+        return reply
+    _data = msg_data.get("_data") if isinstance(msg_data.get("_data"), dict) else {}
+    return str(_data.get("quotedStanzaID") or _data.get("quotedMsgId") or "")
+
+
+async def _resolve_message_wid(inbox: MongoInboxService, phone_id: int, chat_id: int | None, ref: str) -> str | None:
+    """Map a WAHA message reference to our stored message_wid: exact match,
+    else a stored serialized id ending in "_<ref>" (bare stanza ids)."""
+    if not ref:
+        return None
+    if await inbox.message_exists(ref, phone_id):
+        return ref
+    import re as _re
+    filt: dict = {"phone_id": phone_id, "message_wid": {"$regex": "_" + _re.escape(ref.rsplit("_", 1)[-1]) + "$"}}
+    if chat_id is not None:
+        filt["chat_id"] = chat_id
+    doc = await inbox.db.messages.find_one(filt, {"message_wid": 1})
+    return doc["message_wid"] if doc else None
+
+
+async def _org_after_message_stored(db, inbox: MongoInboxService, phone: Phone, chat: dict,
+                                    stored: dict, msg_data: dict[str, Any], msg_type: str) -> None:
+    """Quoted-reply bookkeeping, ticket auto-attachment, revoke stubs and
+    auto-translation. Never raises — the message itself is already saved."""
+    try:
+        from app.models.org_config import get_org_config
+        cfg = get_org_config(db)
+        if msg_type == "revoke":
+            _data = msg_data.get("_data") if isinstance(msg_data.get("_data"), dict) else {}
+            proto = (_data.get("protocolMessageKey") or (_data.get("message") or {}).get("protocolMessage", {}).get("key")
+                     or {}) if isinstance(_data, dict) else {}
+            target = _wid(proto.get("id") if isinstance(proto, dict) else proto)
+            if target:
+                await _mark_revoked(inbox, phone.id, chat.get("id"), target)
+            return
+        quoted = await _resolve_message_wid(inbox, phone.id, chat.get("id"), _quoted_id(msg_data))
+        if quoted and stored.get("id"):
+            await inbox.db.messages.update_one({"id": stored["id"]}, {"$set": {"reply_to_wid": quoted}})
+            if cfg["tickets"].get("auto_attach"):
+                from app.services.ticket_service import TicketService
+                TicketService(db).attach_reply(chat["id"], quoted, stored.get("message_wid") or "")
+        if (not stored.get("from_me") and stored.get("body") and msg_type in ("text", "chat")
+                and cfg["config"].get("translation_enabled") and cfg["config"].get("auto_translate")):
+            await _auto_translate(inbox, stored, cfg["config"].get("translation_language") or "en")
+    except Exception as exc:
+        logger.warning("Org message hooks failed: %s", exc)
+
+
+async def _auto_translate(inbox: MongoInboxService, stored: dict, lang: str) -> None:
+    from app.services.translation import translate_if_foreign
+    tr = await translate_if_foreign(stored.get("body") or "", lang)
+    if not tr:
+        return
+    await inbox.db.messages.update_one({"id": stored["id"]}, {"$set": {"translation": tr}})
+    from app.core.ws_manager import ws_manager
+    await ws_manager.broadcast("message_translated", {
+        "chat_id": stored.get("chat_id"), "message_id": stored["id"], "translation": tr,
+    })
+
+
+async def _mark_revoked(inbox: MongoInboxService, phone_id: int, chat_id: int | None, ref: str) -> bool:
+    """Deleted for everyone: keep the original text in revoked_body (shown only
+    when "Show View Message Option On Deleted Messages" is on) and replace the
+    body everywhere else."""
+    wid = await _resolve_message_wid(inbox, phone_id, chat_id, ref)
+    if not wid:
+        return False
+    doc = await inbox.get_message_by_wid(wid, phone_id)
+    if not doc or doc.get("is_revoked"):
+        return False
+    await inbox.db.messages.update_one({"_id": doc["_id"]}, {"$set": {
+        "is_revoked": True, "revoked_at": datetime.utcnow(),
+        "revoked_body": doc.get("body") or "", "body": "🗑 This message was deleted",
+        "translation": None,
+    }})
+    from app.core.ws_manager import ws_manager
+    await ws_manager.broadcast("message_revoked", {"chat_id": doc.get("chat_id"), "message_id": doc.get("id")})
+    return True
+
+
+async def _process_revoked_event(payload: dict[str, Any]) -> None:
+    """message.revoked → mark the original message deleted (body kept aside)."""
+    db = SessionLocal()
+    try:
+        session = payload.get("session", settings.waha_session_name)
+        data = payload.get("payload") or {}
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
+        before = data.get("before") if isinstance(data.get("before"), dict) else {}
+        inbox = MongoInboxService()
+        for ref in (_wid(before.get("id")), _wid(data.get("revokedMessageId"))):
+            if ref and await _mark_revoked(inbox, phone.id, None, ref):
+                break
+    except Exception as exc:
+        logger.exception("message.revoked error: %s", exc)
+    finally:
+        db.close()
+
+
 async def _process_reaction_event(payload: dict[str, Any]) -> None:
     """Create a ticket when a message is reacted to with a ticket emoji."""
     db = SessionLocal()
@@ -262,6 +417,9 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
         emoji = str(reaction.get("text") or "").strip()
         if not emoji or emoji not in settings.ticket_emoji_reactions:
             return
+        from app.models.org_config import get_org_config
+        if not get_org_config(db)["tickets"].get("emoji_ticketing", True):
+            return  # Settings → Tickets → "Enable emoji based ticketing" is off
 
         msg_id = reaction.get("messageId") or data.get("messageId")
         if isinstance(msg_id, dict):
@@ -271,13 +429,18 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
         if not msg_wid:
             return
 
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
         inbox = MongoInboxService()
-        message = await inbox.get_message_by_wid(msg_wid)
+        message = await inbox.get_message_by_wid(msg_wid, phone.id)
         if not message:
             return
 
         from app.models.ticket import Ticket
-        existing = db.query(Ticket).filter(Ticket.message_wid == msg_wid).first()
+        existing = db.query(Ticket).filter(
+            Ticket.message_wid == msg_wid, Ticket.chat_id == message["chat_id"]
+        ).first()
         if existing:
             return
 
@@ -303,6 +466,9 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
         from app.core.ws_manager import ws_manager
         await ws_manager.emit_ticket_event("ticket_created", ticket.id, {"chat_id": message["chat_id"]})
 
+        from app.services.ticket_service import send_ticket_created_message
+        await send_ticket_created_message(ticket.id)
+
         from app.services.automation_service import AutomationService
         await AutomationService(db).run_rules("ticket_created", {
             "chat_id": message["chat_id"],
@@ -315,6 +481,114 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
         })
     except Exception as exc:
         logger.exception("Reaction webhook error: %s", exc)
+    finally:
+        db.close()
+
+
+def _wid(v: Any) -> str:
+    if isinstance(v, dict):
+        return str(v.get("_serialized") or v.get("id") or "")
+    return str(v or "")
+
+
+async def _record_reaction_event(payload: dict[str, Any]) -> None:
+    """Keep message_reactions in sync: one live reaction per (message, reactor);
+    an empty reaction text means the reactor removed it."""
+    db = SessionLocal()
+    try:
+        session = payload.get("session", settings.waha_session_name)
+        data = payload.get("payload") or {}
+        reaction = data.get("reaction") or {}
+        emoji = str(reaction.get("text") or "").strip()
+        target_wid = _wid(reaction.get("messageId") or data.get("messageId"))
+        if not target_wid:
+            return
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
+        inbox = MongoInboxService()
+        from_me = bool(data.get("fromMe"))
+        reactor = _wid(data.get("participant") or data.get("from"))
+        if from_me:
+            reactor = reactor or (f"{phone.phone_number}@c.us" if phone.phone_number else "me")
+        if not reactor:
+            return
+        target = await inbox.get_message_by_wid(target_wid, phone.id)
+        chat_id = (target or {}).get("chat_id")
+        if chat_id is None:
+            chat_wid = _wid(data.get("to") if from_me else data.get("from"))
+            chat = await inbox.get_chat_by_wid(chat_wid, phone.id) if chat_wid else None
+            chat_id = (chat or {}).get("id")
+        if chat_id is None:
+            return  # reaction on a message in a chat we don't know
+        ts_raw = data.get("timestamp")
+        ts = datetime.utcfromtimestamp(ts_raw) if isinstance(ts_raw, (int, float)) else datetime.utcnow()
+        await inbox.set_reaction({
+            "phone_id": phone.id, "chat_id": chat_id, "message_wid": target_wid,
+            "reactor": reactor, "emoji": emoji[:16], "timestamp": ts, "from_me": from_me,
+        })
+    except Exception as exc:
+        logger.exception("Reaction record error: %s", exc)
+    finally:
+        db.close()
+
+
+def _participant_event_type(waha_type: str, raw_type: str, participant: str, actor: str) -> str | None:
+    """WAHA's join/leave plus the engine's raw notification type → our type.
+
+    join via invite link / community → "join"; added by someone → "add"
+    (self-add counts as join); left → "leave"; removed by an admin → "remove".
+    """
+    if waha_type == "join":
+        if raw_type == "add" and actor and actor != participant:
+            return "add"
+        return "join"
+    if waha_type == "leave":
+        if raw_type == "remove" and actor and actor != participant:
+            return "remove"
+        return "leave"
+    if waha_type in ("promote", "demote"):
+        return waha_type
+    return None
+
+
+async def _process_group_participants(payload: dict[str, Any]) -> None:
+    """group.v2.participants → one group_events row per participant."""
+    db = SessionLocal()
+    try:
+        session = payload.get("session", settings.waha_session_name)
+        data = payload.get("payload") or {}
+        group = data.get("group")
+        group_wid = _wid(group.get("id") if isinstance(group, dict) else group)
+        if not group_wid:
+            return
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
+        raw = data.get("_data") if isinstance(data.get("_data"), dict) else {}
+        raw_type = str(raw.get("type") or "").lower()
+        actor = _wid(raw.get("author")) or None
+        source_id = _wid(raw.get("id")) or None
+
+        inbox = MongoInboxService()
+        chat = await inbox.get_chat_by_wid(group_wid, phone.id)
+        if not chat:
+            chat = await inbox.upsert_chat({"chat_wid": group_wid, "phone_id": phone.id, "is_group": True})
+        ts_raw = data.get("timestamp")
+        ts = datetime.utcfromtimestamp(ts_raw) if isinstance(ts_raw, (int, float)) else datetime.utcnow()
+        for p in data.get("participants") or []:
+            pid = _wid(p.get("id") if isinstance(p, dict) else p)
+            etype = _participant_event_type(str(data.get("type") or "").lower(), raw_type, pid, actor or "")
+            if not pid or not etype:
+                continue
+            await inbox.add_group_event({
+                "phone_id": phone.id, "chat_id": chat["id"], "chat_wid": group_wid,
+                "type": etype, "participant": pid, "actor": actor, "timestamp": ts,
+                # one notification can list several participants
+                "source_event_id": f"{source_id}:{pid}" if source_id else None,
+            })
+    except Exception as exc:
+        logger.exception("group.v2.participants error: %s", exc)
     finally:
         db.close()
 
@@ -341,13 +615,29 @@ async def _process_session_status(payload: dict[str, Any]) -> None:
             return
 
         phone.waha_status = db_status
+        # Track which WhatsApp account is linked: set after a QR scan, clear
+        # when the session is logged out and waiting for a new scan.
+        from app.api.phones import link_phone_number, unlink_phone_number
+        try:
+            if db_status == "WORKING":
+                me = status_payload.get("me") if isinstance(status_payload.get("me"), dict) else None
+                await link_phone_number(db, phone, me=me)
+            elif db_status == "SCAN_QR_CODE":
+                unlink_phone_number(phone)
+        except Exception as exc:
+            logger.warning("Could not sync linked number for session %s: %s", session_name, exc)
+            db.rollback()
+            phone = db.query(Phone).filter(Phone.session_name == session_name).first()
+            if not phone:
+                return
+            phone.waha_status = db_status
         db.commit()
-        logger.info("Session status: session=%s raw=%s db=%s phone_id=%d",
-                    session_name, raw_status, db_status, phone.id)
+        logger.info("Session status: session=%s raw=%s db=%s phone_id=%d number=%s",
+                    session_name, raw_status, db_status, phone.id, phone.phone_number)
 
         from app.core.ws_manager import ws_manager
         await ws_manager.broadcast("phone_status_changed", {
-            "phone_id": phone.id, "status": db_status,
+            "phone_id": phone.id, "status": db_status, "phone_number": phone.phone_number,
         })
         if db_status in ("STOPPED", "FAILED"):
             await ws_manager.broadcast("data_cleared", {"phone_id": phone.id, "reason": db_status})
@@ -412,8 +702,14 @@ async def waha_webhook(
     background: BackgroundTasks,
     x_webhook_secret: str | None = Header(None),
 ):
-    secret = settings.waha_webhook_secret.strip()
-    if secret and x_webhook_secret != secret:
+    import hmac
+    secret = (settings.waha_webhook_secret or "").strip()
+    if not secret:
+        # Fail closed: an unset secret must not mean "accept everything"
+        logger.error("WAHA webhook rejected: WAHA_WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=403, detail="Webhook secret not configured")
+    provided = (x_webhook_secret or "").strip()
+    if not hmac.compare_digest(provided.encode(), secret.encode()):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     try:
@@ -431,6 +727,11 @@ async def waha_webhook(
         background.add_task(_process_message_event, body)
     elif event == "message.reaction":
         background.add_task(_process_reaction_event, body)
+        background.add_task(_record_reaction_event, body)
+    elif event == "message.revoked":
+        background.add_task(_process_revoked_event, body)
+    elif event == "group.v2.participants":
+        background.add_task(_process_group_participants, body)
     elif event == "session.status":
         background.add_task(_process_session_status, body)
 
