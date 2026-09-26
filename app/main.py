@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api.ai_agent import router as ai_router
+from app.api.ai_manage import router as ai_manage_router
 from app.api.analytics import router as analytics_router
 from app.api.auth import router as auth_router
 from app.api.automation import router as automation_router
@@ -165,6 +166,7 @@ app.include_router(analytics_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(dashboard_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(automation_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(ai_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(ai_manage_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(kb_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(search_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(logs_router, prefix=PREFIX, dependencies=_auth)

@@ -232,64 +232,18 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             if body:
                 await automation.run_rules("message_keyword", rule_context)
 
-        # AI auto-flag
-        from app.models.ai_settings import get_ai_settings as _get_ai_cfg
-        _ai_cfg = _get_ai_cfg(db)
-        _flag_on = settings.ai_auto_flag_enabled or _ai_cfg.flag_enabled
-        _flag_criteria = _ai_cfg.flag_criteria or settings.ai_auto_flag_criteria
-        # A chat can opt out of auto-flagging (Settings tab → "Allow AI Flagging")
-        if not from_me and body and _flag_on and chat.get("ai_flagging") is not False:
-            try:
-                from app.services.gemini_service import GeminiService
-                if await GeminiService().flag_message(body, _flag_criteria):
-                    await inbox.flag_message(msg_wid, phone.id, True)
-                    await inbox.update_chat(chat["id"], is_flagged=True)
-                    from app.core.ws_manager import ws_manager as _ws
-                    await _ws.emit_chat_updated(chat["id"], {"is_flagged": True})
-            except Exception as exc:
-                logger.warning("AI auto-flag failed: %s", exc)
-
-        # AI agent — handle_incoming_message decides about SNOOZED chats so an
-        # expired snooze is lifted (checking here would skip them forever).
-        if not from_me and chat.get("ai_active"):
-            from app.services.ai_agent_service import AIAgentService
-            from app.services.waha_service import WAHAService
-            ai = AIAgentService(db)
-            recent = [{"body": body, "from_me": from_me, "sender_name": sender_name}]
-            reply = await ai.handle_incoming_message(chat, body, recent)
-            if reply:
-                waha = WAHAService.from_phone(phone)
-                ai_result = await waha.send_text(chat_wid, reply)
-                ai_ts = datetime.utcnow()
-                ai_wid = ai_result.message_id if ai_result.message_id else f"ai_{msg_wid}"
-                try:
-                    await inbox.upsert_message({
-                        "chat_id": chat["id"],
-                        "chat_wid": chat_wid,
-                        "phone_id": phone.id,
-                        "message_wid": ai_wid,
-                        "from_me": True,
-                        "sender_name": "AI Agent",
-                        "sender_number": phone.phone_number,
-                        "body": reply,
-                        "message_type": "text",
-                        "timestamp": ai_ts,
-                    })
-                except Exception:
-                    pass
-                from app.core.ws_manager import ws_manager as _ws
-                await _ws.emit_new_message(
-                    chat_id=chat["id"],
-                    chat_wid=chat_wid,
-                    body=reply,
-                    from_me=True,
-                    sender_name="AI Agent",
-                    sender_number=phone.phone_number,
-                    timestamp=int(ai_ts.timestamp()),
-                    message_type="text",
-                    chat_name=chat.get("name") or "",
-                    unread_count=0,
-                )
+        # AI agent: auto-flagging + reply pipeline (see ai_agent_service). The
+        # reply runs as a background task so the response delay never blocks
+        # the webhook; a from_me message typed on the phone snoozes the agent.
+        from app.services import ai_agent_service as _ai
+        try:
+            if not from_me:
+                await _ai.on_inbound(db, chat=chat, phone=phone, message_wid=msg_wid,
+                                     body=body, sender_number=sender_number)
+            else:
+                await _ai.on_outbound(db, chat=chat, body=body)
+        except Exception as exc:
+            logger.warning("AI agent hook failed: %s", exc)
 
     except Exception as exc:
         logger.exception("Webhook processing error: %s", exc)
