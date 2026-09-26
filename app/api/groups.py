@@ -455,7 +455,24 @@ async def invite_link(
         raise HTTPException(502, "WhatsApp returned no invite code")
     log_activity(db, "group_invite_link", entity_type="chat", entity_id=chat_id, agent_id=agent.id,
                  description=f"Fetched the invite link of '{chat.get('name') or ''}'")
-    return {"code": code, "link": f"https://chat.whatsapp.com/{code}"}
+    link = f"https://chat.whatsapp.com/{code}"
+    return {"code": code, "link": link, "invite_message": _invite_message(db, chat, link)}
+
+
+def _invite_message(db: Session, chat: dict, link: str) -> str | None:
+    """Settings → Group Settings → "Enable Custom Group Invite Message": the
+    text to share with the link ({{group_name}}, {{invite_link}}). None when
+    off — the client then shares the bare link. Nothing is sent from here."""
+    from app.models.org_config import get_org_config
+    cfg = get_org_config(db)["groups"]
+    if not cfg.get("invite_message_enabled"):
+        return None
+    text = (cfg.get("invite_template") or "").replace("{{group_name}}", chat.get("name") or "our group")
+    if "{{invite_link}}" in text:
+        text = text.replace("{{invite_link}}", link)
+    else:
+        text = f"{text}\n{link}".strip()
+    return text.strip() or None
 
 
 class GroupSettingsRequest(BaseModel):

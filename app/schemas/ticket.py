@@ -43,5 +43,7 @@ class TicketOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     labels: list[int] = []
+    # "AAR-12" (Settings → Tickets → prefix) — display only, ids never change
+    display_id: str | None = None
 
     model_config = {"from_attributes": True}

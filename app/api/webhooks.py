@@ -151,7 +151,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             from_raw = _raw_wid(msg_data.get("author"))
         sender_number = from_raw.split("@")[0] if not from_raw.endswith("@g.us") else ""
 
-        await inbox.upsert_message({
+        stored = await inbox.upsert_message({
             "chat_id": chat["id"],
             "chat_wid": chat_wid,
             "phone_id": phone.id,
@@ -167,6 +167,7 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
             "media_filename": media_filename,
             "timestamp": ts,
         })
+        await _org_after_message_stored(db, inbox, phone, chat, stored, msg_data, msg_type)
 
         if not from_me:
             # Atomic increment — concurrent webhooks must not lose counts.
@@ -296,6 +297,116 @@ async def _process_message_event(payload: dict[str, Any]) -> None:
         db.close()
 
 
+# ── Org config hooks (Settings → Config / Tickets) ──────────────────────── #
+
+def _quoted_id(msg_data: dict[str, Any]) -> str:
+    """The id of the message this one replies to, across WAHA engines."""
+    reply = msg_data.get("replyTo")
+    if isinstance(reply, dict):
+        rid = _wid(reply.get("id"))
+        if rid:
+            return rid
+    elif isinstance(reply, str) and reply:
+        return reply
+    _data = msg_data.get("_data") if isinstance(msg_data.get("_data"), dict) else {}
+    return str(_data.get("quotedStanzaID") or _data.get("quotedMsgId") or "")
+
+
+async def _resolve_message_wid(inbox: MongoInboxService, phone_id: int, chat_id: int | None, ref: str) -> str | None:
+    """Map a WAHA message reference to our stored message_wid: exact match,
+    else a stored serialized id ending in "_<ref>" (bare stanza ids)."""
+    if not ref:
+        return None
+    if await inbox.message_exists(ref, phone_id):
+        return ref
+    import re as _re
+    filt: dict = {"phone_id": phone_id, "message_wid": {"$regex": "_" + _re.escape(ref.rsplit("_", 1)[-1]) + "$"}}
+    if chat_id is not None:
+        filt["chat_id"] = chat_id
+    doc = await inbox.db.messages.find_one(filt, {"message_wid": 1})
+    return doc["message_wid"] if doc else None
+
+
+async def _org_after_message_stored(db, inbox: MongoInboxService, phone: Phone, chat: dict,
+                                    stored: dict, msg_data: dict[str, Any], msg_type: str) -> None:
+    """Quoted-reply bookkeeping, ticket auto-attachment, revoke stubs and
+    auto-translation. Never raises — the message itself is already saved."""
+    try:
+        from app.models.org_config import get_org_config
+        cfg = get_org_config(db)
+        if msg_type == "revoke":
+            _data = msg_data.get("_data") if isinstance(msg_data.get("_data"), dict) else {}
+            proto = (_data.get("protocolMessageKey") or (_data.get("message") or {}).get("protocolMessage", {}).get("key")
+                     or {}) if isinstance(_data, dict) else {}
+            target = _wid(proto.get("id") if isinstance(proto, dict) else proto)
+            if target:
+                await _mark_revoked(inbox, phone.id, chat.get("id"), target)
+            return
+        quoted = await _resolve_message_wid(inbox, phone.id, chat.get("id"), _quoted_id(msg_data))
+        if quoted and stored.get("id"):
+            await inbox.db.messages.update_one({"id": stored["id"]}, {"$set": {"reply_to_wid": quoted}})
+            if cfg["tickets"].get("auto_attach"):
+                from app.services.ticket_service import TicketService
+                TicketService(db).attach_reply(chat["id"], quoted, stored.get("message_wid") or "")
+        if (not stored.get("from_me") and stored.get("body") and msg_type in ("text", "chat")
+                and cfg["config"].get("translation_enabled") and cfg["config"].get("auto_translate")):
+            await _auto_translate(inbox, stored, cfg["config"].get("translation_language") or "en")
+    except Exception as exc:
+        logger.warning("Org message hooks failed: %s", exc)
+
+
+async def _auto_translate(inbox: MongoInboxService, stored: dict, lang: str) -> None:
+    from app.services.translation import translate_if_foreign
+    tr = await translate_if_foreign(stored.get("body") or "", lang)
+    if not tr:
+        return
+    await inbox.db.messages.update_one({"id": stored["id"]}, {"$set": {"translation": tr}})
+    from app.core.ws_manager import ws_manager
+    await ws_manager.broadcast("message_translated", {
+        "chat_id": stored.get("chat_id"), "message_id": stored["id"], "translation": tr,
+    })
+
+
+async def _mark_revoked(inbox: MongoInboxService, phone_id: int, chat_id: int | None, ref: str) -> bool:
+    """Deleted for everyone: keep the original text in revoked_body (shown only
+    when "Show View Message Option On Deleted Messages" is on) and replace the
+    body everywhere else."""
+    wid = await _resolve_message_wid(inbox, phone_id, chat_id, ref)
+    if not wid:
+        return False
+    doc = await inbox.get_message_by_wid(wid, phone_id)
+    if not doc or doc.get("is_revoked"):
+        return False
+    await inbox.db.messages.update_one({"_id": doc["_id"]}, {"$set": {
+        "is_revoked": True, "revoked_at": datetime.utcnow(),
+        "revoked_body": doc.get("body") or "", "body": "🗑 This message was deleted",
+        "translation": None,
+    }})
+    from app.core.ws_manager import ws_manager
+    await ws_manager.broadcast("message_revoked", {"chat_id": doc.get("chat_id"), "message_id": doc.get("id")})
+    return True
+
+
+async def _process_revoked_event(payload: dict[str, Any]) -> None:
+    """message.revoked → mark the original message deleted (body kept aside)."""
+    db = SessionLocal()
+    try:
+        session = payload.get("session", settings.waha_session_name)
+        data = payload.get("payload") or {}
+        phone = db.query(Phone).filter(Phone.session_name == session).first()
+        if not phone:
+            return
+        before = data.get("before") if isinstance(data.get("before"), dict) else {}
+        inbox = MongoInboxService()
+        for ref in (_wid(before.get("id")), _wid(data.get("revokedMessageId"))):
+            if ref and await _mark_revoked(inbox, phone.id, None, ref):
+                break
+    except Exception as exc:
+        logger.exception("message.revoked error: %s", exc)
+    finally:
+        db.close()
+
+
 async def _process_reaction_event(payload: dict[str, Any]) -> None:
     """Create a ticket when a message is reacted to with a ticket emoji."""
     db = SessionLocal()
@@ -306,6 +417,9 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
         emoji = str(reaction.get("text") or "").strip()
         if not emoji or emoji not in settings.ticket_emoji_reactions:
             return
+        from app.models.org_config import get_org_config
+        if not get_org_config(db)["tickets"].get("emoji_ticketing", True):
+            return  # Settings → Tickets → "Enable emoji based ticketing" is off
 
         msg_id = reaction.get("messageId") or data.get("messageId")
         if isinstance(msg_id, dict):
@@ -351,6 +465,9 @@ async def _process_reaction_event(payload: dict[str, Any]) -> None:
 
         from app.core.ws_manager import ws_manager
         await ws_manager.emit_ticket_event("ticket_created", ticket.id, {"chat_id": message["chat_id"]})
+
+        from app.services.ticket_service import send_ticket_created_message
+        await send_ticket_created_message(ticket.id)
 
         from app.services.automation_service import AutomationService
         await AutomationService(db).run_rules("ticket_created", {
@@ -611,6 +728,8 @@ async def waha_webhook(
     elif event == "message.reaction":
         background.add_task(_process_reaction_event, body)
         background.add_task(_record_reaction_event, body)
+    elif event == "message.revoked":
+        background.add_task(_process_revoked_event, body)
     elif event == "group.v2.participants":
         background.add_task(_process_group_participants, body)
     elif event == "session.status":

@@ -2,7 +2,7 @@ from app.models.agent import Agent
 from app.models.agent_phone import AgentPhone
 from app.models.agent_session import AgentSession
 from app.models.phone import Phone
-from app.models.ticket import Ticket, TicketLabel
+from app.models.ticket import Ticket, TicketLabel, TicketMessage
 from app.models.contact import Contact, ContactLabel
 from app.models.label import Label
 from app.models.note import Note
@@ -22,12 +22,14 @@ from app.models.scheduled_message import ScheduledMessage
 from app.models.task import Task
 from app.models.property_definition import PropertyDefinition
 from app.models.org_settings import OrgSettings
+from app.models.org_config import GroupTemplate, MediaLibraryItem, OrgConfig
 
 __all__ = [
     "Agent", "AgentPhone", "AgentSession", "Phone",
-    "Ticket", "TicketLabel", "Contact", "ContactLabel", "Label",
+    "Ticket", "TicketLabel", "TicketMessage", "Contact", "ContactLabel", "Label",
     "Note", "QuickReply", "AutomationRule", "KnowledgeItem",
     "BulkMessageJob", "ActivityLog", "ApiKey", "WebhookEndpoint",
     "ScheduledMessage", "Task", "PropertyDefinition",
     "BulkMessageLog", "MessageTemplate", "SavedChatList", "AIAgentSettings", "OrgSettings",
+    "OrgConfig", "MediaLibraryItem", "GroupTemplate",
 ]

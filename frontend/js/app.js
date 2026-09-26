@@ -3746,6 +3746,16 @@ function renderNoteBubble(n) {
   </div>`;
 }
 
+// ── Org config hooks (Settings → Config; implemented in settings-org.js) ── //
+// Which side a bubble renders on ("Display Active Phone Messages On The Right")
+function orgMsgOnRight(m) {
+  return typeof window.soMsgOnRight === 'function' ? window.soMsgOnRight(m) : !!m.from_me;
+}
+// Extra bubble content: translation / "Translate" action, "View message" on deleted messages
+function orgMsgExtras(m) {
+  return typeof window.soMsgExtras === 'function' ? window.soMsgExtras(m) : '';
+}
+
 function renderMessage(m, isGroup) {
   if (m.body?.startsWith('[NOTE]') || m.message_type === 'note') {
     const content = m.body?.replace('[NOTE] ', '') || m.body;
@@ -3781,10 +3791,10 @@ function renderMessage(m, isGroup) {
 
   const byAgent = me && (m.sent_by_agent_id || m.sender_name === 'AI Agent') && m.sender_name ? `${esc(m.sender_name)} · ` : '';
   const ticks = me ? (m.is_read ? '<span class="cx-ticks read">✓✓</span>' : '<span class="cx-ticks">✓</span>') : '';
-  return `<div class="msg ${me ? 'me' : 'them'}" data-mid="${m.id || ''}" data-ts="${cxTsAttr(m.timestamp)}">
+  return `<div class="msg ${orgMsgOnRight(m) ? 'me' : 'them'}" data-mid="${m.id || ''}" data-ts="${cxTsAttr(m.timestamp)}">
     <div class="msg-bubble ${m.is_flagged ? 'flagged-msg' : ''}${media ? ' has-media' : ''}">
       ${m.is_flagged ? '<div class="msg-flag-badge">🚩 AI Flagged</div>' : ''}
-      ${head}${media}${text}
+      ${head}${media}${text}${orgMsgExtras(m)}
       <span class="cx-btime">${byAgent}${fmt(m.timestamp)} ${ticks}</span>
     </div>
   </div>`;

@@ -10,3 +10,9 @@ class Label(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     color: Mapped[str] = mapped_column(String(20), default="#0D8C7C")
+    # chat | ticket | phone — which picker the label appears in. The column is
+    # added NOT NULL DEFAULT 'chat', so pre-existing labels become chat labels.
+    type: Mapped[str] = mapped_column(String(20), default="chat", nullable=False, index=True)
+
+
+LABEL_TYPES = ("chat", "ticket", "phone")

@@ -91,3 +91,91 @@ async def filter_accessible_chat_ids(db: Session, agent: Agent, chat_ids: list[A
     )
     ok_set = {int(i) for i in ok}
     return [i for i in ids if i in ok_set]
+
+
+# ── Organization permissions (Settings → Permissions) ─────────────────────── #
+# Admins bypass every check. For everyone else the org-wide switches decide.
+
+ACTION_DENIED = {
+    "create_chats": "Your organization doesn't allow agents to start new chats",
+    "data_export": "Your organization doesn't allow agents to export data",
+    "archive_chats": "Your organization doesn't allow agents to archive or close chats",
+    "assign": "Your organization doesn't allow agents to assign chats or tickets",
+    "update_labels": "Your organization doesn't allow agents to change labels",
+    "delete_tickets": "Your organization doesn't allow agents to delete tickets",
+}
+
+
+def org_permissions(db: Session) -> dict:
+    from app.models.org_config import get_org_config
+    return get_org_config(db)["permissions"]
+
+
+def effective_permissions(db: Session, agent: Agent) -> dict:
+    """What this agent may do / see: the org switches, or everything for admins."""
+    perms = org_permissions(db)
+    if is_admin(agent):
+        return {
+            "actions": {k: True for k in perms["actions"]},
+            "screens": {k: True for k in perms["screens"]},
+        }
+    return perms
+
+
+def has_action(db: Session, agent: Agent, action: str) -> bool:
+    if is_admin(agent):
+        return True
+    return bool(org_permissions(db)["actions"].get(action, False))
+
+
+def require_action(db: Session, agent: Agent, action: str) -> None:
+    if not has_action(db, agent, action):
+        raise HTTPException(403, ACTION_DENIED.get(action, "Your organization doesn't allow this action"))
+
+
+def has_screen(db: Session, agent: Agent, screen: str) -> bool:
+    if is_admin(agent):
+        return True
+    return bool(org_permissions(db)["screens"].get(screen, False))
+
+
+def require_screen(db: Session, agent: Agent, screen: str, label: str | None = None) -> None:
+    if not has_screen(db, agent, screen):
+        name = label or screen.replace("_", " ").title()
+        raise HTTPException(403, f"Your organization has turned off {name} for agents")
+
+
+def screen_guard(screen: str, label: str | None = None):
+    """FastAPI dependency factory: 403 when the screen is off for this agent."""
+    from fastapi import Depends
+    from app.api.auth import get_current_agent
+    from app.db.session import get_db
+
+    def _guard(db: Session = Depends(get_db), agent: Agent = Depends(get_current_agent)) -> None:
+        require_screen(db, agent, screen, label)
+
+    _guard.__name__ = f"screen_guard_{screen}"
+    return _guard
+
+
+def should_mask_numbers(db: Session, agent: Agent) -> bool:
+    """Settings → Config → "Mask User Phone Numbers" (never for admins)."""
+    if is_admin(agent):
+        return False
+    from app.models.org_config import get_org_config
+    return bool(get_org_config(db)["config"].get("mask_phone_numbers"))
+
+
+def mask_number(value: str | None) -> str:
+    """'919876543210' → '9198******10'. Keeps a WID's @domain suffix."""
+    if not value:
+        return value or ""
+    ident, sep, domain = str(value).partition("@")
+    if domain == "g.us":
+        return str(value)  # group ids aren't personal numbers
+    if len(ident) <= 4:
+        masked = "*" * len(ident)
+    else:
+        keep_head = min(4, max(1, len(ident) - 6))
+        masked = ident[:keep_head] + "*" * (len(ident) - keep_head - 2) + ident[-2:]
+    return masked + (sep + domain if sep else "")

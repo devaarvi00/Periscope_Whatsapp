@@ -13,6 +13,7 @@ from app.models.phone import Phone
 from app.schemas.inbox import ChatUpdateRequest, SendMessageRequest
 from app.services.access import (
     assert_phone_access, filter_accessible_chat_ids, get_accessible_chat,
+    mask_number, require_action, should_mask_numbers,
 )
 from app.services.activity_service import log_activity
 from app.services.automation_service import fire_trigger
@@ -58,14 +59,63 @@ async def list_chats(
     )
     # last_message_from_me (for the "awaiting reply" filter) is maintained on
     # the chat doc; only chats written before that field existed need a lookup.
+    mask = should_mask_numbers(db, agent)
     result = []
     for doc in docs:
         serialized = _serialize_chat(doc)
         if serialized.get("last_message_from_me") is None:
             msgs = await inbox.get_messages(chat_id=doc["id"], limit=1)
             serialized["last_message_from_me"] = msgs[0].get("from_me") if msgs else None
-        result.append(serialized)
+        result.append(_mask_chat(serialized) if mask else serialized)
     return result
+
+
+# ── Org config hooks (Settings → Config / Permissions) ───────────────────── #
+
+def _mask_chat(chat: dict) -> dict:
+    """Hide personal numbers in a serialized chat ("Mask User Phone Numbers")."""
+    if chat.get("is_group"):
+        sender = chat.get("last_message_sender") or ""
+        if sender.isdigit():
+            chat["last_message_sender"] = mask_number(sender)
+        return chat
+    wid = chat.get("chat_wid") or ""
+    raw = wid.split("@")[0]
+    chat["chat_wid"] = mask_number(wid)
+    name = chat.get("name") or ""
+    if not name or name in (wid, raw, f"+{raw}") or "@" in name or name.lstrip("+").isdigit():
+        chat["name"] = mask_number(name.lstrip("+")) if name else ""
+    if (chat.get("last_message_sender") or "").lstrip("+").isdigit():
+        chat["last_message_sender"] = mask_number(chat["last_message_sender"].lstrip("+"))
+    return chat
+
+
+REVOKED_PLACEHOLDER = "🗑 This message was deleted"
+
+
+def _org_message_view(doc: dict, out: dict, *, show_deleted: bool, mask: bool,
+                      org_numbers: set[str]) -> dict:
+    """Add the org-config fields to a serialized message: stored translation,
+    revoked state (+ original text when "Show View Message Option On Deleted
+    Messages" is on), the quoted message id, and whether one of our other
+    numbers sent it (for "Display Active Phone Messages On The Right")."""
+    sender = doc.get("sender_number") or ""
+    out["from_org_phone"] = bool(out.get("from_me") or (sender and sender in org_numbers))
+    tr = doc.get("translation")
+    out["translation"] = tr if isinstance(tr, dict) and tr.get("text") else None
+    out["reply_to_wid"] = doc.get("reply_to_wid") or None
+    out["is_revoked"] = bool(doc.get("is_revoked"))
+    if out["is_revoked"]:
+        out["body"] = REVOKED_PLACEHOLDER
+        out["translation"] = None
+        out["revoked_body"] = (doc.get("revoked_body") or None) if show_deleted else None
+    if mask and sender:
+        out["sender_number"] = mask_number(sender)
+    return out
+
+
+def _org_numbers(db: Session) -> set[str]:
+    return {str(p[0]) for p in db.query(Phone.phone_number).all() if p[0]}
 
 
 @router.get("/chats/{chat_id}", response_model=dict)
@@ -75,7 +125,8 @@ async def get_chat(
     agent: Agent = Depends(get_current_agent),
 ):
     doc = await get_accessible_chat(db, agent, chat_id)
-    return _serialize_chat(doc)
+    out = _serialize_chat(doc)
+    return _mask_chat(out) if should_mask_numbers(db, agent) else out
 
 
 @router.patch("/chats/{chat_id}")
@@ -96,6 +147,7 @@ async def update_chat(
     updates = {k: v for k, v in updates.items() if v is not None or k == "assigned_to"}
     if "ai_active" in updates:
         updates["ai_state"] = "ACTIVE" if updates["ai_active"] else "INACTIVE"
+    _check_chat_update_permissions(db, agent, updates, prev)
 
     await inbox.update_chat(chat_id, **updates)
 
@@ -133,6 +185,18 @@ async def update_chat(
         })
         await _notify_chat_assigned(prev, updates["assigned_to"], agent)
     return {"ok": True}
+
+
+def _check_chat_update_permissions(db: Session, agent: Agent, updates: dict, prev: dict | None) -> None:
+    """Settings → Permissions: archive/close and assign are org-controlled.
+    Only real changes are checked, so re-sending the current value is fine."""
+    prev = prev or {}
+    if ("is_archived" in updates and bool(updates["is_archived"]) != bool(prev.get("is_archived"))) or (
+        "status" in updates and updates["status"] != (prev.get("status") or "open")
+    ):
+        require_action(db, agent, "archive_chats")
+    if "assigned_to" in updates and updates["assigned_to"] != prev.get("assigned_to"):
+        require_action(db, agent, "assign")
 
 
 def _chat_display_name(chat: dict) -> str:
@@ -305,7 +369,15 @@ async def get_messages(
             except Exception as exc:
                 logger.warning("Lazy-load messages failed for chat %d: %s", chat_id, exc)
 
-    return [_serialize_message(m) for m in msgs]
+    from app.models.org_config import get_org_config
+    cfg = get_org_config(db)["config"]
+    mask = should_mask_numbers(db, agent)
+    numbers = _org_numbers(db)
+    return [
+        _org_message_view(m, _serialize_message(m), show_deleted=bool(cfg.get("show_deleted_messages")),
+                          mask=mask, org_numbers=numbers)
+        for m in msgs
+    ]
 
 
 async def _store_waha_messages(
@@ -380,6 +452,7 @@ async def send_message(
 
     from app.services.waha_service import SendResult
     import time
+    req.body = _with_sender_name(db, agent, req.body)
     if settings.environment == "development" and phone.waha_status != "WORKING":
         result = SendResult(message_id=f"mock_{int(time.time())}_{chat['id']}", raw={"status": "mock_sent"})
     else:
@@ -438,6 +511,16 @@ async def send_message(
     return {"ok": True, "message_id": msg.get("id")}
 
 
+def _with_sender_name(db: Session, agent: Agent, body: str) -> str:
+    """Settings → Config → "Show Sender Names": prefix "*Agent*:\n" (WhatsApp
+    bold) to what the customer receives. Empty bodies (bare media) stay empty."""
+    from app.models.org_config import get_org_config
+    if not body or not get_org_config(db)["config"].get("show_sender_names"):
+        return body
+    name = (agent.name or "").strip().replace("*", "")
+    return f"*{name}*:\n{body}" if name else body
+
+
 @router.post("/chats/{chat_id}/sync-messages")
 async def sync_chat_messages(
     chat_id: int,
@@ -494,6 +577,12 @@ async def bulk_update_chats(
             raise HTTPException(400, "assigned_to must be an agent id or null")
     if "ai_active" in updates:
         updates["ai_state"] = "ACTIVE" if updates["ai_active"] else "INACTIVE"
+    if "is_archived" in updates or "status" in updates:
+        require_action(db, agent, "archive_chats")
+    if "assigned_to" in updates:
+        require_action(db, agent, "assign")
+    if req.add_label_id or req.remove_label_id:
+        require_action(db, agent, "update_labels")
     # Snapshot previous assignees so only real changes notify
     prev_chats: list[dict] = []
     if "assigned_to" in updates:
@@ -541,6 +630,7 @@ async def add_label(
     agent: Agent = Depends(get_current_agent),
 ):
     await get_accessible_chat(db, agent, chat_id)
+    require_action(db, agent, "update_labels")
     await MongoInboxService().add_label_to_chat(chat_id, label_id)
     background.add_task(fire_trigger, "label_added", {
         "chat_id": chat_id, "label_id": label_id, "source": "manual",
@@ -556,6 +646,7 @@ async def remove_label(
     agent: Agent = Depends(get_current_agent),
 ):
     await get_accessible_chat(db, agent, chat_id)
+    require_action(db, agent, "update_labels")
     await MongoInboxService().remove_label_from_chat(chat_id, label_id)
     return {"ok": True}
 

@@ -31,6 +31,7 @@ from app.api.logs import router as logs_router
 from app.api.media import router as media_router
 from app.api.notes import router as notes_router
 from app.api.org import router as org_router
+from app.api.org_config import router as org_config_router  # also installs screen guards
 from app.api.phones import router as phones_router
 from app.api.quick_replies import router as qr_router
 from app.api.search import router as search_router
@@ -174,6 +175,7 @@ app.include_router(scheduled_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(tasks_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(properties_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(org_router, prefix=PREFIX, dependencies=_auth)
+app.include_router(org_config_router, prefix=PREFIX, dependencies=_auth)
 app.include_router(media_router, prefix=PREFIX, dependencies=_auth)
 
 
