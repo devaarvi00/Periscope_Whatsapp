@@ -351,6 +351,64 @@ def _waha_fail(exc: WAHAError) -> HTTPException:
     return HTTPException(502, f"WhatsApp refused: {exc}")
 
 
+# ── Logs → Group logs ── #
+
+_OK_CODES = {"200", "201", "207"}
+
+
+def _participant_results(result: Any, ids: list[str]) -> list[dict]:
+    """Per-participant outcome from a WAHA participants call. Engines differ:
+    WEBJS maps id → {code, message}; NOWEB/GOWS return [{jid|id, status}].
+    When the reply says nothing per participant, the call succeeding means
+    every participant succeeded."""
+    per: dict[str, dict] = {}
+    items: list = []
+    if isinstance(result, dict):
+        for i in ids:
+            v = result.get(i)
+            if isinstance(v, dict):
+                items.append({"id": i, **v})
+        inner = result.get("result")
+        if isinstance(inner, list):
+            items.extend(inner)
+    elif isinstance(result, list):
+        items = result
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        pid = it.get("id") or it.get("jid") or ""
+        if isinstance(pid, dict):
+            pid = pid.get("_serialized") or ""
+        code = it.get("code", it.get("status", it.get("statusCode")))
+        if not pid or code is None:
+            continue
+        ok = str(code) in _OK_CODES
+        per[str(pid)] = {"id": str(pid), "ok": ok, **({} if ok else {"error": str(it.get("message") or code)[:120]})}
+    out = []
+    for i in ids:
+        out.append(per.get(i) or {"id": i, "ok": True})
+    return out
+
+
+def _group_log(agent: Agent, operation: str, chat: dict | None, *, success: int = 0, failed: int = 0,
+               participants: list[dict] | None = None, error: str | None = None, **extra: Any) -> None:
+    from app.services import operation_log as oplog
+    details: dict[str, Any] = {}
+    if chat:
+        details.update(chat_id=chat.get("id"), group=chat.get("name") or "")
+    if participants is not None:
+        details["participants"] = participants
+    if error:
+        details["error"] = error[:300]
+    details.update({k: v for k, v in extra.items() if v is not None})
+    oplog.record("group", operation, success=success, failed=failed,
+                 performed_by_id=agent.id, details=details)
+
+
+def _failed_participants(ids: list[str], exc: Exception) -> list[dict]:
+    return [{"id": i, "ok": False, "error": str(exc)[:120]} for i in ids]
+
+
 class AddMembersRequest(BaseModel):
     numbers: list[str] = Field(..., min_length=1, max_length=50)
 
@@ -379,10 +437,17 @@ async def add_members(
     to_add = [d for d in digits if d not in existing]
     result: Any = None
     if to_add:
+        add_ids = [f"{d}@c.us" for d in to_add]
         try:
-            result = await waha.group_participants_action(chat["chat_wid"], "add", [f"{d}@c.us" for d in to_add])
+            result = await waha.group_participants_action(chat["chat_wid"], "add", add_ids)
         except WAHAError as exc:
+            _group_log(agent, "Add participants", chat, failed=len(add_ids),
+                       participants=_failed_participants(add_ids, exc), error=str(exc))
             raise _waha_fail(exc)
+        per = _participant_results(result, add_ids)
+        ok_n = sum(1 for p in per if p["ok"])
+        _group_log(agent, "Add participants", chat, success=ok_n, failed=len(per) - ok_n,
+                   participants=per, already_members=len(already) or None)
         _invalidate(phone.id, chat["chat_wid"])
         log_activity(
             db, "group_participants_added", entity_type="chat", entity_id=chat_id, agent_id=agent.id,
@@ -400,6 +465,7 @@ _ACTION_LOG = {
     "promote": ("group_participants_promoted", "Made {n} member(s) admin in '{g}'"),
     "demote": ("group_participants_demoted", "Dismissed {n} admin(s) in '{g}'"),
 }
+_ACTION_OP = {"remove": "Remove participants", "promote": "Promote to admin", "demote": "Dismiss as admin"}
 
 
 @router.post("/{chat_id}/members/{action}")
@@ -427,10 +493,17 @@ async def member_action(
         if action == "demote" and not m["is_admin"]:
             raise HTTPException(400, "Not an admin")
         targets.append(m)
+    ids = [m["id"] for m in targets]
+    op_name = _ACTION_OP[action]
     try:
-        result = await waha.group_participants_action(chat["chat_wid"], action, [m["id"] for m in targets])
+        result = await waha.group_participants_action(chat["chat_wid"], action, ids)
     except WAHAError as exc:
+        _group_log(agent, op_name, chat, failed=len(ids),
+                   participants=_failed_participants(ids, exc), error=str(exc))
         raise _waha_fail(exc)
+    per = _participant_results(result, ids)
+    ok_n = sum(1 for p in per if p["ok"])
+    _group_log(agent, op_name, chat, success=ok_n, failed=len(per) - ok_n, participants=per)
     _invalidate(phone.id, chat["chat_wid"])
     act, text = _ACTION_LOG[action]
     log_activity(db, act, entity_type="chat", entity_id=chat_id, agent_id=agent.id,
@@ -449,10 +522,13 @@ async def invite_link(
     try:
         code = await waha.get_group_invite_code(chat["chat_wid"])
     except WAHAError as exc:
+        _group_log(agent, "Get invite link", chat, failed=1, error=str(exc))
         raise _waha_fail(exc)
     code = code.rsplit("/", 1)[-1]
     if not _INVITE_RE.match(code):
+        _group_log(agent, "Get invite link", chat, failed=1, error="WhatsApp returned no invite code")
         raise HTTPException(502, "WhatsApp returned no invite code")
+    _group_log(agent, "Get invite link", chat, success=1)  # the link itself isn't logged
     log_activity(db, "group_invite_link", entity_type="chat", entity_id=chat_id, agent_id=agent.id,
                  description=f"Fetched the invite link of '{chat.get('name') or ''}'")
     link = f"https://chat.whatsapp.com/{code}"
@@ -499,6 +575,7 @@ async def update_group_settings(
     chat, phone, waha, _members, _me = await _manage_ctx(db, agent, chat_id)
     wid = chat["chat_wid"]
     done: list[str] = []
+    error: str | None = None
     try:
         if "subject" in changes:
             await waha.set_group_subject(wid, changes["subject"])
@@ -514,9 +591,20 @@ async def update_group_settings(
             await waha.set_group_admin_only(wid, "info", changes["info_admin_only"])
             done.append("who can edit group info")
     except WAHAError as exc:
+        error = str(exc)
         _invalidate(phone.id, wid)
         raise _waha_fail(exc)
     finally:
+        _group_log(
+            agent, "Update group settings", chat, success=len(done),
+            failed=len(changes) - len(done) if error else 0, error=error,
+            changed=done,
+            requested=sorted(changes),
+            new_subject=changes.get("subject"),
+            description_preview=(changes["description"][:80] if "description" in changes else None),
+            messages_admin_only=changes.get("messages_admin_only"),
+            info_admin_only=changes.get("info_admin_only"),
+        )
         if done:
             log_activity(db, "group_settings_changed", entity_type="chat", entity_id=chat_id, agent_id=agent.id,
                          description=f"Changed {', '.join(done)} of '{chat.get('name') or ''}'")
@@ -555,6 +643,14 @@ async def add_participants(
         waha = WAHAService.from_phone(phone)
         ok = await waha.add_group_participants(chat["chat_wid"], wids)
         results.append({"chat_id": cid, "group": chat.get("name") or "", "ok": ok})
+    ok_groups = sum(1 for r in results if r["ok"])
+    _group_log(
+        agent, f"Add participants to {len(results)} group(s)", None,
+        success=ok_groups * len(wids), failed=(len(results) - ok_groups) * len(wids),
+        participants=[{"id": w} for w in wids],
+        groups=[{"chat_id": r["chat_id"], "group": r.get("group") or "", "ok": r["ok"],
+                 **({"error": r["error"]} if r.get("error") else {})} for r in results],
+    )
     log_activity(
         db, "group_participants_added", entity_type="chat", agent_id=agent.id,
         description=f"Added {len(wids)} participant(s) to {sum(1 for r in results if r['ok'])} group(s)",

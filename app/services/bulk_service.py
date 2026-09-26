@@ -120,12 +120,23 @@ class BulkService:
         self.db.refresh(job)
         recipients = job.recipient_chat_ids or []
 
+        from app.services import operation_log as oplog
+        log_uid = oplog.record(
+            "scheduled", f"Bulk message: {job.name}",
+            pending=len(recipients), status="pending",
+            performed_by_id=job.created_by, performed_by="Scheduler",
+            details={"bulk_job_id": job.id, "run": (job.runs_count or 0) + 1,
+                     "message_type": job.message_type, "recipients": len(recipients),
+                     "repeat": job.repeat, "message_preview": oplog.preview(job.message)},
+        )
+
         from app.models.phone import Phone
         phone = self.db.query(Phone).filter(Phone.id == job.phone_id).first()
         if not phone:
             job.status = "failed"
             job.error_message = "Phone not found"
             self.db.commit()
+            oplog.update(log_uid, failed=len(recipients), pending=0, details={"error": "Phone not found"})
             return {"error": "Phone not found"}
 
         from app.models.bulk_message_job import BulkMessageLog
@@ -211,6 +222,13 @@ class BulkService:
         elif job.status != "cancelled":
             job.status = "done"
         self.db.commit()
+
+        oplog.update(
+            log_uid, success=sent, failed=failed, pending=0,
+            details={"cancelled": job.status == "cancelled",
+                     "not_sent": max(0, len(recipients) - sent - failed),
+                     "next_run": job.scheduled_at if job.status == "pending" else None},
+        )
 
         from app.services.activity_service import log_activity
         log_activity(

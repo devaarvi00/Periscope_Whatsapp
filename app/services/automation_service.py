@@ -65,6 +65,29 @@ async def fire_trigger(trigger_type: str, context: dict[str, Any]) -> None:
         db.close()
 
 
+def log_rule_run(rule: AutomationRule, trigger_type: str, context: dict[str, Any],
+                 taken: list[str], failures: list[str]) -> None:
+    """Logs → Rules logs: one row per rule run (never raises)."""
+    from app.services import operation_log as oplog
+    from app.services.operation_log import preview
+    configured = [a.get("type") for a in (rule.actions or []) if isinstance(a, dict)]
+    oplog.record(
+        "rule", rule.name or f"Rule #{rule.id}",
+        success=len(taken), failed=len(failures),
+        performed_by="Automation",
+        details={
+            "rule_id": rule.id, "rule": rule.name, "trigger": trigger_type,
+            "chat_id": context.get("chat_id"),
+            "chat_name": context.get("chat_name") or None,
+            "message_preview": preview(context.get("message")) or None,
+            "actions_configured": configured,
+            "actions_run": taken,
+            "actions_failed": failures,
+            "skipped": max(0, len(configured) - len(taken) - len(failures)),
+        },
+    )
+
+
 class AutomationService:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -107,10 +130,12 @@ class AutomationService:
         actions_taken: list[str] = []
         for rule in rules:
             if self._matches_criteria(rule, context):
-                taken = await self._execute_actions(rule, context)
+                failures: list[str] = []
+                taken = await self._execute_actions(rule, context, failures)
                 actions_taken.extend(taken)
                 rule.runs_count = (rule.runs_count or 0) + 1
                 self.db.commit()
+                log_rule_run(rule, trigger_type, context, taken, failures)
                 if taken:
                     log_activity(
                         self.db, "automation_rule_executed",
@@ -188,7 +213,11 @@ class AutomationService:
 
     # ── Actions ───────────────────────────────────────────────────────────
 
-    async def _execute_actions(self, rule: AutomationRule, context: dict[str, Any]) -> list[str]:
+    async def _execute_actions(
+        self, rule: AutomationRule, context: dict[str, Any], failures: list[str] | None = None,
+    ) -> list[str]:
+        """Run the rule's actions; returns what was done. Failed action types
+        are appended to `failures` when given."""
         actions_taken: list[str] = []
         for action in (rule.actions or []):
             action_type = action.get("type")
@@ -201,6 +230,8 @@ class AutomationService:
                 # actions, the webhook's own writes) don't hit PendingRollbackError.
                 self.db.rollback()
                 logger.warning("Automation action %s failed: %s", action_type, exc)
+                if failures is not None:
+                    failures.append(f"{action_type}: {type(exc).__name__}")
         return actions_taken
 
     async def _execute_action(
