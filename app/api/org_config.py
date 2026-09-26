@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_agent
+from app.core.config import settings
 from app.api.media_library import router as media_library_router
 from app.db.session import get_db
 from app.models.agent import Agent
@@ -107,6 +108,7 @@ def _config_out(cfg: dict) -> dict:
         "groups": cfg["groups"],
         "languages": [{"code": k, "name": v} for k, v in LANGUAGES.items()],
         "gemini_configured": gemini_configured(),
+        "ticket_emojis": list(settings.ticket_emoji_reactions),
         # Media files are only ever served through the authenticated proxy
         # (/media/{id}/file, /media-library/{id}/file) — there is no public
         # link mode to switch to, so Media Privacy is always on.
