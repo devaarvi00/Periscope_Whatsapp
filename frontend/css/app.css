@@ -252,11 +252,6 @@ input,textarea,select{font:inherit;}
 #login-btn-spinner{animation:lf-spin .75s linear infinite;}
 
 /* Trust line */
-.lf-trust{
-  display:flex;align-items:center;justify-content:center;gap:.4rem;
-  margin-top:1.25rem;font-size:12px;color:#9ca3af;
-}
-.lf-trust svg{width:13px;height:13px;color:var(--accent);opacity:.7;}
 
 /* Feature chips below card */
 .ls-chips{

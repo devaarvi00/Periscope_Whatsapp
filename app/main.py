@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -140,6 +140,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc: Exception):
+    """Any exception a route doesn't handle itself lands here.
+
+    Starlette's own default returns a plain-text "Internal Server Error" body,
+    which isn't valid JSON — the frontend's error handling expects JSON and
+    falls back to a bare "Request failed" with no detail. Logging the full
+    traceback server-side (never sent to the client) keeps this diagnosable
+    without leaking internals to the browser.
+    """
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Something went wrong. Please try again."})
+
 
 PREFIX = settings.api_prefix
 
